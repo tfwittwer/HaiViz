@@ -1,5 +1,6 @@
 pub mod raw_miniquad {
     use std::collections::HashMap;
+    use std::path::Path;
 
     use las::{Point, Reader};
     use miniquad::*;
@@ -7,6 +8,37 @@ pub mod raw_miniquad {
     use crate::ColorMode;
 
     const CHUNK_SIZE: f32 = 50.0;
+
+    /// Custom class definitions: id -> (label, [r,g,b])
+    pub type ClassDefs = HashMap<u8, (String, [f32; 3])>;
+
+    /// Load class definitions from classes.txt in the current directory.
+    /// Format: id;r;g;b;label  (one per line, # for comments)
+    pub fn load_class_defs() -> Option<ClassDefs> {
+        let path = Path::new("classes.txt");
+        if !path.exists() { return None; }
+        let content = std::fs::read_to_string(path).ok()?;
+        let mut defs = HashMap::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') { continue; }
+            let parts: Vec<&str> = line.splitn(5, ';').collect();
+            if parts.len() < 5 { continue; }
+            if let (Ok(id), Ok(r), Ok(g), Ok(b)) = (
+                parts[0].trim().parse::<u8>(),
+                parts[1].trim().parse::<u8>(),
+                parts[2].trim().parse::<u8>(),
+                parts[3].trim().parse::<u8>(),
+            ) {
+                let label = parts[4].trim().to_string();
+                defs.insert(id, (label, [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]));
+            }
+        }
+        if defs.is_empty() { None } else {
+            println!("Loaded {} class definitions from classes.txt", defs.len());
+            Some(defs)
+        }
+    }
 
     /// Point cloud backed by las::Point for full attribute access.
     pub struct VizPointcloud {
@@ -76,9 +108,14 @@ pub mod raw_miniquad {
         pub total_points: i32,
         pub cloud: VizPointcloud,
         positions: Vec<[f32; 3]>,
+        pub class_defs: Option<ClassDefs>,
     }
 
-    fn color_for_point(point: &Point, pos_z: f32, height_range: f32, intensity_min: u16, intensity_range: f32, mode: ColorMode) -> [f32; 3] {
+    fn color_for_point(
+        point: &Point, pos_z: f32, height_range: f32,
+        intensity_min: u16, intensity_range: f32,
+        mode: ColorMode, class_defs: &Option<ClassDefs>,
+    ) -> [f32; 3] {
         match mode {
             ColorMode::Height => {
                 let h = if height_range > 0.0 { (pos_z / height_range).clamp(0.0, 1.0) } else { 0.5 };
@@ -88,10 +125,9 @@ pub mod raw_miniquad {
                 [r, g, b]
             }
             ColorMode::Intensity => {
-                // Logarithmic scaling with the same blue-red gradient as height
                 let h = if intensity_range > 0.0 {
                     let lin = (point.intensity - intensity_min) as f32 / intensity_range;
-                    ((1.0 + lin * 99.0).log10() / 2.0).clamp(0.0, 1.0) // log10(1..100) -> 0..2 -> 0..1
+                    ((1.0 + lin * 99.0).log10() / 2.0).clamp(0.0, 1.0)
                 } else {
                     0.5
                 };
@@ -101,7 +137,13 @@ pub mod raw_miniquad {
                 [r, g, b]
             }
             ColorMode::Classification => {
-                classification_color(point.classification.into())
+                let class_id: u8 = point.classification.into();
+                if let Some(defs) = class_defs {
+                    if let Some((_label, color)) = defs.get(&class_id) {
+                        return *color;
+                    }
+                }
+                classification_color(class_id)
             }
             ColorMode::Rgb => {
                 if let Some(color) = &point.color {
@@ -194,8 +236,90 @@ pub mod raw_miniquad {
         false
     }
 
+    fn create_pipeline(ctx: &mut dyn RenderingBackend) -> Pipeline {
+        let shader = ctx
+            .new_shader(
+                miniquad::ShaderSource::Glsl {
+                    vertex: shader::VERTEX,
+                    fragment: shader::FRAGMENT,
+                },
+                shader::meta(),
+            )
+            .unwrap();
+
+        ctx.new_pipeline(
+            &[BufferLayout::default()],
+            &[
+                VertexAttribute::new("pos", VertexFormat::Float3),
+                VertexAttribute::new("color", VertexFormat::Float3),
+            ],
+            shader,
+            PipelineParams {
+                primitive_type: PrimitiveType::Points,
+                depth_test: Comparison::LessOrEqual,
+                depth_write: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn build_chunks(
+        ctx: &mut dyn RenderingBackend,
+        positions: &[[f32; 3]],
+        vertices: &[Vertex],
+    ) -> Vec<Chunk> {
+        let mut chunk_map: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for (i, pos) in positions.iter().enumerate() {
+            let cx = (pos[0] / CHUNK_SIZE).floor() as i32;
+            let cy = (pos[1] / CHUNK_SIZE).floor() as i32;
+            chunk_map.entry((cx, cy)).or_default().push(i);
+        }
+
+        chunk_map
+            .into_iter()
+            .map(|(_key, point_indices)| {
+                let chunk_verts: Vec<Vertex> =
+                    point_indices.iter().map(|&i| vertices[i]).collect();
+
+                let mut aabb_min = [f32::MAX; 3];
+                let mut aabb_max = [f32::MIN; 3];
+                for v in &chunk_verts {
+                    for j in 0..3 {
+                        aabb_min[j] = aabb_min[j].min(v.pos[j]);
+                        aabb_max[j] = aabb_max[j].max(v.pos[j]);
+                    }
+                }
+
+                let n = chunk_verts.len() as i32;
+                let vertex_buffer = ctx.new_buffer(
+                    BufferType::VertexBuffer,
+                    BufferUsage::Dynamic,
+                    BufferSource::slice(&chunk_verts),
+                );
+                let indices: Vec<u32> = (0..n as u32).collect();
+                let index_buffer = ctx.new_buffer(
+                    BufferType::IndexBuffer,
+                    BufferUsage::Immutable,
+                    BufferSource::slice(&indices),
+                );
+
+                Chunk {
+                    bindings: Bindings {
+                        vertex_buffers: vec![vertex_buffer],
+                        index_buffer,
+                        images: vec![],
+                    },
+                    num_points: n,
+                    aabb_min,
+                    aabb_max,
+                    point_indices,
+                }
+            })
+            .collect()
+    }
+
     impl Stage {
-        pub fn new(ctx: &mut dyn RenderingBackend, filename: &str, color_mode: ColorMode) -> Stage {
+        pub fn new(ctx: &mut dyn RenderingBackend, filename: &str, color_mode: ColorMode, class_defs: Option<ClassDefs>) -> Stage {
             let cloud = VizPointcloud::load(filename);
 
             let height_range = (cloud.max[2] - cloud.min[2]) as f32;
@@ -217,85 +341,13 @@ pub mod raw_miniquad {
                 .enumerate()
                 .map(|(i, p)| Vertex {
                     pos: positions[i],
-                    color: color_for_point(p, positions[i][2], height_range, cloud.intensity_min, intensity_range, color_mode),
+                    color: color_for_point(p, positions[i][2], height_range, cloud.intensity_min, intensity_range, color_mode, &class_defs),
                 })
                 .collect();
 
-            let mut chunk_map: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-            for (i, pos) in positions.iter().enumerate() {
-                let cx = (pos[0] / CHUNK_SIZE).floor() as i32;
-                let cy = (pos[1] / CHUNK_SIZE).floor() as i32;
-                chunk_map.entry((cx, cy)).or_default().push(i);
-            }
-
-            let shader = ctx
-                .new_shader(
-                    miniquad::ShaderSource::Glsl {
-                        vertex: shader::VERTEX,
-                        fragment: shader::FRAGMENT,
-                    },
-                    shader::meta(),
-                )
-                .unwrap();
-
-            let pipeline = ctx.new_pipeline(
-                &[BufferLayout::default()],
-                &[
-                    VertexAttribute::new("pos", VertexFormat::Float3),
-                    VertexAttribute::new("color", VertexFormat::Float3),
-                ],
-                shader,
-                PipelineParams {
-                    primitive_type: PrimitiveType::Points,
-                    depth_test: Comparison::LessOrEqual,
-                    depth_write: true,
-                    ..Default::default()
-                },
-            );
-
+            let pipeline = create_pipeline(ctx);
             let total_points = vertices.len() as i32;
-
-            let chunks: Vec<Chunk> = chunk_map
-                .into_iter()
-                .map(|(_key, point_indices)| {
-                    let chunk_verts: Vec<Vertex> =
-                        point_indices.iter().map(|&i| vertices[i]).collect();
-
-                    let mut aabb_min = [f32::MAX; 3];
-                    let mut aabb_max = [f32::MIN; 3];
-                    for v in &chunk_verts {
-                        for j in 0..3 {
-                            aabb_min[j] = aabb_min[j].min(v.pos[j]);
-                            aabb_max[j] = aabb_max[j].max(v.pos[j]);
-                        }
-                    }
-
-                    let n = chunk_verts.len() as i32;
-                    let vertex_buffer = ctx.new_buffer(
-                        BufferType::VertexBuffer,
-                        BufferUsage::Dynamic,
-                        BufferSource::slice(&chunk_verts),
-                    );
-                    let indices: Vec<u32> = (0..n as u32).collect();
-                    let index_buffer = ctx.new_buffer(
-                        BufferType::IndexBuffer,
-                        BufferUsage::Immutable,
-                        BufferSource::slice(&indices),
-                    );
-
-                    Chunk {
-                        bindings: Bindings {
-                            vertex_buffers: vec![vertex_buffer],
-                            index_buffer,
-                            images: vec![],
-                        },
-                        num_points: n,
-                        aabb_min,
-                        aabb_max,
-                        point_indices,
-                    }
-                })
-                .collect();
+            let chunks = build_chunks(ctx, &positions, &vertices);
 
             println!("{} points in {} chunks ({}m cells), height range: {:.1}m",
                 total_points, chunks.len(), CHUNK_SIZE, height_range);
@@ -306,6 +358,7 @@ pub mod raw_miniquad {
                 total_points,
                 cloud,
                 positions,
+                class_defs,
             }
         }
 
@@ -353,7 +406,7 @@ pub mod raw_miniquad {
                         let p = &self.cloud.points[i];
                         Vertex {
                             pos: self.positions[i],
-                            color: color_for_point(p, self.positions[i][2], height_range, self.cloud.intensity_min, intensity_range, color_mode),
+                            color: color_for_point(p, self.positions[i][2], height_range, self.cloud.intensity_min, intensity_range, color_mode, &self.class_defs),
                         }
                     })
                     .collect();
@@ -398,7 +451,7 @@ pub mod raw_miniquad {
                     h_max = h_max.max(pos[2]);
                     section_verts.push(Vertex {
                         pos: [along, pos[2], 0.0],
-                        color: color_for_point(p, pos[2], height_range, self.cloud.intensity_min, intensity_range, color_mode),
+                        color: color_for_point(p, pos[2], height_range, self.cloud.intensity_min, intensity_range, color_mode, &self.class_defs),
                     });
                 }
             }
@@ -407,7 +460,6 @@ pub mod raw_miniquad {
             println!("Section: {:.1}m long, {:.1}m depth, {} points, height {:.1}..{:.1}m",
                 len, depth, num_points, h_min, h_max);
 
-            // Create GPU buffers
             let vertex_buffer = ctx.new_buffer(
                 BufferType::VertexBuffer,
                 BufferUsage::Immutable,
@@ -461,6 +513,355 @@ pub mod raw_miniquad {
                 drawn += chunk.num_points;
             }
             drawn
+        }
+    }
+
+    // ---- Tile management ----
+
+    pub struct TileInfo {
+        pub filename: String,
+        pub filepath: String,
+        pub xmin: f64, pub ymin: f64, pub zmin: f64,
+        pub xmax: f64, pub ymax: f64, pub zmax: f64,
+    }
+
+    pub struct LoadedTile {
+        pub cloud: VizPointcloud,
+        pub positions: Vec<[f32; 3]>,
+        chunks: Vec<Chunk>,
+        pub total_points: i32,
+    }
+
+    pub struct TileStageManager {
+        pipeline: Pipeline,
+        pub tiles: Vec<TileInfo>,
+        pub loaded: Vec<Option<LoadedTile>>,
+        pub global_min: [f64; 3],
+        pub global_max: [f64; 3],
+        pub class_defs: Option<ClassDefs>,
+    }
+
+    fn read_index(dir_path: &str) -> Vec<TileInfo> {
+        let index_path = Path::new(dir_path).join("index.txt");
+        let content = std::fs::read_to_string(index_path).unwrap();
+        content.lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+            .map(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                TileInfo {
+                    filename: parts[0].to_string(),
+                    filepath: Path::new(dir_path).join(parts[0]).to_string_lossy().to_string(),
+                    xmin: parts[1].parse().unwrap(),
+                    ymin: parts[2].parse().unwrap(),
+                    zmin: parts[3].parse().unwrap(),
+                    xmax: parts[4].parse().unwrap(),
+                    ymax: parts[5].parse().unwrap(),
+                    zmax: parts[6].parse().unwrap(),
+                }
+            })
+            .collect()
+    }
+
+    fn generate_index(dir_path: &str) {
+        println!("Generating index.txt for {}", dir_path);
+        let mut entries = Vec::new();
+        let mut dir_entries: Vec<_> = std::fs::read_dir(dir_path).unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        dir_entries.sort_by_key(|e| e.file_name());
+
+        for entry in dir_entries {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                let ext_lower = ext.to_string_lossy().to_lowercase();
+                if ext_lower == "laz" || ext_lower == "las" {
+                    let reader = Reader::from_path(&path).unwrap();
+                    let bounds = reader.header().bounds();
+                    let filename = path.file_name().unwrap().to_string_lossy();
+                    entries.push(format!("{} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3}",
+                        filename,
+                        bounds.min.x, bounds.min.y, bounds.min.z,
+                        bounds.max.x, bounds.max.y, bounds.max.z,
+                    ));
+                }
+            }
+        }
+        let index_path = Path::new(dir_path).join("index.txt");
+        std::fs::write(&index_path, entries.join("\n")).unwrap();
+        println!("Wrote {} tile entries to index.txt", entries.len());
+    }
+
+    impl TileStageManager {
+        pub fn new(ctx: &mut dyn RenderingBackend, dir_path: &str, class_defs: Option<ClassDefs>) -> TileStageManager {
+            // Generate index if missing
+            let index_path = Path::new(dir_path).join("index.txt");
+            if !index_path.exists() {
+                generate_index(dir_path);
+            }
+
+            let tiles = read_index(dir_path);
+
+            // Compute global bounds
+            let mut global_min = [f64::MAX; 3];
+            let mut global_max = [f64::MIN; 3];
+            for t in &tiles {
+                global_min[0] = global_min[0].min(t.xmin);
+                global_min[1] = global_min[1].min(t.ymin);
+                global_min[2] = global_min[2].min(t.zmin);
+                global_max[0] = global_max[0].max(t.xmax);
+                global_max[1] = global_max[1].max(t.ymax);
+                global_max[2] = global_max[2].max(t.zmax);
+            }
+
+            let n = tiles.len();
+            let loaded = (0..n).map(|_| None).collect();
+
+            println!("{} tiles, bounds: x {:.1}..{:.1}  y {:.1}..{:.1}  z {:.1}..{:.1}",
+                n, global_min[0], global_max[0], global_min[1], global_max[1], global_min[2], global_max[2]);
+
+            let pipeline = create_pipeline(ctx);
+
+            TileStageManager {
+                pipeline,
+                tiles,
+                loaded,
+                global_min,
+                global_max,
+                class_defs,
+            }
+        }
+
+        pub fn height_range(&self) -> f32 {
+            (self.global_max[2] - self.global_min[2]) as f32
+        }
+
+        /// Tile boundary corners in viewer coordinates (at z=0)
+        pub fn tile_corners(&self, idx: usize) -> [(f32, f32); 4] {
+            let t = &self.tiles[idx];
+            let x0 = (t.xmin - self.global_min[0]) as f32;
+            let y0 = (t.ymin - self.global_min[1]) as f32;
+            let x1 = (t.xmax - self.global_min[0]) as f32;
+            let y1 = (t.ymax - self.global_min[1]) as f32;
+            [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        }
+
+        /// Tile center in viewer coordinates
+        pub fn tile_center(&self, idx: usize) -> (f32, f32) {
+            let t = &self.tiles[idx];
+            let cx = ((t.xmin + t.xmax) / 2.0 - self.global_min[0]) as f32;
+            let cy = ((t.ymin + t.ymax) / 2.0 - self.global_min[1]) as f32;
+            (cx, cy)
+        }
+
+        /// Find which tile contains the given viewer-space XY coordinate
+        pub fn tile_at(&self, wx: f32, wy: f32) -> Option<usize> {
+            for (i, t) in self.tiles.iter().enumerate() {
+                let x0 = (t.xmin - self.global_min[0]) as f32;
+                let y0 = (t.ymin - self.global_min[1]) as f32;
+                let x1 = (t.xmax - self.global_min[0]) as f32;
+                let y1 = (t.ymax - self.global_min[1]) as f32;
+                if wx >= x0 && wx <= x1 && wy >= y0 && wy <= y1 {
+                    return Some(i);
+                }
+            }
+            None
+        }
+
+        pub fn load_tile(&mut self, ctx: &mut dyn RenderingBackend, index: usize, color_mode: ColorMode) {
+            if self.loaded[index].is_some() { return; }
+
+            let cloud = VizPointcloud::load(&self.tiles[index].filepath);
+            let height_range = self.height_range();
+            let intensity_range = (cloud.intensity_max - cloud.intensity_min) as f32;
+
+            let positions: Vec<[f32; 3]> = cloud.points.iter().map(|p| [
+                (p.x - self.global_min[0]) as f32,
+                (p.y - self.global_min[1]) as f32,
+                (p.z - self.global_min[2]) as f32,
+            ]).collect();
+
+            let vertices: Vec<Vertex> = cloud.points.iter().enumerate().map(|(i, p)| Vertex {
+                pos: positions[i],
+                color: color_for_point(p, positions[i][2], height_range, cloud.intensity_min, intensity_range, color_mode, &self.class_defs),
+            }).collect();
+
+            let total_points = vertices.len() as i32;
+            let chunks = build_chunks(ctx, &positions, &vertices);
+
+            println!("Tile {} loaded: {} points, {} chunks",
+                self.tiles[index].filename, total_points, chunks.len());
+
+            self.loaded[index] = Some(LoadedTile {
+                cloud,
+                positions,
+                chunks,
+                total_points,
+            });
+        }
+
+        pub fn unload_tile(&mut self, ctx: &mut dyn RenderingBackend, index: usize) {
+            if let Some(tile) = self.loaded[index].take() {
+                for chunk in tile.chunks {
+                    ctx.delete_buffer(chunk.bindings.vertex_buffers[0]);
+                    ctx.delete_buffer(chunk.bindings.index_buffer);
+                }
+                println!("Tile {} unloaded", self.tiles[index].filename);
+            }
+        }
+
+        pub fn draw_visible(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4) -> (i32, i32) {
+            let planes = extract_frustum_planes(view_proj);
+            let mut drawn = 0;
+            let mut total = 0;
+
+            ctx.apply_pipeline(&self.pipeline);
+            for loaded in self.loaded.iter().flatten() {
+                total += loaded.total_points;
+                for chunk in &loaded.chunks {
+                    if aabb_outside_frustum(&planes, &chunk.aabb_min, &chunk.aabb_max) {
+                        continue;
+                    }
+                    ctx.apply_bindings(&chunk.bindings);
+                    ctx.apply_uniforms(miniquad::UniformsSource::table(
+                        &shader::Uniforms { mvp: *view_proj },
+                    ));
+                    ctx.draw(0, chunk.num_points, 1);
+                    drawn += chunk.num_points;
+                }
+            }
+            (drawn, total)
+        }
+
+        pub fn rebuild_colors(&mut self, ctx: &mut dyn RenderingBackend, color_mode: ColorMode) {
+            let height_range = self.height_range();
+            for loaded in self.loaded.iter_mut().flatten() {
+                let intensity_range = (loaded.cloud.intensity_max - loaded.cloud.intensity_min) as f32;
+                for chunk in &mut loaded.chunks {
+                    let chunk_verts: Vec<Vertex> = chunk.point_indices.iter().map(|&i| {
+                        let p = &loaded.cloud.points[i];
+                        Vertex {
+                            pos: loaded.positions[i],
+                            color: color_for_point(p, loaded.positions[i][2], height_range, loaded.cloud.intensity_min, intensity_range, color_mode, &self.class_defs),
+                        }
+                    }).collect();
+                    ctx.buffer_update(chunk.bindings.vertex_buffers[0], BufferSource::slice(&chunk_verts));
+                }
+            }
+        }
+
+        pub fn find_nearest_point(
+            &self,
+            view_proj: &glam::Mat4,
+            screen_x: f32, screen_y: f32,
+            screen_w: f32, screen_h: f32,
+        ) -> Option<(usize, usize)> {
+            let ndc_x = screen_x / screen_w * 2.0 - 1.0;
+            let ndc_y = 1.0 - screen_y / screen_h * 2.0;
+
+            let mut best: Option<(usize, usize)> = None;
+            let mut best_dist = f32::MAX;
+
+            for (tile_idx, loaded) in self.loaded.iter().enumerate() {
+                if let Some(lt) = loaded {
+                    for (i, pos) in lt.positions.iter().enumerate() {
+                        let p = *view_proj * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
+                        let px = p.x / p.w;
+                        let py = p.y / p.w;
+                        let dist = (px - ndc_x) * (px - ndc_x) + (py - ndc_y) * (py - ndc_y);
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best = Some((tile_idx, i));
+                        }
+                    }
+                }
+            }
+            best
+        }
+
+        pub fn loaded_count(&self) -> usize {
+            self.loaded.iter().filter(|l| l.is_some()).count()
+        }
+
+        pub fn total_chunks(&self) -> usize {
+            self.loaded.iter().flatten().map(|l| l.chunks.len()).sum()
+        }
+
+        pub fn extract_section(
+            &self,
+            ctx: &mut dyn RenderingBackend,
+            start: (f32, f32),
+            end: (f32, f32),
+            depth: f32,
+            color_mode: ColorMode,
+        ) -> SectionData {
+            let dx = end.0 - start.0;
+            let dy = end.1 - start.1;
+            let len = (dx * dx + dy * dy).sqrt();
+            let dir = (dx / len, dy / len);
+            let normal = (-dir.1, dir.0);
+
+            let height_range = self.height_range();
+
+            let mut section_verts = Vec::new();
+            let mut h_min = f32::MAX;
+            let mut h_max = f32::MIN;
+
+            for loaded in self.loaded.iter().flatten() {
+                let intensity_range = (loaded.cloud.intensity_max - loaded.cloud.intensity_min) as f32;
+                for (i, pos) in loaded.positions.iter().enumerate() {
+                    let rel_x = pos[0] - start.0;
+                    let rel_y = pos[1] - start.1;
+                    let along = rel_x * dir.0 + rel_y * dir.1;
+                    let perp = rel_x * normal.0 + rel_y * normal.1;
+
+                    if along >= 0.0 && along <= len && perp.abs() <= depth {
+                        let p = &loaded.cloud.points[i];
+                        h_min = h_min.min(pos[2]);
+                        h_max = h_max.max(pos[2]);
+                        section_verts.push(Vertex {
+                            pos: [along, pos[2], 0.0],
+                            color: color_for_point(p, pos[2], height_range, loaded.cloud.intensity_min, intensity_range, color_mode, &self.class_defs),
+                        });
+                    }
+                }
+            }
+
+            let num_points = section_verts.len() as i32;
+            println!("Section: {:.1}m long, {:.1}m depth, {} points, height {:.1}..{:.1}m",
+                len, depth, num_points, h_min, h_max);
+
+            let vertex_buffer = ctx.new_buffer(
+                BufferType::VertexBuffer,
+                BufferUsage::Immutable,
+                BufferSource::slice(&section_verts),
+            );
+            let indices: Vec<u32> = (0..num_points as u32).collect();
+            let index_buffer = ctx.new_buffer(
+                BufferType::IndexBuffer,
+                BufferUsage::Immutable,
+                BufferSource::slice(&indices),
+            );
+
+            SectionData {
+                bindings: Bindings {
+                    vertex_buffers: vec![vertex_buffer],
+                    index_buffer,
+                    images: vec![],
+                },
+                num_points,
+                length: len,
+                height_min: h_min,
+                height_max: h_max,
+            }
+        }
+
+        pub fn draw_section(&self, ctx: &mut dyn RenderingBackend, section: &SectionData, mvp: &glam::Mat4) {
+            ctx.apply_pipeline(&self.pipeline);
+            ctx.apply_bindings(&section.bindings);
+            ctx.apply_uniforms(miniquad::UniformsSource::table(
+                &shader::Uniforms { mvp: *mvp },
+            ));
+            ctx.draw(0, section.num_points, 1);
         }
     }
 

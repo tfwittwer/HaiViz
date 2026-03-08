@@ -1,12 +1,12 @@
 use std::env;
+use std::path::Path;
 
 use console::style;
 use crate::glam::vec3;
 
 use macroquad::prelude::*;
 
-//use raw_miniquad::{SectionData};
-use crate::raw_miniquad::raw_miniquad::{SectionData,Stage};
+use crate::raw_miniquad::raw_miniquad::{SectionData, Stage, TileStageManager, load_class_defs};
 
 const MOVE_SPEED: f32 = 0.5;
 const LOOK_SPEED: f32 = 0.5;
@@ -262,6 +262,16 @@ fn screen_to_world_xy(sx: f32, sy: f32, view_proj: &glam::Mat4, z_plane: f32) ->
     Some((near.x + dir.x * t, near.y + dir.y * t))
 }
 
+/// Project a world position to screen coordinates.
+fn world_to_screen(pos: glam::Vec3, view_proj: &glam::Mat4) -> (f32, f32) {
+    let clip = *view_proj * glam::Vec4::new(pos.x, pos.y, pos.z, 1.0);
+    let ndc_x = clip.x / clip.w;
+    let ndc_y = clip.y / clip.w;
+    let sx = (ndc_x + 1.0) / 2.0 * screen_width();
+    let sy = (1.0 - ndc_y) / 2.0 * screen_height();
+    (sx, sy)
+}
+
 /// Draw the section corridor as 3D wireframe box.
 fn draw_section_corridor(
     start: (f32, f32),
@@ -291,19 +301,15 @@ fn draw_section_corridor(
     ];
 
     let col = YELLOW;
-    // Bottom rectangle
     for i in 0..4 {
         draw_line_3d(b[i], b[(i + 1) % 4], col);
     }
-    // Top rectangle
     for i in 0..4 {
         draw_line_3d(t[i], t[(i + 1) % 4], col);
     }
-    // Verticals
     for i in 0..4 {
         draw_line_3d(b[i], t[i], col);
     }
-    // Center line
     draw_line_3d(
         vec3(start.0, start.1, height_range * 0.5),
         vec3(end.0, end.1, height_range * 0.5),
@@ -311,32 +317,62 @@ fn draw_section_corridor(
     );
 }
 
+/// Format classification label using custom class_defs or default debug format.
+fn class_label(class: las::point::Classification, class_defs: &Option<crate::raw_miniquad::raw_miniquad::ClassDefs>) -> String {
+    let id: u8 = class.into();
+    if let Some(defs) = class_defs {
+        if let Some((label, _)) = defs.get(&id) {
+            return format!("{} ({})", id, label);
+        }
+    }
+    format!("{} ({:?})", id, class)
+}
+
 #[macroquad::main("HaiViz")]
 async fn main() {
     if env::args().count() != 2 {
-        println!("{}", style("Usage: haiviz pointcloud.laz").red());
+        println!("{}", style("Usage: haiviz <pointcloud.laz | directory>").red());
         return;
     }
     let args: Vec<String> = env::args().collect();
-    let cloudfile = &args[1];
+    let input_path = &args[1];
+    let is_tile_mode = Path::new(input_path).is_dir();
+
+    let class_defs = load_class_defs();
+    if let Some(ref cd) = class_defs {
+        println!("Custom classes: {:?}", cd.keys().collect::<Vec<_>>());
+    }
 
     let mut color_mode = ColorMode::Height;
     let mut background = Background::Black;
     let mut app_mode = AppMode::View3D;
 
-    let mut stage = {
-        let InternalGlContext {
-            quad_context: ctx, ..
-        } = unsafe { get_internal_gl() };
+    // Single-file mode state
+    let mut stage: Option<Stage> = None;
+    // Tile mode state
+    let mut tile_mgr: Option<TileStageManager> = None;
 
-        Stage::new(ctx, cloudfile, color_mode)
-    };
+    let height_range;
 
-    let height_range = stage.height_range();
+    if is_tile_mode {
+        let mgr = {
+            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+            TileStageManager::new(ctx, input_path, class_defs.clone())
+        };
+        height_range = mgr.height_range();
+        tile_mgr = Some(mgr);
+    } else {
+        let s = {
+            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+            Stage::new(ctx, input_path, color_mode, class_defs.clone())
+        };
+        height_range = s.height_range();
+        stage = Some(s);
+    }
 
     let world_up = vec3(0.0, 0.0, 1.0);
-    let mut yaw: f32 = 1.18;
-    let mut pitch: f32 = 0.0;
+    let mut yaw: f32 = std::f32::consts::FRAC_PI_4;       // 45°
+    let mut pitch: f32 = -(1.0_f32 / 2.0_f32.sqrt()).atan(); // -35.26° (isometric)
 
     let mut front = vec3(
         yaw.cos() * pitch.cos(),
@@ -355,17 +391,20 @@ async fn main() {
 
     let mut ortho_scale: f32 = 50.0;
 
-    // Section state
+    // Section state (single-file only)
     let mut section_start: Option<(f32, f32)> = None;
     let mut section_end: Option<(f32, f32)> = None;
     let mut section_depth: f32 = 2.0;
     let mut section_data: Option<SectionData> = None;
-    // Section 2D view state
     let mut section_pan = glam::Vec2::ZERO;
     let mut section_zoom: f32 = 50.0;
 
     // Point pick state
     let mut picked_point: Option<usize> = None;
+    let mut picked_tile_point: Option<(usize, usize)> = None;
+
+    // Tile mode: selected tile for UI
+    let mut selected_tile: Option<usize> = None;
 
     loop {
         let delta = get_frame_time();
@@ -379,8 +418,8 @@ async fn main() {
             }
         }
 
+        // ---- Section 2D view ----
         if app_mode == AppMode::SectionView {
-            // ---- Section 2D view ----
             // Navigation
             if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) {
                 section_pan.y += MOVE_SPEED * section_zoom * 0.02;
@@ -395,7 +434,6 @@ async fn main() {
                 section_pan.x += MOVE_SPEED * section_zoom * 0.02;
             }
 
-            // Middle mouse drag to pan section view
             let sec_mouse_pos: Vec2 = mouse_position().into();
             let sec_mouse_delta = sec_mouse_pos - last_mouse_position;
             last_mouse_position = sec_mouse_pos;
@@ -414,7 +452,6 @@ async fn main() {
 
             clear_background(background.color());
 
-            // Render section points
             if let Some(ref sec) = section_data {
                 let aspect = screen_width() / screen_height();
                 let half_h = section_zoom;
@@ -429,14 +466,16 @@ async fn main() {
                     let mut gl = unsafe { get_internal_gl() };
                     gl.flush();
                     gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
-                    stage.draw_section(&mut *gl.quad_context, sec, &section_mvp);
+                    if let Some(ref stg) = stage {
+                        stg.draw_section(&mut *gl.quad_context, sec, &section_mvp);
+                    } else if let Some(ref mgr) = tile_mgr {
+                        mgr.draw_section(&mut *gl.quad_context, sec, &section_mvp);
+                    }
                     gl.quad_context.end_render_pass();
                 }
 
                 set_default_camera();
 
-                // Draw reference axes in screen space
-                // Map section world coords to screen coords
                 let world_to_screen_x = |wx: f32| -> f32 {
                     (wx - (section_pan.x - half_w)) / (2.0 * half_w) * screen_width()
                 };
@@ -444,14 +483,12 @@ async fn main() {
                     (1.0 - (wy - (section_pan.y - half_h)) / (2.0 * half_h)) * screen_height()
                 };
 
-                // Ground line (Y=0)
                 let ground_sy = world_to_screen_y(0.0);
                 if ground_sy > 0.0 && ground_sy < screen_height() {
                     draw_line(0.0, ground_sy, screen_width(), ground_sy, 1.0, Color::new(0.4, 0.4, 0.4, 0.5));
                     draw_text("0m", 5.0, ground_sy - 3.0, 16.0, GRAY);
                 }
 
-                // Section start/end markers
                 let sx0 = world_to_screen_x(0.0);
                 let sx1 = world_to_screen_x(sec.length);
                 draw_line(sx0, 0.0, sx0, screen_height(), 1.0, Color::new(0.4, 0.4, 0.0, 0.5));
@@ -460,7 +497,6 @@ async fn main() {
                 draw_text(&format!("{:.1}m", sec.length), sx1 + 3.0, 30.0, 16.0, YELLOW);
             }
 
-            // egui
             let prev_color_mode = color_mode;
             egui_macroquad::ui(|egui_ctx| {
                 egui_macroquad::egui::Window::new("Controls")
@@ -501,12 +537,17 @@ async fn main() {
             egui_macroquad::draw();
 
             if color_mode != prev_color_mode {
-                // Rebuild section with new colors
                 if let (Some(start), Some(end)) = (section_start, section_end) {
                     let gl = unsafe { get_internal_gl() };
-                    section_data = Some(stage.extract_section(
-                        &mut *gl.quad_context, start, end, section_depth, color_mode,
-                    ));
+                    if let Some(ref stg) = stage {
+                        section_data = Some(stg.extract_section(
+                            &mut *gl.quad_context, start, end, section_depth, color_mode,
+                        ));
+                    } else if let Some(ref mgr) = tile_mgr {
+                        section_data = Some(mgr.extract_section(
+                            &mut *gl.quad_context, start, end, section_depth, color_mode,
+                        ));
+                    }
                 }
             }
 
@@ -514,7 +555,7 @@ async fn main() {
             continue;
         }
 
-        // ---- 3D view modes ----
+        // ---- 3D view modes (shared navigation) ----
         if is_key_pressed(KeyCode::Tab) {
             grabbed = !grabbed;
             set_cursor_grab(grabbed);
@@ -534,7 +575,6 @@ async fn main() {
             position += right * MOVE_SPEED;
         }
 
-        // Scroll: zoom in 3D mode, adjust depth in SectionAdjustDepth
         let (_mwx, mwy) = mouse_wheel();
         if app_mode == AppMode::SectionAdjustDepth {
             if mwy.abs() > 0.001 {
@@ -568,7 +608,6 @@ async fn main() {
             up = right.cross(front).normalize();
         }
 
-        // Middle mouse drag to pan
         if is_mouse_button_down(MouseButton::Middle) {
             let units_per_pixel = ortho_scale * 2.0 / screen_height();
             position -= right * mouse_delta.x * units_per_pixel;
@@ -590,193 +629,453 @@ async fn main() {
         set_camera(&camera);
         let view_proj: glam::Mat4 = camera.matrix();
 
-        //draw_cube_wires(vec3(90., 9., 17.), vec3(2., 2., 2.), GREEN);
-        //draw_cube_wires(vec3(0., 1., 6.), vec3(2., 2., 2.), BLUE);
-        //draw_cube_wires(vec3(16., 13., 8.), vec3(2., 2., 2.), RED);
-
-        // Section preview drawing (in 3D, behind points)
         let mid_z = height_range * 0.5;
         let (mx, my) = macroquad::input::mouse_position();
         let cursor_world = screen_to_world_xy(mx, my, &view_proj, mid_z);
 
-        match app_mode {
-            AppMode::SectionPickEnd => {
-                if let (Some(start), Some((wx, wy))) = (section_start, cursor_world) {
-                    draw_line_3d(
-                        vec3(start.0, start.1, mid_z),
-                        vec3(wx, wy, mid_z),
-                        YELLOW,
-                    );
-                }
-            }
-            AppMode::SectionAdjustDepth => {
-                if let (Some(start), Some(end)) = (section_start, section_end) {
-                    draw_section_corridor(start, end, section_depth, height_range);
-                }
-            }
-            _ => {}
-        }
-
-        // Render point cloud
-        let drawn = {
-            let mut gl = unsafe { get_internal_gl() };
-            gl.flush();
-
-            gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
-            let drawn = stage.draw_visible(&mut *gl.quad_context, &view_proj);
-            gl.quad_context.end_render_pass();
-            drawn
-        };
-
-        set_default_camera();
-
-        // View cube (only interactive in View3D)
-        let vc_interactive = app_mode == AppMode::View3D || app_mode == AppMode::PointPick;
-        if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive) {
-            yaw = new_yaw;
-            pitch = new_pitch;
-            front = vec3(
-                yaw.cos() * pitch.cos(),
-                yaw.sin() * pitch.cos(),
-                pitch.sin(),
-            )
-            .normalize();
-            right = front.cross(world_up).normalize();
-            up = right.cross(front).normalize();
-        }
-
-        // egui UI
-        let prev_color_mode = color_mode;
-        let mut egui_wants_pointer = false;
-        egui_macroquad::ui(|egui_ctx| {
-            egui_wants_pointer = egui_ctx.is_pointer_over_area();
-            egui_macroquad::egui::Window::new("Controls")
-                .default_pos([10.0, 10.0])
-                .show(egui_ctx, |ui| {
-                    let section_label = match app_mode {
-                        AppMode::View3D | AppMode::PointPick => "Cross Section",
-                        AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
-                        AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
-                        AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
-                        AppMode::SectionView => "Back to 3D",
-                    };
-                    if ui.button(section_label).clicked() {
-                        match app_mode {
-                            AppMode::View3D | AppMode::PointPick => {
-                                app_mode = AppMode::SectionPickStart;
-                                section_start = None;
-                                section_end = None;
-                                picked_point = None;
-                            }
-                            _ => {
-                                app_mode = AppMode::View3D;
-                                section_data = None;
-                            }
-                        }
-                    }
-
-                    let pick_label = if app_mode == AppMode::PointPick {
-                        "Click a point... (Esc to cancel)"
-                    } else {
-                        "Point Info"
-                    };
-                    if ui.button(pick_label).clicked() {
-                        if app_mode == AppMode::PointPick {
-                            app_mode = AppMode::View3D;
-                        } else {
-                            app_mode = AppMode::PointPick;
-                            picked_point = None;
-                        }
-                    }
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Color:");
-                        egui_macroquad::egui::ComboBox::from_id_salt("color_mode")
-                            .selected_text(color_mode.label())
-                            .show_ui(ui, |ui| {
-                                for mode in &ColorMode::ALL {
-                                    ui.selectable_value(&mut color_mode, *mode, mode.label());
-                                }
-                            });
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Background:");
-                        egui_macroquad::egui::ComboBox::from_id_salt("background")
-                            .selected_text(background.label())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut background, Background::Black, "Black");
-                                ui.selectable_value(&mut background, Background::White, "White");
-                            });
-                    });
-                    ui.label(format!(
-                        "{}/{} points | {} chunks | FPS: {:.0} | zoom: {:.1}",
-                        drawn, stage.total_points, stage.chunks.len(),
-                        1.0 / get_frame_time(), ortho_scale
-                    ));
-                    if app_mode == AppMode::SectionAdjustDepth {
-                        ui.label(format!("Section depth: {:.1}m", section_depth));
-                    }
-                    if let Some(idx) = picked_point {
-                        ui.separator();
-                        let p = &stage.cloud.points[idx];
-                        ui.label("Point Info:");
-                        ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
-                        ui.label(format!("  Intensity: {}", p.intensity));
-                        let class_id: u8 = p.classification.into();
-                        ui.label(format!("  Classification: {} ({:?})", class_id, p.classification));
-                        ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
-                        if let Some(ref color) = p.color {
-                            ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
-                        }
-                        if let Some(time) = p.gps_time {
-                            ui.label(format!("  GPS time: {:.6}", time));
-                        }
-                    }
-                });
-        });
-        egui_macroquad::draw();
-
-        // Handle mode-specific clicks (only if egui didn't consume the click)
-        if !egui_wants_pointer && is_mouse_button_pressed(MouseButton::Left) {
+        // ---- Single-file mode rendering ----
+        if let Some(ref stg) = stage {
+            // Section preview
             match app_mode {
-                AppMode::PointPick => {
-                    picked_point = stage.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height());
-                }
-                AppMode::SectionPickStart => {
-                    if let Some(world) = cursor_world {
-                        section_start = Some(world);
-                        app_mode = AppMode::SectionPickEnd;
-                    }
-                }
                 AppMode::SectionPickEnd => {
-                    if let Some(world) = cursor_world {
-                        section_end = Some(world);
-                        app_mode = AppMode::SectionAdjustDepth;
+                    if let (Some(start), Some((wx, wy))) = (section_start, cursor_world) {
+                        draw_line_3d(
+                            vec3(start.0, start.1, mid_z),
+                            vec3(wx, wy, mid_z),
+                            YELLOW,
+                        );
                     }
                 }
                 AppMode::SectionAdjustDepth => {
                     if let (Some(start), Some(end)) = (section_start, section_end) {
-                        let gl = unsafe { get_internal_gl() };
-                        let sec = stage.extract_section(
-                            &mut *gl.quad_context, start, end, section_depth, color_mode,
-                        );
-                        // Set initial section view to fit the data
-                        section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
-                        section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
-                        section_data = Some(sec);
-                        app_mode = AppMode::SectionView;
+                        draw_section_corridor(start, end, section_depth, height_range);
                     }
                 }
                 _ => {}
             }
+
+            // Render points
+            let drawn = {
+                let mut gl = unsafe { get_internal_gl() };
+                gl.flush();
+                gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
+                let drawn = stg.draw_visible(&mut *gl.quad_context, &view_proj);
+                gl.quad_context.end_render_pass();
+                drawn
+            };
+
+            set_default_camera();
+
+            // View cube
+            let vc_interactive = app_mode == AppMode::View3D || app_mode == AppMode::PointPick;
+            if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive) {
+                yaw = new_yaw;
+                pitch = new_pitch;
+                front = vec3(yaw.cos() * pitch.cos(), yaw.sin() * pitch.cos(), pitch.sin()).normalize();
+                right = front.cross(world_up).normalize();
+                up = right.cross(front).normalize();
+            }
+
+            // egui UI
+            let prev_color_mode = color_mode;
+            let mut egui_wants_pointer = false;
+            egui_macroquad::ui(|egui_ctx| {
+                egui_wants_pointer = egui_ctx.is_pointer_over_area();
+                egui_macroquad::egui::Window::new("Controls")
+                    .default_pos([10.0, 10.0])
+                    .show(egui_ctx, |ui| {
+                        let section_label = match app_mode {
+                            AppMode::View3D | AppMode::PointPick => "Cross Section",
+                            AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
+                            AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
+                            AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
+                            AppMode::SectionView => "Back to 3D",
+                        };
+                        if ui.button(section_label).clicked() {
+                            match app_mode {
+                                AppMode::View3D | AppMode::PointPick => {
+                                    app_mode = AppMode::SectionPickStart;
+                                    section_start = None;
+                                    section_end = None;
+                                    picked_point = None;
+                                }
+                                _ => {
+                                    app_mode = AppMode::View3D;
+                                    section_data = None;
+                                }
+                            }
+                        }
+
+                        let pick_label = if app_mode == AppMode::PointPick {
+                            "Click a point... (Esc to cancel)"
+                        } else {
+                            "Point Info"
+                        };
+                        if ui.button(pick_label).clicked() {
+                            if app_mode == AppMode::PointPick {
+                                app_mode = AppMode::View3D;
+                            } else {
+                                app_mode = AppMode::PointPick;
+                                picked_point = None;
+                            }
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Color:");
+                            egui_macroquad::egui::ComboBox::from_id_salt("color_mode")
+                                .selected_text(color_mode.label())
+                                .show_ui(ui, |ui| {
+                                    for mode in &ColorMode::ALL {
+                                        ui.selectable_value(&mut color_mode, *mode, mode.label());
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Background:");
+                            egui_macroquad::egui::ComboBox::from_id_salt("background")
+                                .selected_text(background.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut background, Background::Black, "Black");
+                                    ui.selectable_value(&mut background, Background::White, "White");
+                                });
+                        });
+                        ui.label(format!(
+                            "{}/{} points | {} chunks | FPS: {:.0} | zoom: {:.1}",
+                            drawn, stg.total_points, stg.chunks.len(),
+                            1.0 / get_frame_time(), ortho_scale
+                        ));
+                        if app_mode == AppMode::SectionAdjustDepth {
+                            ui.label(format!("Section depth: {:.1}m", section_depth));
+                        }
+                        if let Some(idx) = picked_point {
+                            ui.separator();
+                            let p = &stg.cloud.points[idx];
+                            ui.label("Point Info:");
+                            ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
+                            ui.label(format!("  Intensity: {}", p.intensity));
+                            ui.label(format!("  Classification: {}", class_label(p.classification, &class_defs)));
+                            ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
+                            if let Some(ref color) = p.color {
+                                ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
+                            }
+                            if let Some(time) = p.gps_time {
+                                ui.label(format!("  GPS time: {:.6}", time));
+                            }
+                        }
+                    });
+            });
+            egui_macroquad::draw();
+
+            // Handle clicks
+            if !egui_wants_pointer && is_mouse_button_pressed(MouseButton::Left) {
+                match app_mode {
+                    AppMode::PointPick => {
+                        picked_point = stg.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height());
+                    }
+                    AppMode::SectionPickStart => {
+                        if let Some(world) = cursor_world {
+                            section_start = Some(world);
+                            app_mode = AppMode::SectionPickEnd;
+                        }
+                    }
+                    AppMode::SectionPickEnd => {
+                        if let Some(world) = cursor_world {
+                            section_end = Some(world);
+                            app_mode = AppMode::SectionAdjustDepth;
+                        }
+                    }
+                    AppMode::SectionAdjustDepth => {
+                        if let (Some(start), Some(end)) = (section_start, section_end) {
+                            let gl = unsafe { get_internal_gl() };
+                            let sec = stg.extract_section(
+                                &mut *gl.quad_context, start, end, section_depth, color_mode,
+                            );
+                            section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
+                            section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
+                            section_data = Some(sec);
+                            app_mode = AppMode::SectionView;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if color_mode != prev_color_mode {
+                if let Some(ref mut stg) = stage {
+                    let gl = unsafe { get_internal_gl() };
+                    stg.rebuild_colors(&mut *gl.quad_context, color_mode);
+                }
+            }
         }
 
-        if color_mode != prev_color_mode {
-            let gl = unsafe { get_internal_gl() };
-            stage.rebuild_colors(&mut *gl.quad_context, color_mode);
+        // ---- Tile mode rendering ----
+        if let Some(ref mgr) = tile_mgr {
+            // Section preview (in 3D)
+            match app_mode {
+                AppMode::SectionPickEnd => {
+                    if let (Some(start), Some((wx, wy))) = (section_start, cursor_world) {
+                        draw_line_3d(
+                            vec3(start.0, start.1, mid_z),
+                            vec3(wx, wy, mid_z),
+                            YELLOW,
+                        );
+                    }
+                }
+                AppMode::SectionAdjustDepth => {
+                    if let (Some(start), Some(end)) = (section_start, section_end) {
+                        draw_section_corridor(start, end, section_depth, height_range);
+                    }
+                }
+                _ => {}
+            }
+
+            // Draw tile boundaries at z=0
+            set_camera(&camera);
+            for i in 0..mgr.tiles.len() {
+                let corners = mgr.tile_corners(i);
+                let is_loaded = mgr.loaded[i].is_some();
+                let is_selected = selected_tile == Some(i);
+                let col = if is_selected { YELLOW } else if is_loaded { GREEN } else { RED };
+                let thickness = if is_selected { 2.0 } else { 1.0 };
+                for j in 0..4 {
+                    let k = (j + 1) % 4;
+                    // draw_line_3d doesn't support thickness, use it anyway
+                    draw_line_3d(
+                        vec3(corners[j].0, corners[j].1, 0.0),
+                        vec3(corners[k].0, corners[k].1, 0.0),
+                        col,
+                    );
+                    if thickness > 1.0 {
+                        // Draw a slightly offset line for thicker appearance
+                        draw_line_3d(
+                            vec3(corners[j].0, corners[j].1, 0.1),
+                            vec3(corners[k].0, corners[k].1, 0.1),
+                            col,
+                        );
+                    }
+                }
+            }
+
+            // Render loaded tile points
+            let (drawn, total) = {
+                let mut gl = unsafe { get_internal_gl() };
+                gl.flush();
+                gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
+                let result = mgr.draw_visible(&mut *gl.quad_context, &view_proj);
+                gl.quad_context.end_render_pass();
+                result
+            };
+
+            set_default_camera();
+
+            // Draw tile labels (2D overlay)
+            for i in 0..mgr.tiles.len() {
+                let center = mgr.tile_center(i);
+                let (sx, sy) = world_to_screen(vec3(center.0, center.1, 0.0), &view_proj);
+                if sx > 0.0 && sx < screen_width() && sy > 0.0 && sy < screen_height() {
+                    let is_loaded = mgr.loaded[i].is_some();
+                    let label_color = if is_loaded { GREEN } else { Color::new(1.0, 0.4, 0.4, 0.8) };
+                    let name = &mgr.tiles[i].filename;
+                    let font_size = 12.0;
+                    let text_w = name.len() as f32 * font_size * 0.35;
+                    draw_text(name, sx - text_w / 2.0, sy, font_size, label_color);
+                }
+            }
+
+            // View cube
+            let vc_interactive = app_mode == AppMode::View3D || app_mode == AppMode::PointPick;
+            if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive) {
+                yaw = new_yaw;
+                pitch = new_pitch;
+                front = vec3(yaw.cos() * pitch.cos(), yaw.sin() * pitch.cos(), pitch.sin()).normalize();
+                right = front.cross(world_up).normalize();
+                up = right.cross(front).normalize();
+            }
+
+            // egui UI
+            let prev_color_mode = color_mode;
+            let mut egui_wants_pointer = false;
+            let mut request_load: Option<usize> = None;
+            let mut request_unload: Option<usize> = None;
+            egui_macroquad::ui(|egui_ctx| {
+                egui_wants_pointer = egui_ctx.is_pointer_over_area();
+                egui_macroquad::egui::Window::new("Controls")
+                    .default_pos([10.0, 10.0])
+                    .show(egui_ctx, |ui| {
+                        // Cross Section button
+                        let section_label = match app_mode {
+                            AppMode::View3D | AppMode::PointPick => "Cross Section",
+                            AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
+                            AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
+                            AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
+                            AppMode::SectionView => "Back to 3D",
+                        };
+                        if ui.button(section_label).clicked() {
+                            match app_mode {
+                                AppMode::View3D | AppMode::PointPick => {
+                                    app_mode = AppMode::SectionPickStart;
+                                    section_start = None;
+                                    section_end = None;
+                                    picked_tile_point = None;
+                                }
+                                _ => {
+                                    app_mode = AppMode::View3D;
+                                    section_data = None;
+                                }
+                            }
+                        }
+
+                        // Point pick button
+                        let pick_label = if app_mode == AppMode::PointPick {
+                            "Click a point... (Esc to cancel)"
+                        } else {
+                            "Point Info"
+                        };
+                        if ui.button(pick_label).clicked() {
+                            if app_mode == AppMode::PointPick {
+                                app_mode = AppMode::View3D;
+                            } else {
+                                app_mode = AppMode::PointPick;
+                                picked_tile_point = None;
+                            }
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Color:");
+                            egui_macroquad::egui::ComboBox::from_id_salt("color_mode")
+                                .selected_text(color_mode.label())
+                                .show_ui(ui, |ui| {
+                                    for mode in &ColorMode::ALL {
+                                        ui.selectable_value(&mut color_mode, *mode, mode.label());
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Background:");
+                            egui_macroquad::egui::ComboBox::from_id_salt("background")
+                                .selected_text(background.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut background, Background::Black, "Black");
+                                    ui.selectable_value(&mut background, Background::White, "White");
+                                });
+                        });
+                        ui.label(format!(
+                            "{}/{} points | {} chunks | {}/{} tiles | FPS: {:.0}",
+                            drawn, total, mgr.total_chunks(),
+                            mgr.loaded_count(), mgr.tiles.len(),
+                            1.0 / get_frame_time()
+                        ));
+
+                        // Selected tile info
+                        if let Some(sel) = selected_tile {
+                            ui.separator();
+                            ui.label(format!("Selected: {}", mgr.tiles[sel].filename));
+                            let is_loaded = mgr.loaded[sel].is_some();
+                            if !is_loaded {
+                                if ui.button("Load").clicked() {
+                                    request_load = Some(sel);
+                                }
+                            } else {
+                                if ui.button("Unload").clicked() {
+                                    request_unload = Some(sel);
+                                }
+                            }
+                            if let Some(ref lt) = mgr.loaded[sel] {
+                                ui.label(format!("  {} points loaded", lt.total_points));
+                            }
+                        }
+
+                        // Picked point info
+                        if let Some((tile_idx, point_idx)) = picked_tile_point {
+                            if let Some(ref lt) = mgr.loaded[tile_idx] {
+                                ui.separator();
+                                let p = &lt.cloud.points[point_idx];
+                                ui.label(format!("Point Info ({})", mgr.tiles[tile_idx].filename));
+                                ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
+                                ui.label(format!("  Intensity: {}", p.intensity));
+                                ui.label(format!("  Classification: {}", class_label(p.classification, &class_defs)));
+                                ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
+                                if let Some(ref color) = p.color {
+                                    ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
+                                }
+                                if let Some(time) = p.gps_time {
+                                    ui.label(format!("  GPS time: {:.6}", time));
+                                }
+                            }
+                        }
+                    });
+            });
+            egui_macroquad::draw();
+
+            // Handle clicks
+            if !egui_wants_pointer && is_mouse_button_pressed(MouseButton::Left) {
+                match app_mode {
+                    AppMode::PointPick => {
+                        picked_tile_point = mgr.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height());
+                    }
+                    AppMode::SectionPickStart => {
+                        if let Some(world) = cursor_world {
+                            section_start = Some(world);
+                            app_mode = AppMode::SectionPickEnd;
+                        }
+                    }
+                    AppMode::SectionPickEnd => {
+                        if let Some(world) = cursor_world {
+                            section_end = Some(world);
+                            app_mode = AppMode::SectionAdjustDepth;
+                        }
+                    }
+                    AppMode::SectionAdjustDepth => {
+                        if let (Some(start), Some(end)) = (section_start, section_end) {
+                            let gl = unsafe { get_internal_gl() };
+                            let sec = mgr.extract_section(
+                                &mut *gl.quad_context, start, end, section_depth, color_mode,
+                            );
+                            section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
+                            section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
+                            section_data = Some(sec);
+                            app_mode = AppMode::SectionView;
+                        }
+                    }
+                    AppMode::View3D => {
+                        if let Some((wx, wy)) = screen_to_world_xy(mx, my, &view_proj, 0.0) {
+                            selected_tile = mgr.tile_at(wx, wy);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Handle load/unload (from buttons or keyboard)
+            if let Some(sel) = selected_tile {
+                if is_key_pressed(KeyCode::Enter) && mgr.loaded[sel].is_none() {
+                    request_load = Some(sel);
+                }
+                if is_key_pressed(KeyCode::Delete) && mgr.loaded[sel].is_some() {
+                    request_unload = Some(sel);
+                }
+            }
+            if let Some(idx) = request_load {
+                if let Some(ref mut mgr) = tile_mgr {
+                    let gl = unsafe { get_internal_gl() };
+                    mgr.load_tile(&mut *gl.quad_context, idx, color_mode);
+                }
+            }
+            if let Some(idx) = request_unload {
+                if let Some(ref mut mgr) = tile_mgr {
+                    let gl = unsafe { get_internal_gl() };
+                    mgr.unload_tile(&mut *gl.quad_context, idx);
+                }
+            }
+
+            if color_mode != prev_color_mode {
+                if let Some(ref mut mgr) = tile_mgr {
+                    let gl = unsafe { get_internal_gl() };
+                    mgr.rebuild_colors(&mut *gl.quad_context, color_mode);
+                }
+            }
         }
 
         next_frame().await
     }
 }
-
