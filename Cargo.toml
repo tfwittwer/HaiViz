@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 macroquad = "0.4"
-haicloudrs = { path = "../haicloudrs" }
+egui-macroquad = "0.17"
+las = { version = "0.9.9", features = ["laz-parallel"] }
 console = "0.16"
 miniquad = "0.4"
 glam = { version="0.27" }
