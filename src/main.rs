@@ -5,8 +5,185 @@ use crate::glam::vec3;
 
 use macroquad::prelude::*;
 
+//use raw_miniquad::{SectionData};
+use crate::raw_miniquad::raw_miniquad::{SectionData,Stage};
+
 const MOVE_SPEED: f32 = 0.5;
 const LOOK_SPEED: f32 = 0.5;
+
+mod raw_miniquad;
+
+mod view_cube {
+    use macroquad::prelude::*;
+    use std::f32::consts::PI;
+
+    const SIZE: f32 = 70.0;
+    const MARGIN: f32 = 20.0;
+
+    const CORNERS: [[f32; 3]; 8] = [
+        [-1.0, -1.0, -1.0], // 0
+        [ 1.0, -1.0, -1.0], // 1
+        [ 1.0,  1.0, -1.0], // 2
+        [-1.0,  1.0, -1.0], // 3
+        [-1.0, -1.0,  1.0], // 4
+        [ 1.0, -1.0,  1.0], // 5
+        [ 1.0,  1.0,  1.0], // 6
+        [-1.0,  1.0,  1.0], // 7
+    ];
+
+    struct FaceDef {
+        corners: [usize; 4],
+        label: &'static str,
+        normal: [f32; 3],
+        snap_yaw: f32,
+        snap_pitch: f32,
+        color: Color,
+    }
+
+    fn faces() -> [FaceDef; 6] {
+        [
+            FaceDef { corners: [4, 5, 6, 7], label: "Top",    normal: [ 0.0, 0.0, 1.0], snap_yaw: PI/2.0, snap_pitch: -1.5,     color: Color::new(0.3, 0.5, 0.8, 0.85) },
+            FaceDef { corners: [3, 2, 1, 0], label: "Bot",    normal: [ 0.0, 0.0,-1.0], snap_yaw: PI/2.0, snap_pitch:  1.5,     color: Color::new(0.2, 0.3, 0.5, 0.85) },
+            FaceDef { corners: [1, 2, 6, 5], label: "E",      normal: [ 1.0, 0.0, 0.0], snap_yaw: 0.0,    snap_pitch:  0.0,     color: Color::new(0.8, 0.3, 0.3, 0.85) },
+            FaceDef { corners: [0, 3, 7, 4], label: "W",      normal: [-1.0, 0.0, 0.0], snap_yaw: PI,     snap_pitch:  0.0,     color: Color::new(0.5, 0.2, 0.2, 0.85) },
+            FaceDef { corners: [3, 2, 6, 7], label: "N",      normal: [ 0.0, 1.0, 0.0], snap_yaw: PI/2.0, snap_pitch:  0.0,     color: Color::new(0.3, 0.7, 0.3, 0.85) },
+            FaceDef { corners: [0, 1, 5, 4], label: "S",      normal: [ 0.0,-1.0, 0.0], snap_yaw: -PI/2.0, snap_pitch: 0.0,     color: Color::new(0.2, 0.4, 0.2, 0.85) },
+        ]
+    }
+
+    fn rotate(p: &[f32; 3], right: Vec3, up: Vec3, front: Vec3) -> [f32; 3] {
+        [
+            p[0] * right.x + p[1] * right.y + p[2] * right.z,
+            p[0] * up.x    + p[1] * up.y    + p[2] * up.z,
+            -(p[0] * front.x + p[1] * front.y + p[2] * front.z),
+        ]
+    }
+
+    fn to_screen(rotated: &[f32; 3], cx: f32, cy: f32, scale: f32) -> (f32, f32) {
+        (cx + rotated[0] * scale, cy - rotated[1] * scale)
+    }
+
+    fn point_in_quad(px: f32, py: f32, quad: &[(f32, f32); 4]) -> bool {
+        let mut sign = None;
+        for i in 0..4 {
+            let (x1, y1) = quad[i];
+            let (x2, y2) = quad[(i + 1) % 4];
+            let cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1);
+            let s = cross > 0.0;
+            match sign {
+                None => sign = Some(s),
+                Some(prev) => if prev != s { return false; }
+            }
+        }
+        true
+    }
+
+    pub fn draw_and_interact(front: Vec3, right: Vec3, up: Vec3, interactive: bool) -> Option<(f32, f32)> {
+        let cx = screen_width() - MARGIN - SIZE;
+        let cy = MARGIN + SIZE;
+        let scale = SIZE * 0.45;
+
+        let face_defs = faces();
+
+        let rotated_corners: Vec<[f32; 3]> = CORNERS.iter()
+            .map(|c| rotate(c, right, up, front))
+            .collect();
+
+        struct RotatedFace {
+            screen_corners: [(f32, f32); 4],
+            center_z: f32,
+            center_screen: (f32, f32),
+            label: &'static str,
+            snap_yaw: f32,
+            snap_pitch: f32,
+            color: Color,
+            facing_camera: bool,
+        }
+
+        let mut rot_faces: Vec<RotatedFace> = face_defs.iter().map(|f| {
+            let rc: Vec<[f32; 3]> = f.corners.iter().map(|&i| rotated_corners[i]).collect();
+            let screen_corners = [
+                to_screen(&rc[0], cx, cy, scale),
+                to_screen(&rc[1], cx, cy, scale),
+                to_screen(&rc[2], cx, cy, scale),
+                to_screen(&rc[3], cx, cy, scale),
+            ];
+            let rn = rotate(&f.normal, right, up, front);
+            let center_z = rc.iter().map(|c| c[2]).sum::<f32>() / 4.0;
+            let center_screen = (
+                screen_corners.iter().map(|c| c.0).sum::<f32>() / 4.0,
+                screen_corners.iter().map(|c| c.1).sum::<f32>() / 4.0,
+            );
+            RotatedFace {
+                screen_corners,
+                center_z,
+                center_screen,
+                label: f.label,
+                snap_yaw: f.snap_yaw,
+                snap_pitch: f.snap_pitch,
+                color: f.color,
+                facing_camera: rn[2] > 0.0,
+            }
+        }).collect();
+
+        rot_faces.sort_by(|a, b| a.center_z.partial_cmp(&b.center_z).unwrap());
+
+        draw_circle(cx, cy, SIZE * 0.7, Color::new(0.15, 0.15, 0.15, 0.6));
+
+        for face in &rot_faces {
+            let c = face.screen_corners;
+            draw_triangle(
+                Vec2::new(c[0].0, c[0].1),
+                Vec2::new(c[1].0, c[1].1),
+                Vec2::new(c[2].0, c[2].1),
+                face.color,
+            );
+            draw_triangle(
+                Vec2::new(c[0].0, c[0].1),
+                Vec2::new(c[2].0, c[2].1),
+                Vec2::new(c[3].0, c[3].1),
+                face.color,
+            );
+
+            for i in 0..4 {
+                let j = (i + 1) % 4;
+                draw_line(c[i].0, c[i].1, c[j].0, c[j].1, 1.0, Color::new(0.8, 0.8, 0.8, 0.6));
+            }
+
+            if face.facing_camera {
+                let font_size = 14.0;
+                let text_w = face.label.len() as f32 * font_size * 0.35;
+                draw_text(
+                    face.label,
+                    face.center_screen.0 - text_w / 2.0,
+                    face.center_screen.1 + font_size * 0.25,
+                    font_size,
+                    WHITE,
+                );
+            }
+        }
+
+        if interactive && is_key_pressed(KeyCode::T) {
+            return Some((PI / 2.0, -1.5));
+        }
+
+
+        if interactive && is_mouse_button_pressed(MouseButton::Left) {
+            let (mx, my) = macroquad::input::mouse_position();
+            let dx = mx - cx;
+            let dy = my - cy;
+            if dx * dx + dy * dy < (SIZE * 0.8) * (SIZE * 0.8) {
+                for face in rot_faces.iter().rev() {
+                    if face.facing_camera && point_in_quad(mx, my, &face.screen_corners) {
+                        return Some((face.snap_yaw, face.snap_pitch));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ColorMode {
@@ -54,10 +231,87 @@ impl Background {
             Background::White => WHITE,
         }
     }
-
 }
 
-#[macroquad::main("Hai Performance Point Cloud Viewer")]
+#[derive(Clone, Copy, PartialEq)]
+enum AppMode {
+    View3D,
+    PointPick,
+    SectionPickStart,
+    SectionPickEnd,
+    SectionAdjustDepth,
+    SectionView,
+}
+
+/// Unproject screen coordinates to world XY plane at given Z height.
+fn screen_to_world_xy(sx: f32, sy: f32, view_proj: &glam::Mat4, z_plane: f32) -> Option<(f32, f32)> {
+    let inv = view_proj.inverse();
+    let ndc_x = sx / screen_width() * 2.0 - 1.0;
+    let ndc_y = 1.0 - sy / screen_height() * 2.0;
+
+    let near = inv * glam::Vec4::new(ndc_x, ndc_y, -1.0, 1.0);
+    let far = inv * glam::Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+    let near = glam::Vec3::new(near.x / near.w, near.y / near.w, near.z / near.w);
+    let far = glam::Vec3::new(far.x / far.w, far.y / far.w, far.z / far.w);
+
+    let dir = far - near;
+    if dir.z.abs() < 1e-6 {
+        return Some((near.x, near.y));
+    }
+    let t = (z_plane - near.z) / dir.z;
+    Some((near.x + dir.x * t, near.y + dir.y * t))
+}
+
+/// Draw the section corridor as 3D wireframe box.
+fn draw_section_corridor(
+    start: (f32, f32),
+    end: (f32, f32),
+    depth: f32,
+    height_range: f32,
+) {
+    let dx = end.0 - start.0;
+    let dy = end.1 - start.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 0.001 { return; }
+    let nx = -dy / len * depth;
+    let ny = dx / len * depth;
+
+    // 4 bottom corners (z=0), 4 top corners (z=height_range)
+    let b = [
+        vec3(start.0 + nx, start.1 + ny, 0.0),
+        vec3(start.0 - nx, start.1 - ny, 0.0),
+        vec3(end.0 - nx,   end.1 - ny,   0.0),
+        vec3(end.0 + nx,   end.1 + ny,   0.0),
+    ];
+    let t = [
+        vec3(start.0 + nx, start.1 + ny, height_range),
+        vec3(start.0 - nx, start.1 - ny, height_range),
+        vec3(end.0 - nx,   end.1 - ny,   height_range),
+        vec3(end.0 + nx,   end.1 + ny,   height_range),
+    ];
+
+    let col = YELLOW;
+    // Bottom rectangle
+    for i in 0..4 {
+        draw_line_3d(b[i], b[(i + 1) % 4], col);
+    }
+    // Top rectangle
+    for i in 0..4 {
+        draw_line_3d(t[i], t[(i + 1) % 4], col);
+    }
+    // Verticals
+    for i in 0..4 {
+        draw_line_3d(b[i], t[i], col);
+    }
+    // Center line
+    draw_line_3d(
+        vec3(start.0, start.1, height_range * 0.5),
+        vec3(end.0, end.1, height_range * 0.5),
+        RED,
+    );
+}
+
+#[macroquad::main("HaiViz")]
 async fn main() {
     if env::args().count() != 2 {
         println!("{}", style("Usage: haiviz pointcloud.laz").red());
@@ -68,43 +322,199 @@ async fn main() {
 
     let mut color_mode = ColorMode::Height;
     let mut background = Background::Black;
+    let mut app_mode = AppMode::View3D;
 
     let mut stage = {
         let InternalGlContext {
             quad_context: ctx, ..
         } = unsafe { get_internal_gl() };
 
-        raw_miniquad::Stage::new(ctx, cloudfile, color_mode)
+        Stage::new(ctx, cloudfile, color_mode)
     };
 
-    let world_up = vec3(0.0, 1.0, 0.0);
+    let height_range = stage.height_range();
+
+    let world_up = vec3(0.0, 0.0, 1.0);
     let mut yaw: f32 = 1.18;
     let mut pitch: f32 = 0.0;
 
     let mut front = vec3(
         yaw.cos() * pitch.cos(),
-        pitch.sin(),
         yaw.sin() * pitch.cos(),
+        pitch.sin(),
     )
     .normalize();
     let mut right = front.cross(world_up).normalize();
     let mut up = right.cross(front).normalize();
-    let mut position = vec3(0.0, 1.0, 0.0);
+    let mut position = vec3(0.0, 0.0, 1.0);
     let mut last_mouse_position: Vec2 = mouse_position().into();
 
     let mut grabbed = false;
     set_cursor_grab(grabbed);
     show_mouse(!grabbed);
 
-    // Orthographic zoom: visible half-height in world units
     let mut ortho_scale: f32 = 50.0;
+
+    // Section state
+    let mut section_start: Option<(f32, f32)> = None;
+    let mut section_end: Option<(f32, f32)> = None;
+    let mut section_depth: f32 = 2.0;
+    let mut section_data: Option<SectionData> = None;
+    // Section 2D view state
+    let mut section_pan = glam::Vec2::ZERO;
+    let mut section_zoom: f32 = 50.0;
+
+    // Point pick state
+    let mut picked_point: Option<usize> = None;
 
     loop {
         let delta = get_frame_time();
 
         if is_key_pressed(KeyCode::Escape) {
-            break;
+            if app_mode != AppMode::View3D {
+                app_mode = AppMode::View3D;
+                section_data = None;
+            } else {
+                break;
+            }
         }
+
+        if app_mode == AppMode::SectionView {
+            // ---- Section 2D view ----
+            // Navigation
+            if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) {
+                section_pan.y += MOVE_SPEED * section_zoom * 0.02;
+            }
+            if is_key_down(KeyCode::S) || is_key_down(KeyCode::Down) {
+                section_pan.y -= MOVE_SPEED * section_zoom * 0.02;
+            }
+            if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
+                section_pan.x -= MOVE_SPEED * section_zoom * 0.02;
+            }
+            if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
+                section_pan.x += MOVE_SPEED * section_zoom * 0.02;
+            }
+
+            // Middle mouse drag to pan section view
+            let sec_mouse_pos: Vec2 = mouse_position().into();
+            let sec_mouse_delta = sec_mouse_pos - last_mouse_position;
+            last_mouse_position = sec_mouse_pos;
+            if is_mouse_button_down(MouseButton::Middle) {
+                let units_per_pixel = section_zoom * 2.0 / screen_height();
+                section_pan.x -= sec_mouse_delta.x * units_per_pixel;
+                section_pan.y += sec_mouse_delta.y * units_per_pixel;
+            }
+
+            let (_mwx, mwy) = mouse_wheel();
+            if mwy.abs() > 0.001 {
+                let factor = if mwy > 0.0 { 0.9 } else { 1.1 };
+                section_zoom *= factor;
+                section_zoom = section_zoom.clamp(0.1, 10000.0);
+            }
+
+            clear_background(background.color());
+
+            // Render section points
+            if let Some(ref sec) = section_data {
+                let aspect = screen_width() / screen_height();
+                let half_h = section_zoom;
+                let half_w = half_h * aspect;
+                let section_mvp = glam::Mat4::orthographic_rh_gl(
+                    section_pan.x - half_w, section_pan.x + half_w,
+                    section_pan.y - half_h, section_pan.y + half_h,
+                    -1.0, 1.0,
+                );
+
+                {
+                    let mut gl = unsafe { get_internal_gl() };
+                    gl.flush();
+                    gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
+                    stage.draw_section(&mut *gl.quad_context, sec, &section_mvp);
+                    gl.quad_context.end_render_pass();
+                }
+
+                set_default_camera();
+
+                // Draw reference axes in screen space
+                // Map section world coords to screen coords
+                let world_to_screen_x = |wx: f32| -> f32 {
+                    (wx - (section_pan.x - half_w)) / (2.0 * half_w) * screen_width()
+                };
+                let world_to_screen_y = |wy: f32| -> f32 {
+                    (1.0 - (wy - (section_pan.y - half_h)) / (2.0 * half_h)) * screen_height()
+                };
+
+                // Ground line (Y=0)
+                let ground_sy = world_to_screen_y(0.0);
+                if ground_sy > 0.0 && ground_sy < screen_height() {
+                    draw_line(0.0, ground_sy, screen_width(), ground_sy, 1.0, Color::new(0.4, 0.4, 0.4, 0.5));
+                    draw_text("0m", 5.0, ground_sy - 3.0, 16.0, GRAY);
+                }
+
+                // Section start/end markers
+                let sx0 = world_to_screen_x(0.0);
+                let sx1 = world_to_screen_x(sec.length);
+                draw_line(sx0, 0.0, sx0, screen_height(), 1.0, Color::new(0.4, 0.4, 0.0, 0.5));
+                draw_line(sx1, 0.0, sx1, screen_height(), 1.0, Color::new(0.4, 0.4, 0.0, 0.5));
+                draw_text("start", sx0 + 3.0, 30.0, 16.0, YELLOW);
+                draw_text(&format!("{:.1}m", sec.length), sx1 + 3.0, 30.0, 16.0, YELLOW);
+            }
+
+            // egui
+            let prev_color_mode = color_mode;
+            egui_macroquad::ui(|egui_ctx| {
+                egui_macroquad::egui::Window::new("Controls")
+                    .default_pos([10.0, 10.0])
+                    .show(egui_ctx, |ui| {
+                        if ui.button("Back to 3D").clicked() {
+                            app_mode = AppMode::View3D;
+                            section_data = None;
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Color:");
+                            egui_macroquad::egui::ComboBox::from_id_salt("color_mode")
+                                .selected_text(color_mode.label())
+                                .show_ui(ui, |ui| {
+                                    for mode in &ColorMode::ALL {
+                                        ui.selectable_value(&mut color_mode, *mode, mode.label());
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Background:");
+                            egui_macroquad::egui::ComboBox::from_id_salt("background")
+                                .selected_text(background.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut background, Background::Black, "Black");
+                                    ui.selectable_value(&mut background, Background::White, "White");
+                                });
+                        });
+                        if let Some(ref sec) = section_data {
+                            ui.label(format!(
+                                "Section: {:.1}m | {} points | h: {:.1}..{:.1}m",
+                                sec.length, sec.num_points, sec.height_min, sec.height_max
+                            ));
+                        }
+                    });
+            });
+            egui_macroquad::draw();
+
+            if color_mode != prev_color_mode {
+                // Rebuild section with new colors
+                if let (Some(start), Some(end)) = (section_start, section_end) {
+                    let gl = unsafe { get_internal_gl() };
+                    section_data = Some(stage.extract_section(
+                        &mut *gl.quad_context, start, end, section_depth, color_mode,
+                    ));
+                }
+            }
+
+            next_frame().await;
+            continue;
+        }
+
+        // ---- 3D view modes ----
         if is_key_pressed(KeyCode::Tab) {
             grabbed = !grabbed;
             set_cursor_grab(grabbed);
@@ -124,16 +534,23 @@ async fn main() {
             position += right * MOVE_SPEED;
         }
 
-        let (_mouse_wheel_x, mouse_wheel_y) = mouse_wheel();
-        if mouse_wheel_y.abs() > 0.001 {
-            let zoom_factor = if mouse_wheel_y > 0.0 { 0.9 } else { 1.1 };
+        // Scroll: zoom in 3D mode, adjust depth in SectionAdjustDepth
+        let (_mwx, mwy) = mouse_wheel();
+        if app_mode == AppMode::SectionAdjustDepth {
+            if mwy.abs() > 0.001 {
+                let factor = if mwy > 0.0 { 1.2 } else { 0.8 };
+                section_depth *= factor;
+                section_depth = section_depth.clamp(0.1, 500.0);
+            }
+        } else if mwy.abs() > 0.001 {
+            let zoom_factor = if mwy > 0.0 { 0.9 } else { 1.1 };
             ortho_scale *= zoom_factor;
             ortho_scale = ortho_scale.clamp(0.5, 10000.0);
         }
 
-        let mouse_position: Vec2 = mouse_position().into();
-        let mouse_delta = mouse_position - last_mouse_position;
-        last_mouse_position = mouse_position;
+        let mouse_pos: Vec2 = mouse_position().into();
+        let mouse_delta = mouse_pos - last_mouse_position;
+        last_mouse_position = mouse_pos;
 
         if grabbed || is_mouse_button_down(MouseButton::Right) {
             yaw += mouse_delta.x * delta * LOOK_SPEED;
@@ -142,13 +559,20 @@ async fn main() {
 
             front = vec3(
                 yaw.cos() * pitch.cos(),
-                pitch.sin(),
                 yaw.sin() * pitch.cos(),
+                pitch.sin(),
             )
             .normalize();
 
             right = front.cross(world_up).normalize();
             up = right.cross(front).normalize();
+        }
+
+        // Middle mouse drag to pan
+        if is_mouse_button_down(MouseButton::Middle) {
+            let units_per_pixel = ortho_scale * 2.0 / screen_height();
+            position -= right * mouse_delta.x * units_per_pixel;
+            position += up * mouse_delta.y * units_per_pixel;
         }
 
         clear_background(background.color());
@@ -164,17 +588,41 @@ async fn main() {
             ..Default::default()
         };
         set_camera(&camera);
+        let view_proj: glam::Mat4 = camera.matrix();
 
-        draw_cube_wires(vec3(90., 9., 17.), vec3(2., 2., 2.), GREEN);
-        draw_cube_wires(vec3(0., 1., 6.), vec3(2., 2., 2.), BLUE);
-        draw_cube_wires(vec3(16., 13., 8.), vec3(2., 2., 2.), RED);
+        //draw_cube_wires(vec3(90., 9., 17.), vec3(2., 2., 2.), GREEN);
+        //draw_cube_wires(vec3(0., 1., 6.), vec3(2., 2., 2.), BLUE);
+        //draw_cube_wires(vec3(16., 13., 8.), vec3(2., 2., 2.), RED);
 
+        // Section preview drawing (in 3D, behind points)
+        let mid_z = height_range * 0.5;
+        let (mx, my) = macroquad::input::mouse_position();
+        let cursor_world = screen_to_world_xy(mx, my, &view_proj, mid_z);
+
+        match app_mode {
+            AppMode::SectionPickEnd => {
+                if let (Some(start), Some((wx, wy))) = (section_start, cursor_world) {
+                    draw_line_3d(
+                        vec3(start.0, start.1, mid_z),
+                        vec3(wx, wy, mid_z),
+                        YELLOW,
+                    );
+                }
+            }
+            AppMode::SectionAdjustDepth => {
+                if let (Some(start), Some(end)) = (section_start, section_end) {
+                    draw_section_corridor(start, end, section_depth, height_range);
+                }
+            }
+            _ => {}
+        }
+
+        // Render point cloud
         let drawn = {
             let mut gl = unsafe { get_internal_gl() };
             gl.flush();
 
             gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
-            let view_proj: glam::Mat4 = camera.matrix();
             let drawn = stage.draw_visible(&mut *gl.quad_context, &view_proj);
             gl.quad_context.end_render_pass();
             drawn
@@ -182,12 +630,65 @@ async fn main() {
 
         set_default_camera();
 
+        // View cube (only interactive in View3D)
+        let vc_interactive = app_mode == AppMode::View3D || app_mode == AppMode::PointPick;
+        if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive) {
+            yaw = new_yaw;
+            pitch = new_pitch;
+            front = vec3(
+                yaw.cos() * pitch.cos(),
+                yaw.sin() * pitch.cos(),
+                pitch.sin(),
+            )
+            .normalize();
+            right = front.cross(world_up).normalize();
+            up = right.cross(front).normalize();
+        }
+
         // egui UI
         let prev_color_mode = color_mode;
+        let mut egui_wants_pointer = false;
         egui_macroquad::ui(|egui_ctx| {
+            egui_wants_pointer = egui_ctx.is_pointer_over_area();
             egui_macroquad::egui::Window::new("Controls")
                 .default_pos([10.0, 10.0])
                 .show(egui_ctx, |ui| {
+                    let section_label = match app_mode {
+                        AppMode::View3D | AppMode::PointPick => "Cross Section",
+                        AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
+                        AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
+                        AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
+                        AppMode::SectionView => "Back to 3D",
+                    };
+                    if ui.button(section_label).clicked() {
+                        match app_mode {
+                            AppMode::View3D | AppMode::PointPick => {
+                                app_mode = AppMode::SectionPickStart;
+                                section_start = None;
+                                section_end = None;
+                                picked_point = None;
+                            }
+                            _ => {
+                                app_mode = AppMode::View3D;
+                                section_data = None;
+                            }
+                        }
+                    }
+
+                    let pick_label = if app_mode == AppMode::PointPick {
+                        "Click a point... (Esc to cancel)"
+                    } else {
+                        "Point Info"
+                    };
+                    if ui.button(pick_label).clicked() {
+                        if app_mode == AppMode::PointPick {
+                            app_mode = AppMode::View3D;
+                        } else {
+                            app_mode = AppMode::PointPick;
+                            picked_point = None;
+                        }
+                    }
+                    ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("Color:");
                         egui_macroquad::egui::ComboBox::from_id_salt("color_mode")
@@ -212,9 +713,63 @@ async fn main() {
                         drawn, stage.total_points, stage.chunks.len(),
                         1.0 / get_frame_time(), ortho_scale
                     ));
+                    if app_mode == AppMode::SectionAdjustDepth {
+                        ui.label(format!("Section depth: {:.1}m", section_depth));
+                    }
+                    if let Some(idx) = picked_point {
+                        ui.separator();
+                        let p = &stage.cloud.points[idx];
+                        ui.label("Point Info:");
+                        ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
+                        ui.label(format!("  Intensity: {}", p.intensity));
+                        let class_id: u8 = p.classification.into();
+                        ui.label(format!("  Classification: {} ({:?})", class_id, p.classification));
+                        ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
+                        if let Some(ref color) = p.color {
+                            ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
+                        }
+                        if let Some(time) = p.gps_time {
+                            ui.label(format!("  GPS time: {:.6}", time));
+                        }
+                    }
                 });
         });
         egui_macroquad::draw();
+
+        // Handle mode-specific clicks (only if egui didn't consume the click)
+        if !egui_wants_pointer && is_mouse_button_pressed(MouseButton::Left) {
+            match app_mode {
+                AppMode::PointPick => {
+                    picked_point = stage.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height());
+                }
+                AppMode::SectionPickStart => {
+                    if let Some(world) = cursor_world {
+                        section_start = Some(world);
+                        app_mode = AppMode::SectionPickEnd;
+                    }
+                }
+                AppMode::SectionPickEnd => {
+                    if let Some(world) = cursor_world {
+                        section_end = Some(world);
+                        app_mode = AppMode::SectionAdjustDepth;
+                    }
+                }
+                AppMode::SectionAdjustDepth => {
+                    if let (Some(start), Some(end)) = (section_start, section_end) {
+                        let gl = unsafe { get_internal_gl() };
+                        let sec = stage.extract_section(
+                            &mut *gl.quad_context, start, end, section_depth, color_mode,
+                        );
+                        // Set initial section view to fit the data
+                        section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
+                        section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
+                        section_data = Some(sec);
+                        app_mode = AppMode::SectionView;
+                    }
+                }
+                _ => {}
+            }
+        }
 
         if color_mode != prev_color_mode {
             let gl = unsafe { get_internal_gl() };
@@ -225,388 +780,3 @@ async fn main() {
     }
 }
 
-mod raw_miniquad {
-    use std::collections::HashMap;
-
-    use las::{Point, Reader};
-    use miniquad::*;
-
-    use crate::ColorMode;
-
-    const CHUNK_SIZE: f32 = 50.0;
-
-    /// Point cloud backed by las::Point for full attribute access.
-    pub struct VizPointcloud {
-        pub points: Vec<Point>,
-        pub min: [f64; 3],
-        pub max: [f64; 3],
-        pub intensity_min: u16,
-        pub intensity_max: u16,
-    }
-
-    impl VizPointcloud {
-        pub fn load(filename: &str) -> VizPointcloud {
-            let mut reader = Reader::from_path(filename).unwrap();
-            let n = reader.header().number_of_points() as usize;
-
-            let mut points = Vec::with_capacity(n);
-            reader.read_all_points_into(&mut points).unwrap();
-
-            let mut min = [f64::MAX; 3];
-            let mut max = [f64::MIN; 3];
-            let mut intensity_min = u16::MAX;
-            let mut intensity_max = u16::MIN;
-
-            for point in &points {
-                min[0] = min[0].min(point.x);
-                min[1] = min[1].min(point.y);
-                min[2] = min[2].min(point.z);
-                max[0] = max[0].max(point.x);
-                max[1] = max[1].max(point.y);
-                max[2] = max[2].max(point.z);
-                intensity_min = intensity_min.min(point.intensity);
-                intensity_max = intensity_max.max(point.intensity);
-            }
-
-            println!("{} points loaded from {}", points.len(), filename);
-            println!("Intensity range: {}..{}", intensity_min, intensity_max);
-            VizPointcloud { points, min, max, intensity_min, intensity_max }
-        }
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct Vertex {
-        pub pos: [f32; 3],
-        pub color: [f32; 3],
-    }
-
-    pub struct Chunk {
-        bindings: Bindings,
-        num_points: i32,
-        aabb_min: [f32; 3],
-        aabb_max: [f32; 3],
-        point_indices: Vec<usize>,
-    }
-
-    pub struct Stage {
-        pipeline: Pipeline,
-        pub chunks: Vec<Chunk>,
-        pub total_points: i32,
-        pub cloud: VizPointcloud,
-        positions: Vec<[f32; 3]>,
-    }
-
-    fn color_for_point(point: &Point, pos_y: f32, height_range: f32, intensity_min: u16, intensity_range: f32, mode: ColorMode) -> [f32; 3] {
-        match mode {
-            ColorMode::Height => {
-                let h = if height_range > 0.0 { (pos_y / height_range).clamp(0.0, 1.0) } else { 0.5 };
-                let r = (2.0 * h - 0.5).clamp(0.0, 1.0);
-                let g = (1.0 - 2.0 * (h - 0.5).abs()).clamp(0.0, 1.0);
-                let b = (1.0 - 2.0 * h).clamp(0.0, 1.0);
-                [r, g, b]
-            }
-            ColorMode::Intensity => {
-                let i = if intensity_range > 0.0 {
-                    ((point.intensity - intensity_min) as f32 / intensity_range).clamp(0.0, 1.0)
-                } else {
-                    0.5
-                };
-                [i, i, i]
-            }
-            ColorMode::Classification => {
-                classification_color(point.classification.into())
-            }
-            ColorMode::Rgb => {
-                if let Some(color) = &point.color {
-                    let r = color.red as f32 / 65535.0;
-                    let g = color.green as f32 / 65535.0;
-                    let b = color.blue as f32 / 65535.0;
-                    [r, g, b]
-                } else {
-                    [0.5, 0.5, 0.5]
-                }
-            }
-        }
-    }
-
-    fn classification_color(class: u8) -> [f32; 3] {
-        match class {
-            0 => [0.5, 0.5, 0.5],     // Created/Never classified
-            1 => [0.6, 0.6, 0.6],     // Unclassified
-            2 => [0.6, 0.4, 0.2],     // Ground
-            3 => [0.0, 0.8, 0.0],     // Low Vegetation
-            4 => [0.0, 0.6, 0.0],     // Medium Vegetation
-            5 => [0.0, 0.4, 0.0],     // High Vegetation
-            6 => [1.0, 0.0, 0.0],     // Building
-            7 => [1.0, 0.5, 0.0],     // Low Point (noise)
-            8 => [0.8, 0.8, 0.0],     // Model Key-point
-            9 => [0.0, 0.0, 1.0],     // Water
-            10 => [0.8, 0.8, 0.8],    // Rail
-            11 => [0.3, 0.3, 0.3],    // Road Surface
-            12 => [0.9, 0.9, 0.0],    // Overlap
-            13 => [0.7, 0.7, 0.0],    // Wire - Guard
-            14 => [0.9, 0.9, 0.0],    // Wire - Conductor
-            15 => [0.4, 0.0, 0.6],    // Transmission Tower
-            16 => [0.6, 0.0, 0.8],    // Wire - Connector
-            17 => [0.2, 0.2, 0.6],    // Bridge Deck
-            18 => [1.0, 0.0, 0.5],    // High Noise
-            _ => {
-                let h = (class as f32 * 0.618033988) % 1.0;
-                hsv_to_rgb(h, 0.8, 0.9)
-            }
-        }
-    }
-
-    fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
-        let i = (h * 6.0).floor();
-        let f = h * 6.0 - i;
-        let p = v * (1.0 - s);
-        let q = v * (1.0 - f * s);
-        let t = v * (1.0 - (1.0 - f) * s);
-        match (i as i32) % 6 {
-            0 => [v, t, p],
-            1 => [q, v, p],
-            2 => [p, v, t],
-            3 => [p, q, v],
-            4 => [t, p, v],
-            _ => [v, p, q],
-        }
-    }
-
-    fn extract_frustum_planes(vp: &glam::Mat4) -> [[f32; 4]; 6] {
-        let c = vp.to_cols_array_2d();
-        let mut planes = [[0.0f32; 4]; 6];
-        for i in 0..4 {
-            planes[0][i] = c[i][3] + c[i][0];
-            planes[1][i] = c[i][3] - c[i][0];
-            planes[2][i] = c[i][3] + c[i][1];
-            planes[3][i] = c[i][3] - c[i][1];
-            planes[4][i] = c[i][3] + c[i][2];
-            planes[5][i] = c[i][3] - c[i][2];
-        }
-        for plane in &mut planes {
-            let len = (plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]).sqrt();
-            if len > 0.0 {
-                for v in plane.iter_mut() {
-                    *v /= len;
-                }
-            }
-        }
-        planes
-    }
-
-    fn aabb_outside_frustum(planes: &[[f32; 4]; 6], amin: &[f32; 3], amax: &[f32; 3]) -> bool {
-        for plane in planes {
-            let px = if plane[0] >= 0.0 { amax[0] } else { amin[0] };
-            let py = if plane[1] >= 0.0 { amax[1] } else { amin[1] };
-            let pz = if plane[2] >= 0.0 { amax[2] } else { amin[2] };
-            if plane[0] * px + plane[1] * py + plane[2] * pz + plane[3] < 0.0 {
-                return true;
-            }
-        }
-        false
-    }
-
-    impl Stage {
-        pub fn new(ctx: &mut dyn RenderingBackend, filename: &str, color_mode: ColorMode) -> Stage {
-            let cloud = VizPointcloud::load(filename);
-
-            let height_range = (cloud.max[2] - cloud.min[2]) as f32;
-            let intensity_range = (cloud.intensity_max - cloud.intensity_min) as f32;
-
-            let positions: Vec<[f32; 3]> = cloud
-                .points
-                .iter()
-                .map(|p| [
-                    (p.x - cloud.min[0]) as f32,
-                    (p.z - cloud.min[2]) as f32, // z -> y (up)
-                    (p.y - cloud.min[1]) as f32,
-                ])
-                .collect();
-
-            let vertices: Vec<Vertex> = cloud
-                .points
-                .iter()
-                .enumerate()
-                .map(|(i, p)| Vertex {
-                    pos: positions[i],
-                    color: color_for_point(p, positions[i][1], height_range, cloud.intensity_min, intensity_range, color_mode),
-                })
-                .collect();
-
-            let mut chunk_map: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-            for (i, pos) in positions.iter().enumerate() {
-                let cx = (pos[0] / CHUNK_SIZE).floor() as i32;
-                let cz = (pos[2] / CHUNK_SIZE).floor() as i32;
-                chunk_map.entry((cx, cz)).or_default().push(i);
-            }
-
-            let shader = ctx
-                .new_shader(
-                    miniquad::ShaderSource::Glsl {
-                        vertex: shader::VERTEX,
-                        fragment: shader::FRAGMENT,
-                    },
-                    shader::meta(),
-                )
-                .unwrap();
-
-            let pipeline = ctx.new_pipeline(
-                &[BufferLayout::default()],
-                &[
-                    VertexAttribute::new("pos", VertexFormat::Float3),
-                    VertexAttribute::new("color", VertexFormat::Float3),
-                ],
-                shader,
-                PipelineParams {
-                    primitive_type: PrimitiveType::Points,
-                    depth_test: Comparison::LessOrEqual,
-                    depth_write: true,
-                    ..Default::default()
-                },
-            );
-
-            let total_points = vertices.len() as i32;
-
-            let chunks: Vec<Chunk> = chunk_map
-                .into_iter()
-                .map(|(_key, point_indices)| {
-                    let chunk_verts: Vec<Vertex> =
-                        point_indices.iter().map(|&i| vertices[i]).collect();
-
-                    let mut aabb_min = [f32::MAX; 3];
-                    let mut aabb_max = [f32::MIN; 3];
-                    for v in &chunk_verts {
-                        for j in 0..3 {
-                            aabb_min[j] = aabb_min[j].min(v.pos[j]);
-                            aabb_max[j] = aabb_max[j].max(v.pos[j]);
-                        }
-                    }
-
-                    let n = chunk_verts.len() as i32;
-                    let vertex_buffer = ctx.new_buffer(
-                        BufferType::VertexBuffer,
-                        BufferUsage::Dynamic,
-                        BufferSource::slice(&chunk_verts),
-                    );
-                    let indices: Vec<u32> = (0..n as u32).collect();
-                    let index_buffer = ctx.new_buffer(
-                        BufferType::IndexBuffer,
-                        BufferUsage::Immutable,
-                        BufferSource::slice(&indices),
-                    );
-
-                    Chunk {
-                        bindings: Bindings {
-                            vertex_buffers: vec![vertex_buffer],
-                            index_buffer,
-                            images: vec![],
-                        },
-                        num_points: n,
-                        aabb_min,
-                        aabb_max,
-                        point_indices,
-                    }
-                })
-                .collect();
-
-            println!("{} points in {} chunks ({}m cells), height range: {:.1}m",
-                total_points, chunks.len(), CHUNK_SIZE, height_range);
-
-            Stage {
-                pipeline,
-                chunks,
-                total_points,
-                cloud,
-                positions,
-            }
-        }
-
-        pub fn rebuild_colors(&mut self, ctx: &mut dyn RenderingBackend, color_mode: ColorMode) {
-            let height_range = (self.cloud.max[2] - self.cloud.min[2]) as f32;
-            let intensity_range = (self.cloud.intensity_max - self.cloud.intensity_min) as f32;
-
-            for chunk in &mut self.chunks {
-                let chunk_verts: Vec<Vertex> = chunk
-                    .point_indices
-                    .iter()
-                    .map(|&i| {
-                        let p = &self.cloud.points[i];
-                        Vertex {
-                            pos: self.positions[i],
-                            color: color_for_point(p, self.positions[i][1], height_range, self.cloud.intensity_min, intensity_range, color_mode),
-                        }
-                    })
-                    .collect();
-
-                ctx.buffer_update(
-                    chunk.bindings.vertex_buffers[0],
-                    BufferSource::slice(&chunk_verts),
-                );
-            }
-        }
-
-        pub fn draw_visible(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4) -> i32 {
-            let planes = extract_frustum_planes(view_proj);
-            let mut drawn = 0;
-
-            ctx.apply_pipeline(&self.pipeline);
-            for chunk in &self.chunks {
-                if aabb_outside_frustum(&planes, &chunk.aabb_min, &chunk.aabb_max) {
-                    continue;
-                }
-                ctx.apply_bindings(&chunk.bindings);
-                ctx.apply_uniforms(miniquad::UniformsSource::table(
-                    &shader::Uniforms {
-                        mvp: *view_proj,
-                    },
-                ));
-                ctx.draw(0, chunk.num_points, 1);
-                drawn += chunk.num_points;
-            }
-            drawn
-        }
-    }
-
-    pub mod shader {
-        use miniquad::*;
-
-        pub const VERTEX: &str = r#"#version 100
-            attribute vec3 pos;
-            attribute vec3 color;
-
-            uniform mat4 mvp;
-
-            varying lowp vec3 v_color;
-
-            void main() {
-                gl_Position = mvp * vec4(pos, 1.0);
-                gl_PointSize = 2.0;
-                v_color = color;
-            }"#;
-
-        pub const FRAGMENT: &str = r#"#version 100
-            varying lowp vec3 v_color;
-
-            void main() {
-                gl_FragColor = vec4(v_color, 1.0);
-            }"#;
-
-        pub fn meta() -> ShaderMeta {
-            ShaderMeta {
-                images: vec![],
-                uniforms: UniformBlockLayout {
-                    uniforms: vec![
-                        UniformDesc::new("mvp", UniformType::Mat4),
-                    ],
-                },
-            }
-        }
-
-        #[repr(C)]
-        pub struct Uniforms {
-            pub mvp: glam::Mat4,
-        }
-    }
-}
