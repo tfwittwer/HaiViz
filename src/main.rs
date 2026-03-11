@@ -1,17 +1,19 @@
 use std::env;
 use std::path::Path;
+//use rfd;
 
 use console::style;
 use crate::glam::vec3;
 
 use macroquad::prelude::*;
 
-use crate::raw_miniquad::raw_miniquad::{SectionData, Stage, TileStageManager, load_class_defs};
+use crate::raw_miniquad::{EdlRenderer, SectionData, Stage, TileStageManager, load_class_defs};
 
 const MOVE_SPEED: f32 = 0.5;
 const LOOK_SPEED: f32 = 0.5;
 
 mod raw_miniquad;
+mod polylines;
 
 mod view_cube {
     use macroquad::prelude::*;
@@ -191,6 +193,7 @@ pub enum ColorMode {
     Intensity,
     Classification,
     Rgb,
+    PointSourceId,
 }
 
 impl ColorMode {
@@ -200,38 +203,19 @@ impl ColorMode {
             ColorMode::Intensity => "Intensity",
             ColorMode::Classification => "Classification",
             ColorMode::Rgb => "RGB",
+            ColorMode::PointSourceId => "PointSourceId",
         }
     }
 
-    const ALL: [ColorMode; 4] = [
+    const ALL: [ColorMode; 5] = [
         ColorMode::Height,
         ColorMode::Intensity,
         ColorMode::Classification,
         ColorMode::Rgb,
+        ColorMode::PointSourceId,
     ];
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum Background {
-    Black,
-    White,
-}
-
-impl Background {
-    fn label(&self) -> &'static str {
-        match self {
-            Background::Black => "Black",
-            Background::White => "White",
-        }
-    }
-
-    fn color(&self) -> macroquad::color::Color {
-        match self {
-            Background::Black => BLACK,
-            Background::White => WHITE,
-        }
-    }
-}
 
 #[derive(Clone, Copy, PartialEq)]
 enum AppMode {
@@ -241,6 +225,8 @@ enum AppMode {
     SectionPickEnd,
     SectionAdjustDepth,
     SectionView,
+    MeasureFirst,
+    MeasureSecond,
 }
 
 /// Unproject screen coordinates to world XY plane at given Z height.
@@ -318,18 +304,121 @@ fn draw_section_corridor(
 }
 
 /// Format classification label using custom class_defs or default debug format.
-fn class_label(class: las::point::Classification, class_defs: &Option<crate::raw_miniquad::raw_miniquad::ClassDefs>) -> String {
+fn class_label(class: las::point::Classification, class_defs: &Option<crate::raw_miniquad::ClassDefs>) -> String {
     let id: u8 = class.into();
-    if let Some(defs) = class_defs {
-        if let Some((label, _)) = defs.get(&id) {
+    if let Some(defs) = class_defs &&
+        let Some((label, _)) = defs.get(&id) {
             return format!("{} ({})", id, label);
-        }
+        
     }
     format!("{} ({:?})", id, class)
 }
 
-#[macroquad::main("HaiViz")]
+fn polylines_window(
+    egui_ctx: &egui_macroquad::egui::Context,
+    poly_files: &mut Vec<polylines::PolylineFile>,
+    selected_poly: &mut Option<(usize, usize)>,
+    poly_load_error: &mut Option<String>,
+    data_offset: [f64; 3],
+    background: Color,
+) {
+    egui_macroquad::egui::Window::new("Polylines")
+        .default_pos([10.0, 300.0])
+        .default_open(false)
+        .show(egui_ctx, |ui| {
+            let luma = background.r * 0.299 + background.g * 0.587 + background.b * 0.114;
+            let default_color = if luma > 0.5 { BLACK } else { WHITE };
+            if ui.button("Load Polyline File...").clicked() &&
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Polyline", &["txt", "xyz", "poly", "dat", ""])
+                    .pick_file()
+                {
+                    match polylines::load(path.to_str().unwrap_or(""), data_offset, default_color) {
+                        Ok(pf) => { *poly_load_error = None; poly_files.push(pf); }
+                        Err(e) => { *poly_load_error = Some(e); }
+                }
+                
+            }
+            if let Some(ref err) = *poly_load_error {
+                ui.colored_label(egui_macroquad::egui::Color32::RED, err);
+            }
+            ui.separator();
+            let mut to_remove: Option<usize> = None;
+            for (fi, pf) in poly_files.iter_mut().enumerate() {
+                let fname = std::path::Path::new(&pf.path)
+                    .file_name().and_then(|n| n.to_str()).unwrap_or(&pf.path);
+                ui.collapsing(format!("{} ({} lines)", fname, pf.polylines.len()), |ui| {
+                    if ui.small_button("Remove file").clicked() {
+                        to_remove = Some(fi);
+                        if selected_poly.map(|(f, _)| f) == Some(fi) { *selected_poly = None; }
+                    }
+                    for (pi, pl) in pf.polylines.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            let is_sel = *selected_poly == Some((fi, pi));
+                            if ui.selectable_label(is_sel, &pl.name).clicked() {
+                                *selected_poly = if is_sel { None } else { Some((fi, pi)) };
+                            }
+                            let mut ec = mq_to_egui(pl.color);
+                            if ui.color_edit_button_srgba(&mut ec).changed() {
+                                pl.color = egui_to_mq(ec);
+                            }
+                            ui.add(egui_macroquad::egui::Slider::new(&mut pl.radius, 0.001..=0.05).text("r (m)").logarithmic(true));
+                        });
+                    }
+                });
+            }
+            if let Some(fi) = to_remove { poly_files.remove(fi); }
+        });
+}
+
+fn mq_to_egui(c: Color) -> egui_macroquad::egui::Color32 {
+    egui_macroquad::egui::Color32::from_rgba_unmultiplied(
+        (c.r * 255.0) as u8, (c.g * 255.0) as u8,
+        (c.b * 255.0) as u8, (c.a * 255.0) as u8,
+    )
+}
+
+fn egui_to_mq(c: egui_macroquad::egui::Color32) -> Color {
+    Color::new(c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, c.a() as f32 / 255.0)
+}
+
+fn gen_icon() -> miniquad::conf::Icon {
+    let mut seed: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = || -> u8 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed & 0xFF) as u8
+    };
+
+    let mut small  = [0u8; 16 * 16 * 4];
+    let mut medium = [0u8; 32 * 32 * 4];
+    let mut big    = [0u8; 64 * 64 * 4];
+
+    for pixel in small.chunks_mut(4)  { pixel[0]=rng(); pixel[1]=rng(); pixel[2]=rng(); pixel[3]=255; }
+    for pixel in medium.chunks_mut(4) { pixel[0]=rng(); pixel[1]=rng(); pixel[2]=rng(); pixel[3]=255; }
+    for pixel in big.chunks_mut(4)    { pixel[0]=rng(); pixel[1]=rng(); pixel[2]=rng(); pixel[3]=255; }
+
+    miniquad::conf::Icon { small, medium, big }
+}
+
+fn conf() -> Conf {
+ Conf {
+   window_title: "HaiViz ".to_owned()+env!("CARGO_PKG_VERSION"), //this field is not optional!
+   window_width: 1600,
+   window_height: 900,
+   fullscreen:false,   
+   icon: Some(gen_icon()),
+   ..Default::default()
+ }
+}
+
+#[macroquad::main(conf)]
 async fn main() {
+    println!(" *** HaiViz {} ***",env!("CARGO_PKG_VERSION"));
     if env::args().count() != 2 {
         println!("{}", style("Usage: haiviz <pointcloud.laz | directory>").red());
         return;
@@ -344,7 +433,7 @@ async fn main() {
     }
 
     let mut color_mode = ColorMode::Height;
-    let mut background = Background::Black;
+    let mut background: Color = BLACK;
     let mut app_mode = AppMode::View3D;
 
     // Single-file mode state
@@ -382,14 +471,31 @@ async fn main() {
     .normalize();
     let mut right = front.cross(world_up).normalize();
     let mut up = right.cross(front).normalize();
-    let mut position = vec3(0.0, 0.0, 1.0);
+
+    // Compute initial camera position and ortho_scale to fit the data on screen.
+    let (data_extent_x, data_extent_y) = if let Some(ref mgr) = tile_mgr {
+        (
+            (mgr.global_max[0] - mgr.global_min[0]) as f32,
+            (mgr.global_max[1] - mgr.global_min[1]) as f32,
+        )
+    } else if let Some(ref stg) = stage {
+        (
+            (stg.cloud.max[0] - stg.cloud.min[0]) as f32,
+            (stg.cloud.max[1] - stg.cloud.min[1]) as f32,
+        )
+    } else {
+        (100.0, 100.0)
+    };
+    let data_center = vec3(data_extent_x * 0.5, data_extent_y * 0.5, height_range * 0.5);
+    let mut position = data_center - front * (data_extent_x.max(data_extent_y) * 2.0);
     let mut last_mouse_position: Vec2 = mouse_position().into();
 
     let mut grabbed = false;
     set_cursor_grab(grabbed);
     show_mouse(!grabbed);
 
-    let mut ortho_scale: f32 = 50.0;
+    let aspect = screen_width() / screen_height().max(1.0);
+    let mut ortho_scale: f32 = (data_extent_y * 0.5).max(data_extent_x * 0.5 / aspect) * 1.05;
 
     // Section state (single-file only)
     let mut section_start: Option<(f32, f32)> = None;
@@ -405,6 +511,32 @@ async fn main() {
 
     // Tile mode: selected tile for UI
     let mut selected_tile: Option<usize> = None;
+
+    // Measure mode state (viewer-space positions)
+    let mut measure_a: Option<glam::Vec3> = None;
+    let mut measure_b: Option<glam::Vec3> = None;
+
+    let mut point_size: f32 = 2.0;
+
+    // Compute viewer-space offset (world coords of the viewer origin)
+    let data_offset: [f64; 3] = if let Some(ref mgr) = tile_mgr {
+        mgr.global_min
+    } else if let Some(ref stg) = stage {
+        stg.cloud.min
+    } else {
+        [0.0, 0.0, 0.0]
+    };
+
+    let mut poly_files: Vec<polylines::PolylineFile> = Vec::new();
+    let mut selected_poly: Option<(usize, usize)> = None; // (file_idx, poly_idx)
+    let mut poly_load_error: Option<String> = None;
+
+    let mut edl_enabled = false;
+    let mut edl_strength: f32 = 8.0;
+    let mut edl_renderer = {
+        let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+        EdlRenderer::new(ctx, screen_width() as u32, screen_height() as u32)
+    };
 
     loop {
         let delta = get_frame_time();
@@ -450,7 +582,7 @@ async fn main() {
                 section_zoom = section_zoom.clamp(0.1, 10000.0);
             }
 
-            clear_background(background.color());
+            clear_background(background);
 
             if let Some(ref sec) = section_data {
                 let aspect = screen_width() / screen_height();
@@ -467,9 +599,9 @@ async fn main() {
                     gl.flush();
                     gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
                     if let Some(ref stg) = stage {
-                        stg.draw_section(&mut *gl.quad_context, sec, &section_mvp);
+                        stg.draw_section(&mut *gl.quad_context, sec, &section_mvp, point_size);
                     } else if let Some(ref mgr) = tile_mgr {
-                        mgr.draw_section(&mut *gl.quad_context, sec, &section_mvp);
+                        mgr.draw_section(&mut *gl.quad_context, sec, &section_mvp, point_size);
                     }
                     gl.quad_context.end_render_pass();
                 }
@@ -495,6 +627,17 @@ async fn main() {
                 draw_line(sx1, 0.0, sx1, screen_height(), 1.0, Color::new(0.4, 0.4, 0.0, 0.5));
                 draw_text("start", sx0 + 3.0, 30.0, 16.0, YELLOW);
                 draw_text(&format!("{:.1}m", sec.length), sx1 + 3.0, 30.0, 16.0, YELLOW);
+
+                if !poly_files.is_empty() &&
+                    let (Some(start), Some(end)) = (section_start, section_end) {
+                        polylines::draw_section(
+                            &poly_files, start, end,
+                            section_depth,
+                            section_pan, section_zoom,
+                            screen_width(), screen_height(),
+                        );
+                    
+                }
             }
 
             let prev_color_mode = color_mode;
@@ -519,12 +662,10 @@ async fn main() {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Background:");
-                            egui_macroquad::egui::ComboBox::from_id_salt("background")
-                                .selected_text(background.label())
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut background, Background::Black, "Black");
-                                    ui.selectable_value(&mut background, Background::White, "White");
-                                });
+                            let mut bg_egui = mq_to_egui(background);
+                            if ui.color_edit_button_srgba(&mut bg_egui).changed() {
+                                background = egui_to_mq(bg_egui);
+                            }
                         });
                         if let Some(ref sec) = section_data {
                             ui.label(format!(
@@ -533,11 +674,12 @@ async fn main() {
                             ));
                         }
                     });
+                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
             });
             egui_macroquad::draw();
 
-            if color_mode != prev_color_mode {
-                if let (Some(start), Some(end)) = (section_start, section_end) {
+            if color_mode != prev_color_mode &&
+                let (Some(start), Some(end)) = (section_start, section_end) {
                     let gl = unsafe { get_internal_gl() };
                     if let Some(ref stg) = stage {
                         section_data = Some(stg.extract_section(
@@ -548,7 +690,7 @@ async fn main() {
                             &mut *gl.quad_context, start, end, section_depth, color_mode,
                         ));
                     }
-                }
+                
             }
 
             next_frame().await;
@@ -592,7 +734,17 @@ async fn main() {
         let mouse_delta = mouse_pos - last_mouse_position;
         last_mouse_position = mouse_pos;
 
+        let mid_z = height_range * 0.5;
+
+        // Orbit pivot: screen-center ray intersected with mid_z plane
+        let orbit_pivot = if front.z.abs() > 0.01 {
+            position + front * ((mid_z - position.z) / front.z)
+        } else {
+            data_center
+        };
+
         if grabbed || is_mouse_button_down(MouseButton::Right) {
+            let old_front = front;
             yaw += mouse_delta.x * delta * LOOK_SPEED;
             pitch += mouse_delta.y * delta * -LOOK_SPEED;
             pitch = pitch.clamp(-1.5, 1.5);
@@ -606,6 +758,9 @@ async fn main() {
 
             right = front.cross(world_up).normalize();
             up = right.cross(front).normalize();
+
+            // Orbit: keep pivot at screen center after rotation
+            position = orbit_pivot + front * (position - orbit_pivot).dot(old_front);
         }
 
         if is_mouse_button_down(MouseButton::Middle) {
@@ -614,7 +769,7 @@ async fn main() {
             position += up * mouse_delta.y * units_per_pixel;
         }
 
-        clear_background(background.color());
+        clear_background(background);
 
         let camera = Camera3D {
             position,
@@ -629,9 +784,24 @@ async fn main() {
         set_camera(&camera);
         let view_proj: glam::Mat4 = camera.matrix();
 
-        let mid_z = height_range * 0.5;
         let (mx, my) = macroquad::input::mouse_position();
         let cursor_world = screen_to_world_xy(mx, my, &view_proj, mid_z);
+
+        // ---- Measure overlays ----
+        let cross_size = ortho_scale * 0.015;
+        if let Some(a) = measure_a {
+            draw_line_3d(vec3(a.x - cross_size, a.y, a.z), vec3(a.x + cross_size, a.y, a.z), YELLOW);
+            draw_line_3d(vec3(a.x, a.y - cross_size, a.z), vec3(a.x, a.y + cross_size, a.z), YELLOW);
+            draw_line_3d(vec3(a.x, a.y, a.z - cross_size), vec3(a.x, a.y, a.z + cross_size), YELLOW);
+        }
+        if let Some(b) = measure_b {
+            draw_line_3d(vec3(b.x - cross_size, b.y, b.z), vec3(b.x + cross_size, b.y, b.z), ORANGE);
+            draw_line_3d(vec3(b.x, b.y - cross_size, b.z), vec3(b.x, b.y + cross_size, b.z), ORANGE);
+            draw_line_3d(vec3(b.x, b.y, b.z - cross_size), vec3(b.x, b.y, b.z + cross_size), ORANGE);
+        }
+        if let (Some(a), Some(b)) = (measure_a, measure_b) {
+            draw_line_3d(a, b, WHITE);
+        }
 
         // ---- Single-file mode rendering ----
         if let Some(ref stg) = stage {
@@ -654,13 +824,26 @@ async fn main() {
                 _ => {}
             }
 
-            // Render points
+            // Render points (with optional EDL post-process)
             let drawn = {
                 let mut gl = unsafe { get_internal_gl() };
                 gl.flush();
-                gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
-                let drawn = stg.draw_visible(&mut *gl.quad_context, &view_proj);
-                gl.quad_context.end_render_pass();
+                edl_renderer.resize_if_needed(
+                    &mut *gl.quad_context,
+                    screen_width() as u32,
+                    screen_height() as u32,
+                );
+                if edl_enabled {
+                    edl_renderer.begin(&mut *gl.quad_context);
+                } else {
+                    gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
+                }
+                let drawn = stg.draw_visible(&mut *gl.quad_context, &view_proj, point_size);
+                if edl_enabled {
+                    edl_renderer.apply(&mut *gl.quad_context, edl_strength);
+                } else {
+                    gl.quad_context.end_render_pass();
+                }
                 drawn
             };
 
@@ -669,23 +852,26 @@ async fn main() {
             // View cube
             let vc_interactive = app_mode == AppMode::View3D || app_mode == AppMode::PointPick;
             if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive) {
+                let old_front = front;
                 yaw = new_yaw;
                 pitch = new_pitch;
                 front = vec3(yaw.cos() * pitch.cos(), yaw.sin() * pitch.cos(), pitch.sin()).normalize();
                 right = front.cross(world_up).normalize();
                 up = right.cross(front).normalize();
+                position = orbit_pivot + front * (position - orbit_pivot).dot(old_front);
             }
 
             // egui UI
             let prev_color_mode = color_mode;
             let mut egui_wants_pointer = false;
+            let mut do_zoom_all = false;
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_pointer = egui_ctx.is_pointer_over_area();
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
                         let section_label = match app_mode {
-                            AppMode::View3D | AppMode::PointPick => "Cross Section",
+                            AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst | AppMode::MeasureSecond => "Cross Section",
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
@@ -719,6 +905,20 @@ async fn main() {
                                 picked_point = None;
                             }
                         }
+                        let measure_label = match app_mode {
+                            AppMode::MeasureFirst => "Click point A... (Esc to cancel)",
+                            AppMode::MeasureSecond => "Click point B... (Esc to cancel)",
+                            _ => "Measure",
+                        };
+                        if ui.button(measure_label).clicked() {
+                            if matches!(app_mode, AppMode::MeasureFirst | AppMode::MeasureSecond) {
+                                app_mode = AppMode::View3D;
+                            } else {
+                                app_mode = AppMode::MeasureFirst;
+                                measure_a = None;
+                                measure_b = None;
+                            }
+                        }
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.label("Color:");
@@ -732,12 +932,25 @@ async fn main() {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Background:");
-                            egui_macroquad::egui::ComboBox::from_id_salt("background")
-                                .selected_text(background.label())
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut background, Background::Black, "Black");
-                                    ui.selectable_value(&mut background, Background::White, "White");
-                                });
+                            let mut bg_egui = mq_to_egui(background);
+                            if ui.color_edit_button_srgba(&mut bg_egui).changed() {
+                                background = egui_to_mq(bg_egui);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("Zoom All").clicked() { do_zoom_all = true; }
+                            ui.label("Pt size:");
+                            if ui.button("-").clicked() { point_size = (point_size - 1.0).max(1.0); }
+                            ui.label(format!("{:.0}", point_size));
+                            if ui.button("+").clicked() { point_size = (point_size + 1.0).min(10.0); }
+                        });
+                        ui.horizontal(|ui| {
+                            let edl_label = if edl_enabled { "EDL: ON" } else { "EDL: OFF" };
+                            if ui.button(edl_label).clicked() { edl_enabled = !edl_enabled; }
+                            if edl_enabled {
+                                ui.label("Strength:");
+                                ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
+                            }
                         });
                         ui.label(format!(
                             "{}/{} points | {} chunks | FPS: {:.0} | zoom: {:.1}",
@@ -746,6 +959,28 @@ async fn main() {
                         ));
                         if app_mode == AppMode::SectionAdjustDepth {
                             ui.label(format!("Section depth: {:.1}m", section_depth));
+                        }
+                        if let (Some(a), Some(b)) = (measure_a, measure_b) {
+                            let off = glam::Vec3::new(
+                                stg.cloud.min[0] as f32, stg.cloud.min[1] as f32, stg.cloud.min[2] as f32,
+                            );
+                            let wa = a + off;
+                            let wb = b + off;
+                            let dx = wb.x - wa.x;
+                            let dy = wb.y - wa.y;
+                            let dz = wb.z - wa.z;
+                            let dist3d = (dx*dx + dy*dy + dz*dz).sqrt();
+                            let dist2d = (dx*dx + dy*dy).sqrt();
+                            ui.separator();
+                            ui.label("Measurement:");
+                            ui.label(format!("  A: ({:.3}, {:.3}, {:.3})", wa.x, wa.y, wa.z));
+                            ui.label(format!("  B: ({:.3}, {:.3}, {:.3})", wb.x, wb.y, wb.z));
+                            ui.label(format!("  dX: {:.3}  dY: {:.3}  dZ: {:.3}", dx, dy, dz));
+                            ui.label(format!("  3D dist: {:.3}m", dist3d));
+                            ui.label(format!("  Horiz:   {:.3}m  ΔZ: {:.3}m", dist2d, dz));
+                        } else if measure_a.is_some() {
+                            ui.separator();
+                            ui.label("A set — click point B");
                         }
                         if let Some(idx) = picked_point {
                             ui.separator();
@@ -761,10 +996,19 @@ async fn main() {
                             if let Some(time) = p.gps_time {
                                 ui.label(format!("  GPS time: {:.6}", time));
                             }
+                            ui.label(format!("  Point Source Id: {}", p.point_source_id));
                         }
                     });
+                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
             });
             egui_macroquad::draw();
+
+            if do_zoom_all {
+                let aspect = screen_width() / screen_height().max(1.0);
+                ortho_scale = (data_extent_y * 0.5).max(data_extent_x * 0.5 / aspect) * 1.05;
+                position = vec3(data_extent_x * 0.5, data_extent_y * 0.5, height_range * 0.5)
+                    - front * (data_extent_x.max(data_extent_y) * 2.0);
+            }
 
             // Handle clicks
             if !egui_wants_pointer && is_mouse_button_pressed(MouseButton::Left) {
@@ -796,15 +1040,30 @@ async fn main() {
                             app_mode = AppMode::SectionView;
                         }
                     }
+                    AppMode::MeasureFirst => {
+                        if let Some(idx) = stg.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
+                            measure_a = Some(glam::Vec3::from(stg.positions[idx]));
+                            measure_b = None;
+                            app_mode = AppMode::MeasureSecond;
+                        }
+                    }
+                    AppMode::MeasureSecond => {
+                        if let Some(idx) = stg.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
+                            measure_b = Some(glam::Vec3::from(stg.positions[idx]));
+                        }
+                    }
+                    AppMode::View3D => {
+                        selected_poly = polylines::pick(&poly_files, &view_proj, mx, my, screen_width(), screen_height(), 12.0);
+                    }
                     _ => {}
                 }
             }
 
-            if color_mode != prev_color_mode {
-                if let Some(ref mut stg) = stage {
+            if color_mode != prev_color_mode &&
+                let Some(ref mut stg) = stage {
                     let gl = unsafe { get_internal_gl() };
                     stg.rebuild_colors(&mut *gl.quad_context, color_mode);
-                }
+                
             }
         }
 
@@ -856,13 +1115,26 @@ async fn main() {
                 }
             }
 
-            // Render loaded tile points
+            // Render loaded tile points (with optional EDL post-process)
             let (drawn, total) = {
                 let mut gl = unsafe { get_internal_gl() };
                 gl.flush();
-                gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
-                let result = mgr.draw_visible(&mut *gl.quad_context, &view_proj);
-                gl.quad_context.end_render_pass();
+                edl_renderer.resize_if_needed(
+                    &mut *gl.quad_context,
+                    screen_width() as u32,
+                    screen_height() as u32,
+                );
+                if edl_enabled {
+                    edl_renderer.begin(&mut *gl.quad_context);
+                } else {
+                    gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
+                }
+                let result = mgr.draw_visible(&mut *gl.quad_context, &view_proj, point_size);
+                if edl_enabled {
+                    edl_renderer.apply(&mut *gl.quad_context, edl_strength);
+                } else {
+                    gl.quad_context.end_render_pass();
+                }
                 result
             };
 
@@ -885,11 +1157,13 @@ async fn main() {
             // View cube
             let vc_interactive = app_mode == AppMode::View3D || app_mode == AppMode::PointPick;
             if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive) {
+                let old_front = front;
                 yaw = new_yaw;
                 pitch = new_pitch;
                 front = vec3(yaw.cos() * pitch.cos(), yaw.sin() * pitch.cos(), pitch.sin()).normalize();
                 right = front.cross(world_up).normalize();
                 up = right.cross(front).normalize();
+                position = orbit_pivot + front * (position - orbit_pivot).dot(old_front);
             }
 
             // egui UI
@@ -897,6 +1171,8 @@ async fn main() {
             let mut egui_wants_pointer = false;
             let mut request_load: Option<usize> = None;
             let mut request_unload: Option<usize> = None;
+            let mut do_zoom_all = false;
+            let mut do_zoom_selected = false;
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_pointer = egui_ctx.is_pointer_over_area();
                 egui_macroquad::egui::Window::new("Controls")
@@ -904,7 +1180,7 @@ async fn main() {
                     .show(egui_ctx, |ui| {
                         // Cross Section button
                         let section_label = match app_mode {
-                            AppMode::View3D | AppMode::PointPick => "Cross Section",
+                            AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst | AppMode::MeasureSecond => "Cross Section",
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
@@ -939,6 +1215,20 @@ async fn main() {
                                 picked_tile_point = None;
                             }
                         }
+                        let measure_label = match app_mode {
+                            AppMode::MeasureFirst => "Click point A... (Esc to cancel)",
+                            AppMode::MeasureSecond => "Click point B... (Esc to cancel)",
+                            _ => "Measure",
+                        };
+                        if ui.button(measure_label).clicked() {
+                            if matches!(app_mode, AppMode::MeasureFirst | AppMode::MeasureSecond) {
+                                app_mode = AppMode::View3D;
+                            } else {
+                                app_mode = AppMode::MeasureFirst;
+                                measure_a = None;
+                                measure_b = None;
+                            }
+                        }
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.label("Color:");
@@ -952,12 +1242,30 @@ async fn main() {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Background:");
-                            egui_macroquad::egui::ComboBox::from_id_salt("background")
-                                .selected_text(background.label())
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut background, Background::Black, "Black");
-                                    ui.selectable_value(&mut background, Background::White, "White");
-                                });
+                            let mut bg_egui = mq_to_egui(background);
+                            if ui.color_edit_button_srgba(&mut bg_egui).changed() {
+                                background = egui_to_mq(bg_egui);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("Zoom All").clicked() { do_zoom_all = true; }
+                            if selected_tile.is_some() && ui.button("Zoom on Object").clicked() {
+                                do_zoom_selected = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Pt size:");
+                            if ui.button("-").clicked() { point_size = (point_size - 1.0).max(1.0); }
+                            ui.label(format!("{:.0}", point_size));
+                            if ui.button("+").clicked() { point_size = (point_size + 1.0).min(10.0); }
+                        });
+                        ui.horizontal(|ui| {
+                            let edl_label = if edl_enabled { "EDL: ON" } else { "EDL: OFF" };
+                            if ui.button(edl_label).clicked() { edl_enabled = !edl_enabled; }
+                            if edl_enabled {
+                                ui.label("Strength:");
+                                ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
+                            }
                         });
                         ui.label(format!(
                             "{}/{} points | {} chunks | {}/{} tiles | FPS: {:.0}",
@@ -965,6 +1273,29 @@ async fn main() {
                             mgr.loaded_count(), mgr.tiles.len(),
                             1.0 / get_frame_time()
                         ));
+
+                        if let (Some(a), Some(b)) = (measure_a, measure_b) {
+                            let off = glam::Vec3::new(
+                                mgr.global_min[0] as f32, mgr.global_min[1] as f32, mgr.global_min[2] as f32,
+                            );
+                            let wa = a + off;
+                            let wb = b + off;
+                            let dx = wb.x - wa.x;
+                            let dy = wb.y - wa.y;
+                            let dz = wb.z - wa.z;
+                            let dist3d = (dx*dx + dy*dy + dz*dz).sqrt();
+                            let dist2d = (dx*dx + dy*dy).sqrt();
+                            ui.separator();
+                            ui.label("Measurement:");
+                            ui.label(format!("  A: ({:.3}, {:.3}, {:.3})", wa.x, wa.y, wa.z));
+                            ui.label(format!("  B: ({:.3}, {:.3}, {:.3})", wb.x, wb.y, wb.z));
+                            ui.label(format!("  dX: {:.3}  dY: {:.3}  dZ: {:.3}", dx, dy, dz));
+                            ui.label(format!("  3D dist: {:.3}m", dist3d));
+                            ui.label(format!("  Horiz:   {:.3}m  ΔZ: {:.3}m", dist2d, dz));
+                        } else if measure_a.is_some() {
+                            ui.separator();
+                            ui.label("A set — click point B");
+                        }
 
                         // Selected tile info
                         if let Some(sel) = selected_tile {
@@ -975,10 +1306,9 @@ async fn main() {
                                 if ui.button("Load").clicked() {
                                     request_load = Some(sel);
                                 }
-                            } else {
-                                if ui.button("Unload").clicked() {
+                            } 
+                            else if ui.button("Unload").clicked() {
                                     request_unload = Some(sel);
-                                }
                             }
                             if let Some(ref lt) = mgr.loaded[sel] {
                                 ui.label(format!("  {} points loaded", lt.total_points));
@@ -986,8 +1316,8 @@ async fn main() {
                         }
 
                         // Picked point info
-                        if let Some((tile_idx, point_idx)) = picked_tile_point {
-                            if let Some(ref lt) = mgr.loaded[tile_idx] {
+                        if let Some((tile_idx, point_idx)) = picked_tile_point &&
+                            let Some(ref lt) = mgr.loaded[tile_idx] {
                                 ui.separator();
                                 let p = &lt.cloud.points[point_idx];
                                 ui.label(format!("Point Info ({})", mgr.tiles[tile_idx].filename));
@@ -1001,11 +1331,33 @@ async fn main() {
                                 if let Some(time) = p.gps_time {
                                     ui.label(format!("  GPS time: {:.6}", time));
                                 }
-                            }
+                                ui.label(format!("  Intensity: {}", p.point_source_id));
+                            
                         }
                     });
+                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
             });
             egui_macroquad::draw();
+
+            if do_zoom_all {
+                let aspect = screen_width() / screen_height().max(1.0);
+                ortho_scale = (data_extent_y * 0.5).max(data_extent_x * 0.5 / aspect) * 1.05;
+                position = vec3(data_extent_x * 0.5, data_extent_y * 0.5, height_range * 0.5)
+                    - front * (data_extent_x.max(data_extent_y) * 2.0);
+            }
+            if do_zoom_selected &&
+                let Some(sel) = selected_tile {
+                    let t = &mgr.tiles[sel];
+                    let ext_x = (t.xmax - t.xmin) as f32;
+                    let ext_y = (t.ymax - t.ymin) as f32;
+                    let cx = ((t.xmin + t.xmax) / 2.0 - mgr.global_min[0]) as f32;
+                    let cy = ((t.ymin + t.ymax) / 2.0 - mgr.global_min[1]) as f32;
+                    let aspect = screen_width() / screen_height().max(1.0);
+                    ortho_scale = (ext_y * 0.5).max(ext_x * 0.5 / aspect) * 1.2;
+                    position = vec3(cx, cy, height_range * 0.5)
+                        - front * (ext_x.max(ext_y) * 2.0);
+                
+            }
 
             // Handle clicks
             if !egui_wants_pointer && is_mouse_button_pressed(MouseButton::Left) {
@@ -1037,6 +1389,18 @@ async fn main() {
                             app_mode = AppMode::SectionView;
                         }
                     }
+                    AppMode::MeasureFirst => {
+                        if let Some((tile_idx, pt_idx)) = mgr.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
+                            measure_a = Some(glam::Vec3::from(mgr.loaded[tile_idx].as_ref().unwrap().positions[pt_idx]));
+                            measure_b = None;
+                            app_mode = AppMode::MeasureSecond;
+                        }
+                    }
+                    AppMode::MeasureSecond => {
+                        if let Some((tile_idx, pt_idx)) = mgr.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
+                            measure_b = Some(glam::Vec3::from(mgr.loaded[tile_idx].as_ref().unwrap().positions[pt_idx]));
+                        }
+                    }
                     AppMode::View3D => {
                         if let Some((wx, wy)) = screen_to_world_xy(mx, my, &view_proj, 0.0) {
                             selected_tile = mgr.tile_at(wx, wy);
@@ -1055,25 +1419,32 @@ async fn main() {
                     request_unload = Some(sel);
                 }
             }
-            if let Some(idx) = request_load {
-                if let Some(ref mut mgr) = tile_mgr {
+            if let Some(idx) = request_load &&
+                let Some(ref mut mgr) = tile_mgr {
                     let gl = unsafe { get_internal_gl() };
                     mgr.load_tile(&mut *gl.quad_context, idx, color_mode);
-                }
+                
             }
-            if let Some(idx) = request_unload {
-                if let Some(ref mut mgr) = tile_mgr {
+            if let Some(idx) = request_unload &&
+                let Some(ref mut mgr) = tile_mgr {
                     let gl = unsafe { get_internal_gl() };
                     mgr.unload_tile(&mut *gl.quad_context, idx);
-                }
+                
             }
 
-            if color_mode != prev_color_mode {
-                if let Some(ref mut mgr) = tile_mgr {
+            if color_mode != prev_color_mode &&
+                let Some(ref mut mgr) = tile_mgr {
                     let gl = unsafe { get_internal_gl() };
                     mgr.rebuild_colors(&mut *gl.quad_context, color_mode);
-                }
+                
             }
+        }
+
+        // ---- Polyline 3D overlay (both modes) ----
+        if !poly_files.is_empty() {
+            set_camera(&camera);
+            polylines::draw_3d(&poly_files);
+            set_default_camera();
         }
 
         next_frame().await

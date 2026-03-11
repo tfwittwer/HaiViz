@@ -1,4 +1,4 @@
-pub mod raw_miniquad {
+//pub mod raw_miniquad {
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -107,7 +107,7 @@ pub mod raw_miniquad {
         pub chunks: Vec<Chunk>,
         pub total_points: i32,
         pub cloud: VizPointcloud,
-        positions: Vec<[f32; 3]>,
+        pub positions: Vec<[f32; 3]>,
         pub class_defs: Option<ClassDefs>,
     }
 
@@ -138,10 +138,10 @@ pub mod raw_miniquad {
             }
             ColorMode::Classification => {
                 let class_id: u8 = point.classification.into();
-                if let Some(defs) = class_defs {
-                    if let Some((_label, color)) = defs.get(&class_id) {
+                if let Some(defs) = class_defs &&
+                    let Some((_label, color)) = defs.get(&class_id) {
                         return *color;
-                    }
+                    
                 }
                 classification_color(class_id)
             }
@@ -154,6 +154,11 @@ pub mod raw_miniquad {
                 } else {
                     [0.5, 0.5, 0.5]
                 }
+            }
+            ColorMode::PointSourceId => {
+                let psid = point.point_source_id;
+                let h = (psid as f32 * 0.618_034) % 1.0;
+                hsv_to_rgb(h, 0.8, 0.9)
             }
         }
     }
@@ -180,7 +185,7 @@ pub mod raw_miniquad {
             17 => [0.2, 0.2, 0.6],
             18 => [1.0, 0.0, 0.5],
             _ => {
-                let h = (class as f32 * 0.618033988) % 1.0;
+                let h = (class as f32 * 0.618_034) % 1.0;
                 hsv_to_rgb(h, 0.8, 0.9)
             }
         }
@@ -237,6 +242,11 @@ pub mod raw_miniquad {
     }
 
     fn create_pipeline(ctx: &mut dyn RenderingBackend) -> Pipeline {
+        // On desktop OpenGL, gl_PointSize in the vertex shader is only respected
+        // when GL_PROGRAM_POINT_SIZE (0x8642) is enabled. This is always active in
+        // OpenGL ES / WebGL so no guard is needed, but on desktop it must be set.
+        unsafe { miniquad::gl::glEnable(0x8642); }
+
         let shader = ctx
             .new_shader(
                 miniquad::ShaderSource::Glsl {
@@ -275,12 +285,10 @@ pub mod raw_miniquad {
             chunk_map.entry((cx, cy)).or_default().push(i);
         }
 
-        chunk_map
-            .into_iter()
-            .map(|(_key, point_indices)| {
+        chunk_map.into_values()
+            .map(|point_indices| {
                 let chunk_verts: Vec<Vertex> =
-                    point_indices.iter().map(|&i| vertices[i]).collect();
-
+                point_indices.iter().map(|&i| vertices[i]).collect();
                 let mut aabb_min = [f32::MAX; 3];
                 let mut aabb_max = [f32::MIN; 3];
                 for v in &chunk_verts {
@@ -485,18 +493,19 @@ pub mod raw_miniquad {
             }
         }
 
-        pub fn draw_section(&self, ctx: &mut dyn RenderingBackend, section: &SectionData, mvp: &glam::Mat4) {
+        pub fn draw_section(&self, ctx: &mut dyn RenderingBackend, section: &SectionData, mvp: &glam::Mat4, point_size: f32) {
             ctx.apply_pipeline(&self.pipeline);
             ctx.apply_bindings(&section.bindings);
             ctx.apply_uniforms(miniquad::UniformsSource::table(
-                &shader::Uniforms { mvp: *mvp },
+                &shader::Uniforms { mvp: *mvp, point_size, height_range: self.height_range() },
             ));
             ctx.draw(0, section.num_points, 1);
         }
 
-        pub fn draw_visible(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4) -> i32 {
+        pub fn draw_visible(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4, point_size: f32) -> i32 {
             let planes = extract_frustum_planes(view_proj);
             let mut drawn = 0;
+            let height_range = self.height_range();
 
             ctx.apply_pipeline(&self.pipeline);
             for chunk in &self.chunks {
@@ -505,9 +514,7 @@ pub mod raw_miniquad {
                 }
                 ctx.apply_bindings(&chunk.bindings);
                 ctx.apply_uniforms(miniquad::UniformsSource::table(
-                    &shader::Uniforms {
-                        mvp: *view_proj,
-                    },
+                    &shader::Uniforms { mvp: *view_proj, point_size, height_range },
                 ));
                 ctx.draw(0, chunk.num_points, 1);
                 drawn += chunk.num_points;
@@ -709,10 +716,11 @@ pub mod raw_miniquad {
             }
         }
 
-        pub fn draw_visible(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4) -> (i32, i32) {
+        pub fn draw_visible(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4, point_size: f32) -> (i32, i32) {
             let planes = extract_frustum_planes(view_proj);
             let mut drawn = 0;
             let mut total = 0;
+            let height_range = self.height_range();
 
             ctx.apply_pipeline(&self.pipeline);
             for loaded in self.loaded.iter().flatten() {
@@ -723,7 +731,7 @@ pub mod raw_miniquad {
                     }
                     ctx.apply_bindings(&chunk.bindings);
                     ctx.apply_uniforms(miniquad::UniformsSource::table(
-                        &shader::Uniforms { mvp: *view_proj },
+                        &shader::Uniforms { mvp: *view_proj, point_size, height_range },
                     ));
                     ctx.draw(0, chunk.num_points, 1);
                     drawn += chunk.num_points;
@@ -855,13 +863,192 @@ pub mod raw_miniquad {
             }
         }
 
-        pub fn draw_section(&self, ctx: &mut dyn RenderingBackend, section: &SectionData, mvp: &glam::Mat4) {
+        pub fn draw_section(&self, ctx: &mut dyn RenderingBackend, section: &SectionData, mvp: &glam::Mat4, point_size: f32) {
             ctx.apply_pipeline(&self.pipeline);
             ctx.apply_bindings(&section.bindings);
             ctx.apply_uniforms(miniquad::UniformsSource::table(
-                &shader::Uniforms { mvp: *mvp },
+                &shader::Uniforms { mvp: *mvp, point_size, height_range: self.height_range() },
             ));
             ctx.draw(0, section.num_points, 1);
+        }
+    }
+
+    // ---- EDL (Eye-Dome Lighting) renderer ----
+
+    pub struct EdlRenderer {
+        offscreen_pass: RenderPass,
+        color_texture: TextureId,
+        depth_texture: TextureId,
+        edl_pipeline: Pipeline,
+        quad_bindings: Bindings,
+        pub width: u32,
+        pub height: u32,
+    }
+
+    impl EdlRenderer {
+        pub fn new(ctx: &mut dyn RenderingBackend, width: u32, height: u32) -> Self {
+            let (offscreen_pass, color_texture, depth_texture, edl_pipeline, quad_bindings) =
+                Self::create_resources(ctx, width, height);
+            Self { offscreen_pass, color_texture, depth_texture, edl_pipeline, quad_bindings, width, height }
+        }
+
+        fn create_resources(
+            ctx: &mut dyn RenderingBackend,
+            width: u32,
+            height: u32,
+        ) -> (RenderPass, TextureId, TextureId, Pipeline, Bindings) {
+            let color_texture = ctx.new_render_texture(TextureParams {
+                format: TextureFormat::RGBA8,
+                wrap: TextureWrap::Clamp,
+                min_filter: FilterMode::Nearest,
+                mag_filter: FilterMode::Nearest,
+                width,
+                height,
+                ..Default::default()
+            });
+            let depth_texture = ctx.new_render_texture(TextureParams {
+                format: TextureFormat::Depth,
+                wrap: TextureWrap::Clamp,
+                min_filter: FilterMode::Nearest,
+                mag_filter: FilterMode::Nearest,
+                width,
+                height,
+                ..Default::default()
+            });
+            let offscreen_pass = ctx.new_render_pass(color_texture, Some(depth_texture));
+
+            let verts: [[f32; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+            let indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
+            let vbuf = ctx.new_buffer(
+                BufferType::VertexBuffer,
+                BufferUsage::Immutable,
+                BufferSource::slice(&verts),
+            );
+            let ibuf = ctx.new_buffer(
+                BufferType::IndexBuffer,
+                BufferUsage::Immutable,
+                BufferSource::slice(&indices),
+            );
+            let shader = ctx.new_shader(
+                ShaderSource::Glsl {
+                    vertex: edl_shader::VERTEX,
+                    fragment: edl_shader::FRAGMENT,
+                },
+                edl_shader::meta(),
+            ).unwrap();
+            let edl_pipeline = ctx.new_pipeline(
+                &[BufferLayout::default()],
+                &[VertexAttribute::new("pos", VertexFormat::Float2)],
+                shader,
+                PipelineParams::default(),
+            );
+            let quad_bindings = Bindings {
+                vertex_buffers: vec![vbuf],
+                index_buffer: ibuf,
+                images: vec![color_texture],
+            };
+            (offscreen_pass, color_texture, depth_texture, edl_pipeline, quad_bindings)
+        }
+
+        pub fn resize_if_needed(&mut self, ctx: &mut dyn RenderingBackend, width: u32, height: u32) {
+            if self.width == width && self.height == height { return; }
+            ctx.delete_render_pass(self.offscreen_pass);
+            ctx.delete_texture(self.color_texture);
+            ctx.delete_texture(self.depth_texture);
+            let (offscreen_pass, color_texture, depth_texture, edl_pipeline, quad_bindings) =
+                Self::create_resources(ctx, width, height);
+            self.offscreen_pass = offscreen_pass;
+            self.color_texture = color_texture;
+            self.depth_texture = depth_texture;
+            self.edl_pipeline = edl_pipeline;
+            self.quad_bindings = quad_bindings;
+            self.width = width;
+            self.height = height;
+        }
+
+        /// Begin rendering point cloud to offscreen texture (replaces begin_default_pass).
+        pub fn begin(&self, ctx: &mut dyn RenderingBackend) {
+            ctx.begin_pass(
+                Some(self.offscreen_pass),
+                PassAction::Clear {
+                    color: Some((0.0, 0.0, 0.0, 0.0)),
+                    depth: Some(1.0),
+                    stencil: None,
+                },
+            );
+        }
+
+        /// Apply EDL post-process to the default framebuffer.
+        /// Call after the draw_visible call; replaces end_render_pass.
+        pub fn apply(&self, ctx: &mut dyn RenderingBackend, strength: f32) {
+            ctx.end_render_pass();
+            ctx.begin_default_pass(PassAction::Nothing);
+            ctx.apply_pipeline(&self.edl_pipeline);
+            ctx.apply_bindings(&self.quad_bindings);
+            ctx.apply_uniforms(UniformsSource::table(&edl_shader::Uniforms {
+                px_size: [1.0 / self.width as f32, 1.0 / self.height as f32],
+                strength,
+            }));
+            ctx.draw(0, 6, 1);
+            ctx.end_render_pass();
+        }
+    }
+
+    pub mod edl_shader {
+        use miniquad::*;
+
+        pub const VERTEX: &str = r#"#version 100
+            attribute vec2 pos;
+            varying lowp vec2 v_uv;
+            void main() {
+                gl_Position = vec4(pos, 0.0, 1.0);
+                v_uv = pos * 0.5 + 0.5;
+            }"#;
+
+        pub const FRAGMENT: &str = r#"#version 100
+            uniform sampler2D tex;
+            uniform mediump vec2 px_size;
+            uniform mediump float strength;
+            varying lowp vec2 v_uv;
+            void main() {
+                lowp vec4 c = texture2D(tex, v_uv);
+                mediump float d = c.a;
+                if (d < 0.001) {
+                    discard;
+                }
+                mediump float d_l = texture2D(tex, v_uv + vec2(-px_size.x, 0.0)).a;
+                mediump float d_r = texture2D(tex, v_uv + vec2( px_size.x, 0.0)).a;
+                mediump float d_u = texture2D(tex, v_uv + vec2(0.0,  px_size.y)).a;
+                mediump float d_d = texture2D(tex, v_uv + vec2(0.0, -px_size.y)).a;
+                if (d_l < 0.001) d_l = d;
+                if (d_r < 0.001) d_r = d;
+                if (d_u < 0.001) d_u = d;
+                if (d_d < 0.001) d_d = d;
+                mediump float r = 0.0;
+                r += max(0.0, d_l - d);
+                r += max(0.0, d_r - d);
+                r += max(0.0, d_u - d);
+                r += max(0.0, d_d - d);
+                mediump float shade = exp(-strength * r);
+                gl_FragColor = vec4(c.rgb * shade, 1.0);
+            }"#;
+
+        pub fn meta() -> ShaderMeta {
+            ShaderMeta {
+                images: vec!["tex".to_string()],
+                uniforms: UniformBlockLayout {
+                    uniforms: vec![
+                        UniformDesc::new("px_size", UniformType::Float2),
+                        UniformDesc::new("strength", UniformType::Float1),
+                    ],
+                },
+            }
+        }
+
+        #[repr(C)]
+        pub struct Uniforms {
+            pub px_size: [f32; 2],
+            pub strength: f32,
         }
     }
 
@@ -873,20 +1060,29 @@ pub mod raw_miniquad {
             attribute vec3 color;
 
             uniform mat4 mvp;
+            uniform float point_size;
+            uniform float height_range;
 
             varying lowp vec3 v_color;
+            varying mediump float v_depth;
 
             void main() {
                 gl_Position = mvp * vec4(pos, 1.0);
-                gl_PointSize = 2.0;
+                gl_PointSize = point_size;
                 v_color = color;
+                // Use model-space Z (height) as depth signal for EDL.
+                // height_range gives full [0.002, 1.0] coverage so depth
+                // differences between neighbors are large and EDL is visible.
+                mediump float t = (height_range > 0.0) ? (pos.z / height_range) : 0.5;
+                v_depth = t * 0.998 + 0.002;
             }"#;
 
         pub const FRAGMENT: &str = r#"#version 100
             varying lowp vec3 v_color;
+            varying mediump float v_depth;
 
             void main() {
-                gl_FragColor = vec4(v_color, 1.0);
+                gl_FragColor = vec4(v_color, v_depth);
             }"#;
 
         pub fn meta() -> ShaderMeta {
@@ -895,6 +1091,8 @@ pub mod raw_miniquad {
                 uniforms: UniformBlockLayout {
                     uniforms: vec![
                         UniformDesc::new("mvp", UniformType::Mat4),
+                        UniformDesc::new("point_size", UniformType::Float1),
+                        UniformDesc::new("height_range", UniformType::Float1),
                     ],
                 },
             }
@@ -903,6 +1101,8 @@ pub mod raw_miniquad {
         #[repr(C)]
         pub struct Uniforms {
             pub mvp: glam::Mat4,
+            pub point_size: f32,
+            pub height_range: f32,
         }
     }
-}
+//}
