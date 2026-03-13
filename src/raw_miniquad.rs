@@ -1,8 +1,11 @@
 //pub mod raw_miniquad {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+    use std::fs::File;
+    use std::io::BufReader;
     use std::path::Path;
 
     use las::{Point, Reader};
+    use las::copc::{CopcEntryReader, VoxelKey};
     use miniquad::*;
 
     use crate::ColorMode;
@@ -1049,6 +1052,554 @@
         pub struct Uniforms {
             pub px_size: [f32; 2],
             pub strength: f32,
+        }
+    }
+
+    // ---- COPC Stage ----
+
+    struct CopcEntry {
+        key: VoxelKey,
+        offset: u64,
+        byte_size: i32,
+        point_count: i32,
+        xmin: f64, ymin: f64, zmin: f64,
+        xmax: f64, ymax: f64, zmax: f64,
+    }
+
+    struct CopcLoadedNode {
+        chunks: Vec<Chunk>,
+        positions: Vec<[f32; 3]>,
+        points: Vec<Point>,
+        total_points: i32,
+    }
+
+    /// Request sent to the background loader thread.
+    struct CopcLoadReq {
+        key: VoxelKey,
+        offset: u64,
+        byte_size: i32,
+        point_count: i32,
+        generation: u64,
+    }
+
+    /// Result returned by the background loader thread.
+    struct CopcLoadResult {
+        key: VoxelKey,
+        points: Vec<Point>,
+        generation: u64,
+    }
+
+    pub struct CopcStage {
+        pipeline: Pipeline,
+        /// Root spacing in metres (halved at each level)
+        pub spacing: f64,
+        entries: Vec<CopcEntry>,
+        loaded_nodes: HashMap<VoxelKey, CopcLoadedNode>,
+        pub global_min: [f64; 3],
+        pub global_max: [f64; 3],
+        pub intensity_min: u16,
+        pub intensity_max: u16,
+        pub class_defs: Option<ClassDefs>,
+        /// Nodes dispatched to the loader thread but not yet ingested.
+        in_flight: HashSet<VoxelKey>,
+        /// Send requests to the background loader thread.
+        load_tx: std::sync::mpsc::Sender<CopcLoadReq>,
+        /// Receive completed results from the background loader thread.
+        result_rx: std::sync::mpsc::Receiver<CopcLoadResult>,
+        /// Time of the last view change; dispatch is deferred until the view settles.
+        last_view_change: std::time::Instant,
+        /// View-projection matrix from the previous frame, used to detect view changes.
+        prev_view_proj: glam::Mat4,
+        /// Incremented on every view change; results from older generations are discarded.
+        generation: u64,
+    }
+
+    /// Compute (xmin,ymin,zmin,xmax,ymax,zmax) for a VoxelKey given COPC octree params.
+    fn voxel_bounds(key: &VoxelKey, cx: f64, cy: f64, cz: f64, halfsize: f64) -> (f64, f64, f64, f64, f64, f64) {
+        let root_min_x = cx - halfsize;
+        let root_min_y = cy - halfsize;
+        let root_min_z = cz - halfsize;
+        let span = halfsize * 2.0 / (1i64 << key.l) as f64;
+        let xmin = root_min_x + span * key.x as f64;
+        let ymin = root_min_y + span * key.y as f64;
+        let zmin = root_min_z + span * key.z as f64;
+        (xmin, ymin, zmin, xmin + span, ymin + span, zmin + span)
+    }
+
+    /// Spawn a background thread that services COPC load requests.
+    /// The file is reopened for every request so that the LAZ decompressor
+    /// starts from a clean state — each COPC node is a self-contained LAZ chunk
+    /// and reusing the reader across nodes can leave stale decompressor state.
+    fn spawn_copc_loader(
+        filepath: String,
+        rx: std::sync::mpsc::Receiver<CopcLoadReq>,
+        tx: std::sync::mpsc::Sender<CopcLoadResult>,
+    ) {
+        std::thread::Builder::new()
+            .name("copc-loader".into())
+            .spawn(move || {
+                for req in rx {
+                    let file = match File::open(&filepath) {
+                        Ok(f) => BufReader::new(f),
+                        Err(e) => { eprintln!("COPC loader: open error: {}", e); continue; }
+                    };
+                    let mut reader = match CopcEntryReader::new(file) {
+                        Ok(r) => r,
+                        Err(e) => { eprintln!("COPC loader: reader error: {}", e); continue; }
+                    };
+                    let las_entry = las::copc::Entry {
+                        key: req.key,
+                        offset: req.offset,
+                        byte_size: req.byte_size,
+                        point_count: req.point_count,
+                    };
+                    let mut points = Vec::new();
+                    match reader.read_entry_points(&las_entry, &mut points) {
+                        Ok(_) => { let _ = tx.send(CopcLoadResult { key: req.key, points, generation: req.generation }); }
+                        Err(e) => eprintln!("COPC loader error for {:?}: {}", req.key, e),
+                    }
+                }
+            })
+            .expect("Cannot spawn COPC loader thread");
+    }
+
+    impl CopcStage {
+        pub fn new(
+            ctx: &mut dyn RenderingBackend,
+            filepath: &str,
+            _color_mode: ColorMode,
+            class_defs: Option<ClassDefs>,
+        ) -> Self {
+            let file = BufReader::new(File::open(filepath).expect("Cannot open COPC file"));
+            let reader = CopcEntryReader::new(file).expect("Cannot create COPC reader");
+            let header = reader.header();
+
+            let copc_info = header.copc_info_vlr().expect("Not a COPC file");
+            let (cx, cy, cz, halfsize, spacing) = (
+                copc_info.center_x,
+                copc_info.center_y,
+                copc_info.center_z,
+                copc_info.halfsize,
+                copc_info.spacing,
+            );
+
+            let bounds = header.bounds();
+            let global_min = [bounds.min.x, bounds.min.y, bounds.min.z];
+            let global_max = [bounds.max.x, bounds.max.y, bounds.max.z];
+
+            let hier_entries = reader.hierarchy_entries()
+                .expect("No COPC hierarchy");
+
+            let entries: Vec<CopcEntry> = hier_entries.iter()
+                .filter(|e| e.point_count > 0)
+                .map(|e| {
+                    let (xmin, ymin, zmin, xmax, ymax, zmax) =
+                        voxel_bounds(&e.key, cx, cy, cz, halfsize);
+                    CopcEntry {
+                        key: e.key,
+                        offset: e.offset,
+                        byte_size: e.byte_size,
+                        point_count: e.point_count,
+                        xmin, ymin, zmin, xmax, ymax, zmax,
+                    }
+                })
+                .collect();
+
+            let max_level = entries.iter().map(|e| e.key.l).max().unwrap_or(0);
+
+            println!(
+                "COPC: {} entries (max depth {}), root spacing {:.2}m, \
+                 bounds x {:.1}..{:.1}  y {:.1}..{:.1}  z {:.1}..{:.1}",
+                entries.len(), max_level, spacing,
+                global_min[0], global_max[0],
+                global_min[1], global_max[1],
+                global_min[2], global_max[2],
+            );
+
+            let pipeline = create_pipeline(ctx);
+
+            let (load_tx, load_rx) = std::sync::mpsc::channel::<CopcLoadReq>();
+            let (result_tx, result_rx) = std::sync::mpsc::channel::<CopcLoadResult>();
+            spawn_copc_loader(filepath.to_string(), load_rx, result_tx);
+
+            let mut stage = CopcStage {
+                pipeline,
+                spacing,
+                entries,
+                loaded_nodes: HashMap::new(),
+                global_min,
+                global_max,
+                intensity_min: u16::MAX,
+                intensity_max: 0,
+                class_defs,
+                in_flight: HashSet::new(),
+                load_tx,
+                result_rx,
+                last_view_change: std::time::Instant::now(),
+                prev_view_proj: glam::Mat4::IDENTITY,
+                generation: 0,
+            };
+
+            // Dispatch the root node immediately so the viewer shows something on startup.
+            stage.dispatch_load(VoxelKey::ROOT);
+
+            stage
+        }
+
+        pub fn height_range(&self) -> f32 {
+            (self.global_max[2] - self.global_min[2]) as f32
+        }
+
+        /// How many nodes are dispatched to the loader but not yet on the GPU.
+        pub fn pending_count(&self) -> usize {
+            self.in_flight.len()
+        }
+
+        /// Send a load request to the background thread (no-op if already dispatched).
+        fn dispatch_load(&mut self, key: VoxelKey) {
+            if self.in_flight.contains(&key) { return; }
+            if let Some(entry) = self.entries.iter().find(|e| e.key == key) {
+                let _ = self.load_tx.send(CopcLoadReq {
+                    key,
+                    offset: entry.offset,
+                    byte_size: entry.byte_size,
+                    point_count: entry.point_count,
+                    generation: self.generation,
+                });
+                self.in_flight.insert(key);
+            }
+        }
+
+        /// Convert loaded points into GPU chunks and store them.
+        fn ingest_node(
+            &mut self,
+            ctx: &mut dyn RenderingBackend,
+            key: VoxelKey,
+            pts: Vec<Point>,
+            color_mode: ColorMode,
+        ) {
+            let height_range = self.height_range();
+            let intensity_range = if self.intensity_max > self.intensity_min {
+                (self.intensity_max - self.intensity_min) as f32
+            } else {
+                65535.0
+            };
+
+            for p in &pts {
+                self.intensity_min = self.intensity_min.min(p.intensity);
+                self.intensity_max = self.intensity_max.max(p.intensity);
+            }
+
+            let positions: Vec<[f32; 3]> = pts.iter().map(|p| [
+                (p.x - self.global_min[0]) as f32,
+                (p.y - self.global_min[1]) as f32,
+                (p.z - self.global_min[2]) as f32,
+            ]).collect();
+
+            let vertices: Vec<Vertex> = pts.iter().enumerate().map(|(i, p)| Vertex {
+                pos: positions[i],
+                color: color_for_point(
+                    p, positions[i][2], height_range,
+                    self.intensity_min, intensity_range,
+                    color_mode, &self.class_defs,
+                ),
+            }).collect();
+
+            let total_points = vertices.len() as i32;
+            let chunks = build_chunks(ctx, &positions, &vertices);
+
+            self.loaded_nodes.insert(key, CopcLoadedNode { chunks, positions, points: pts, total_points });
+        }
+
+        /// Called every frame. Drains completed results, then dispatches new requests.
+        pub fn update_view(
+            &mut self,
+            ctx: &mut dyn RenderingBackend,
+            view_proj: &glam::Mat4,
+            ortho_scale: f32,
+            screen_h: f32,
+            color_mode: ColorMode,
+        ) {
+            // Detect view changes: cancel all queued loads and bump the generation so
+            // any results that were already in-flight get discarded when they arrive.
+            if *view_proj != self.prev_view_proj {
+                self.prev_view_proj = *view_proj;
+                self.last_view_change = std::time::Instant::now();
+                self.generation = self.generation.wrapping_add(1);
+                self.in_flight.clear();
+            }
+            const SETTLE_MS: u64 = 300;
+            let view_settled = self.last_view_change.elapsed()
+                >= std::time::Duration::from_millis(SETTLE_MS);
+
+            // Drain all results that the background thread has finished.
+            // Discard results that belong to a previous generation (view has moved on).
+            // GPU upload (ingest_node) is cheap — just vertex buffer creation.
+            while let Ok(result) = self.result_rx.try_recv() {
+                self.in_flight.remove(&result.key);
+                if result.generation != self.generation { continue; }
+                // Only ingest if not already loaded (might have been unloaded mid-flight).
+                if !self.loaded_nodes.contains_key(&result.key) {
+                    let n = result.points.len();
+                    self.ingest_node(ctx, result.key, result.points, color_mode);
+                    println!("COPC ingested ({},{},{},{}) — {} pts, {} in-flight",
+                        result.key.l, result.key.x, result.key.y, result.key.z,
+                        n, self.in_flight.len());
+                }
+            }
+
+            // Meters per screen pixel determines the required LOD.
+            let mpp = (ortho_scale * 2.0 / screen_h.max(1.0)) as f64;
+            let target_depth = if mpp > 0.0 && self.spacing > 0.0 {
+                (self.spacing / mpp).log2().ceil() as i32
+            } else {
+                0
+            }.max(0).min(20);
+
+            let planes = extract_frustum_planes(view_proj);
+
+            let desired: HashSet<VoxelKey> = self.entries.iter()
+                .filter(|e| e.key.l <= target_depth)
+                .filter(|e| {
+                    let vmin = [
+                        (e.xmin - self.global_min[0]) as f32,
+                        (e.ymin - self.global_min[1]) as f32,
+                        (e.zmin - self.global_min[2]) as f32,
+                    ];
+                    let vmax = [
+                        (e.xmax - self.global_min[0]) as f32,
+                        (e.ymax - self.global_min[1]) as f32,
+                        (e.zmax - self.global_min[2]) as f32,
+                    ];
+                    !aabb_outside_frustum(&planes, &vmin, &vmax)
+                })
+                .map(|e| e.key)
+                .collect();
+
+            // Unload nodes that are no longer desired and not in flight.
+            let to_unload: Vec<VoxelKey> = self.loaded_nodes.keys()
+                .filter(|k| !desired.contains(k))
+                .copied()
+                .collect();
+            for key in to_unload {
+                if let Some(node) = self.loaded_nodes.remove(&key) {
+                    for chunk in node.chunks {
+                        ctx.delete_buffer(chunk.bindings.vertex_buffers[0]);
+                        ctx.delete_buffer(chunk.bindings.index_buffer);
+                    }
+                }
+            }
+
+            // Dispatch loads for desired nodes that are not loaded and not in flight.
+            // Only dispatch once the view has settled (no changes for SETTLE_MS).
+            // Sort by NDC distance from screen centre so the most visible nodes load first.
+            // Cap the queue depth so we never flood the channel on a sudden zoom-in.
+            const MAX_IN_FLIGHT: usize = 4;
+            let budget = MAX_IN_FLIGHT.saturating_sub(self.in_flight.len());
+            if view_settled && budget > 0 {
+                // Build a lookup from key → entry for centre-distance sorting.
+                let entry_map: HashMap<VoxelKey, &CopcEntry> =
+                    self.entries.iter().map(|e| (e.key, e)).collect();
+
+                let mut to_dispatch: Vec<VoxelKey> = desired.iter()
+                    .filter(|k| !self.loaded_nodes.contains_key(k) && !self.in_flight.contains(k))
+                    .copied()
+                    .collect();
+
+                // Project each voxel's world-space centre through view_proj and measure
+                // its NDC distance from the screen centre (0,0).  Coarser levels are
+                // given a small bonus so LOD still progresses coarse→fine overall.
+                to_dispatch.sort_by(|a, b| {
+                    let ndc_dist = |key: &VoxelKey| -> f32 {
+                        if let Some(e) = entry_map.get(key) {
+                            let cx = ((e.xmin + e.xmax) * 0.5 - self.global_min[0]) as f32;
+                            let cy = ((e.ymin + e.ymax) * 0.5 - self.global_min[1]) as f32;
+                            let cz = ((e.zmin + e.zmax) * 0.5 - self.global_min[2]) as f32;
+                            let p = view_proj.project_point3(glam::Vec3::new(cx, cy, cz));
+                            // Combine screen distance with a per-level bias so coarse
+                            // nodes are preferred when they are roughly as close.
+                            p.x * p.x + p.y * p.y + key.l as f32 * 0.1
+                        } else {
+                            f32::MAX
+                        }
+                    };
+                    ndc_dist(a).partial_cmp(&ndc_dist(b)).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                for key in to_dispatch.into_iter().take(budget) {
+                    self.dispatch_load(key);
+                }
+            }
+        }
+
+        pub fn draw_visible(
+            &self,
+            ctx: &mut dyn RenderingBackend,
+            view_proj: &glam::Mat4,
+            point_size: f32,
+        ) -> i32 {
+            let planes = extract_frustum_planes(view_proj);
+            let height_range = self.height_range();
+            let mut drawn = 0;
+
+            ctx.apply_pipeline(&self.pipeline);
+            for node in self.loaded_nodes.values() {
+                for chunk in &node.chunks {
+                    if aabb_outside_frustum(&planes, &chunk.aabb_min, &chunk.aabb_max) {
+                        continue;
+                    }
+                    ctx.apply_bindings(&chunk.bindings);
+                    ctx.apply_uniforms(miniquad::UniformsSource::table(
+                        &shader::Uniforms { mvp: *view_proj, point_size, height_range },
+                    ));
+                    ctx.draw(0, chunk.num_points, 1);
+                    drawn += chunk.num_points;
+                }
+            }
+            drawn
+        }
+
+        pub fn total_loaded_points(&self) -> i32 {
+            self.loaded_nodes.values().map(|n| n.total_points).sum()
+        }
+
+        pub fn loaded_node_count(&self) -> usize {
+            self.loaded_nodes.len()
+        }
+
+        pub fn find_nearest_point(
+            &self,
+            view_proj: &glam::Mat4,
+            screen_x: f32, screen_y: f32,
+            screen_w: f32, screen_h: f32,
+        ) -> Option<(&Point, glam::Vec3)> {
+            let ndc_x = screen_x / screen_w * 2.0 - 1.0;
+            let ndc_y = 1.0 - screen_y / screen_h * 2.0;
+            let mut best_dist = f32::MAX;
+            let mut best: Option<(&Point, glam::Vec3)> = None;
+            for node in self.loaded_nodes.values() {
+                for (i, pos) in node.positions.iter().enumerate() {
+                    let p = *view_proj * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
+                    let px = p.x / p.w;
+                    let py = p.y / p.w;
+                    let dist = (px - ndc_x) * (px - ndc_x) + (py - ndc_y) * (py - ndc_y);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best = Some((&node.points[i], glam::Vec3::from(*pos)));
+                    }
+                }
+            }
+            best
+        }
+
+        pub fn rebuild_colors(&mut self, ctx: &mut dyn RenderingBackend, color_mode: ColorMode) {
+            let height_range = self.height_range();
+            let intensity_range = if self.intensity_max > self.intensity_min {
+                (self.intensity_max - self.intensity_min) as f32
+            } else {
+                65535.0
+            };
+            for node in self.loaded_nodes.values_mut() {
+                for chunk in &mut node.chunks {
+                    let verts: Vec<Vertex> = chunk.point_indices.iter().map(|&i| Vertex {
+                        pos: node.positions[i],
+                        color: color_for_point(
+                            &node.points[i], node.positions[i][2], height_range,
+                            self.intensity_min, intensity_range,
+                            color_mode, &self.class_defs,
+                        ),
+                    }).collect();
+                    ctx.buffer_update(chunk.bindings.vertex_buffers[0], BufferSource::slice(&verts));
+                }
+            }
+        }
+
+        pub fn extract_section(
+            &self,
+            ctx: &mut dyn RenderingBackend,
+            start: (f32, f32),
+            end: (f32, f32),
+            depth: f32,
+            color_mode: ColorMode,
+        ) -> SectionData {
+            let dx = end.0 - start.0;
+            let dy = end.1 - start.1;
+            let len = (dx * dx + dy * dy).sqrt();
+            let dir = (dx / len, dy / len);
+            let normal = (-dir.1, dir.0);
+
+            let height_range = self.height_range();
+            let intensity_range = if self.intensity_max > self.intensity_min {
+                (self.intensity_max - self.intensity_min) as f32
+            } else {
+                65535.0
+            };
+
+            let mut section_verts = Vec::new();
+            let mut h_min = f32::MAX;
+            let mut h_max = f32::MIN;
+
+            for node in self.loaded_nodes.values() {
+                for (i, pos) in node.positions.iter().enumerate() {
+                    let rel_x = pos[0] - start.0;
+                    let rel_y = pos[1] - start.1;
+                    let along = rel_x * dir.0 + rel_y * dir.1;
+                    let perp = rel_x * normal.0 + rel_y * normal.1;
+                    if along >= 0.0 && along <= len && perp.abs() <= depth {
+                        h_min = h_min.min(pos[2]);
+                        h_max = h_max.max(pos[2]);
+                        section_verts.push(Vertex {
+                            pos: [along, pos[2], 0.0],
+                            color: color_for_point(
+                                &node.points[i], pos[2], height_range,
+                                self.intensity_min, intensity_range,
+                                color_mode, &self.class_defs,
+                            ),
+                        });
+                    }
+                }
+            }
+
+            let num_points = section_verts.len() as i32;
+            println!("COPC Section: {:.1}m long, {:.1}m depth, {} points", len, depth, num_points);
+
+            let vertex_buffer = ctx.new_buffer(
+                BufferType::VertexBuffer,
+                BufferUsage::Immutable,
+                BufferSource::slice(&section_verts),
+            );
+            let indices: Vec<u32> = (0..num_points as u32).collect();
+            let index_buffer = ctx.new_buffer(
+                BufferType::IndexBuffer,
+                BufferUsage::Immutable,
+                BufferSource::slice(&indices),
+            );
+            SectionData {
+                bindings: Bindings {
+                    vertex_buffers: vec![vertex_buffer],
+                    index_buffer,
+                    images: vec![],
+                },
+                num_points,
+                length: len,
+                height_min: if h_min == f32::MAX { 0.0 } else { h_min },
+                height_max: if h_max == f32::MIN { 0.0 } else { h_max },
+            }
+        }
+
+        pub fn draw_section(
+            &self,
+            ctx: &mut dyn RenderingBackend,
+            section: &SectionData,
+            mvp: &glam::Mat4,
+            point_size: f32,
+        ) {
+            ctx.apply_pipeline(&self.pipeline);
+            ctx.apply_bindings(&section.bindings);
+            ctx.apply_uniforms(miniquad::UniformsSource::table(
+                &shader::Uniforms { mvp: *mvp, point_size, height_range: self.height_range() },
+            ));
+            ctx.draw(0, section.num_points, 1);
         }
     }
 

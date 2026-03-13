@@ -7,7 +7,8 @@ use crate::glam::vec3;
 
 use macroquad::prelude::*;
 
-use crate::raw_miniquad::{EdlRenderer, SectionData, Stage, TileStageManager, load_class_defs};
+use crate::raw_miniquad::{CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, load_class_defs};
+use las::Point as LasPoint;
 
 const MOVE_SPEED: f32 = 0.5;
 const LOOK_SPEED: f32 = 0.5;
@@ -227,6 +228,8 @@ enum AppMode {
     SectionView,
     MeasureFirst,
     MeasureSecond,
+    SectionMeasureFirst,
+    SectionMeasureSecond,
 }
 
 /// Unproject screen coordinates to world XY plane at given Z height.
@@ -426,6 +429,12 @@ async fn main() {
     let args: Vec<String> = env::args().collect();
     let input_path = &args[1];
     let is_tile_mode = Path::new(input_path).is_dir();
+    let is_copc = !is_tile_mode && {
+        las::Reader::from_path(input_path)
+            .map(|r| r.header().copc_info_vlr().is_some())
+            .unwrap_or(false)
+    };
+    if is_copc { println!("Detected COPC format"); }
 
     let class_defs = load_class_defs();
     if let Some(ref cd) = class_defs {
@@ -440,6 +449,8 @@ async fn main() {
     let mut stage: Option<Stage> = None;
     // Tile mode state
     let mut tile_mgr: Option<TileStageManager> = None;
+    // COPC mode state
+    let mut copc_stage: Option<CopcStage> = None;
 
     let height_range;
 
@@ -450,6 +461,13 @@ async fn main() {
         };
         height_range = mgr.height_range();
         tile_mgr = Some(mgr);
+    } else if is_copc {
+        let cs = {
+            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+            CopcStage::new(ctx, input_path, color_mode, class_defs.clone())
+        };
+        height_range = cs.height_range();
+        copc_stage = Some(cs);
     } else {
         let s = {
             let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
@@ -478,6 +496,11 @@ async fn main() {
             (mgr.global_max[0] - mgr.global_min[0]) as f32,
             (mgr.global_max[1] - mgr.global_min[1]) as f32,
         )
+    } else if let Some(ref cs) = copc_stage {
+        (
+            (cs.global_max[0] - cs.global_min[0]) as f32,
+            (cs.global_max[1] - cs.global_min[1]) as f32,
+        )
     } else if let Some(ref stg) = stage {
         (
             (stg.cloud.max[0] - stg.cloud.min[0]) as f32,
@@ -504,10 +527,13 @@ async fn main() {
     let mut section_data: Option<SectionData> = None;
     let mut section_pan = glam::Vec2::ZERO;
     let mut section_zoom: f32 = 50.0;
+    let mut sec_measure_a: Option<glam::Vec2> = None;
+    let mut sec_measure_b: Option<glam::Vec2> = None;
 
     // Point pick state
     let mut picked_point: Option<usize> = None;
     let mut picked_tile_point: Option<(usize, usize)> = None;
+    let mut picked_copc_point: Option<LasPoint> = None;
 
     // Tile mode: selected tile for UI
     let mut selected_tile: Option<usize> = None;
@@ -521,6 +547,8 @@ async fn main() {
     // Compute viewer-space offset (world coords of the viewer origin)
     let data_offset: [f64; 3] = if let Some(ref mgr) = tile_mgr {
         mgr.global_min
+    } else if let Some(ref cs) = copc_stage {
+        cs.global_min
     } else if let Some(ref stg) = stage {
         stg.cloud.min
     } else {
@@ -551,7 +579,7 @@ async fn main() {
         }
 
         // ---- Section 2D view ----
-        if app_mode == AppMode::SectionView {
+        if matches!(app_mode, AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond) {
             // Navigation
             if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) {
                 section_pan.y += MOVE_SPEED * section_zoom * 0.02;
@@ -602,6 +630,8 @@ async fn main() {
                         stg.draw_section(&mut *gl.quad_context, sec, &section_mvp, point_size);
                     } else if let Some(ref mgr) = tile_mgr {
                         mgr.draw_section(&mut *gl.quad_context, sec, &section_mvp, point_size);
+                    } else if let Some(ref cs) = copc_stage {
+                        cs.draw_section(&mut *gl.quad_context, sec, &section_mvp, point_size);
                     }
                     gl.quad_context.end_render_pass();
                 }
@@ -636,18 +666,55 @@ async fn main() {
                             section_pan, section_zoom,
                             screen_width(), screen_height(),
                         );
-                    
+
+                }
+
+                // ---- Measure overlays ----
+                let marker_sz = 8.0;
+                if let Some(a) = sec_measure_a {
+                    let sx = world_to_screen_x(a.x);
+                    let sy = world_to_screen_y(a.y);
+                    draw_line(sx - marker_sz, sy, sx + marker_sz, sy, 1.5, YELLOW);
+                    draw_line(sx, sy - marker_sz, sx, sy + marker_sz, 1.5, YELLOW);
+                    draw_circle_lines(sx, sy, 5.0, 1.0, YELLOW);
+                    draw_text("A", sx + 8.0, sy - 6.0, 16.0, YELLOW);
+                }
+                if let Some(b) = sec_measure_b {
+                    let sx = world_to_screen_x(b.x);
+                    let sy = world_to_screen_y(b.y);
+                    draw_line(sx - marker_sz, sy, sx + marker_sz, sy, 1.5, ORANGE);
+                    draw_line(sx, sy - marker_sz, sx, sy + marker_sz, 1.5, ORANGE);
+                    draw_circle_lines(sx, sy, 5.0, 1.0, ORANGE);
+                    draw_text("B", sx + 8.0, sy - 6.0, 16.0, ORANGE);
+                }
+                if let (Some(a), Some(b)) = (sec_measure_a, sec_measure_b) {
+                    draw_line(
+                        world_to_screen_x(a.x), world_to_screen_y(a.y),
+                        world_to_screen_x(b.x), world_to_screen_y(b.y),
+                        1.5, WHITE,
+                    );
+                }
+                // Crosshair at mouse when in measure mode
+                if matches!(app_mode, AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond) {
+                    let (mx, my) = mouse_position();
+                    let ch = 12.0;
+                    draw_line(mx - ch, my, mx + ch, my, 1.0, Color::new(1.0, 1.0, 1.0, 0.7));
+                    draw_line(mx, my - ch, mx, my + ch, 1.0, Color::new(1.0, 1.0, 1.0, 0.7));
                 }
             }
 
             let prev_color_mode = color_mode;
+            let mut egui_wants_sec_pointer = false;
             egui_macroquad::ui(|egui_ctx| {
+                egui_wants_sec_pointer = egui_ctx.is_pointer_over_area();
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
                         if ui.button("Back to 3D").clicked() {
                             app_mode = AppMode::View3D;
                             section_data = None;
+                            sec_measure_a = None;
+                            sec_measure_b = None;
                         }
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -673,10 +740,68 @@ async fn main() {
                                 sec.length, sec.num_points, sec.height_min, sec.height_max
                             ));
                         }
+                        ui.separator();
+                        let measuring = matches!(app_mode, AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond);
+                        if measuring {
+                            if ui.button("Stop measuring").clicked() {
+                                app_mode = AppMode::SectionView;
+                                sec_measure_a = None;
+                                sec_measure_b = None;
+                            }
+                            if app_mode == AppMode::SectionMeasureFirst {
+                                ui.label("Click point A");
+                            } else {
+                                ui.label("Click point B");
+                            }
+                        } else if ui.button("Measure").clicked() {
+                            app_mode = AppMode::SectionMeasureFirst;
+                            sec_measure_a = None;
+                            sec_measure_b = None;
+                        }
+                        if let (Some(a), Some(b)) = (sec_measure_a, sec_measure_b) {
+                            let dh = (b.x - a.x).abs();
+                            let dv = b.y - a.y;
+                            let slant = (dh * dh + dv * dv).sqrt();
+                            let angle_deg = dv.atan2(dh).to_degrees();
+                            let slope_pct = if dh > 0.0001 { dv / dh * 100.0 } else { f32::INFINITY };
+                            ui.separator();
+                            ui.label("Measurement:");
+                            ui.label(format!("  Δ height:  {:+.3} m", dv));
+                            ui.label(format!("  Horiz:     {:.3} m", dh));
+                            ui.label(format!("  Slant:     {:.3} m", slant));
+                            ui.label(format!("  Angle:     {:.2}°", angle_deg));
+                            if slope_pct.is_finite() {
+                                ui.label(format!("  Slope:     {:.1}%", slope_pct));
+                            } else {
+                                ui.label("  Slope:     vertical");
+                            }
+                        }
                     });
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
             });
             egui_macroquad::draw();
+
+            // ---- Section measure click handling ----
+            if !egui_wants_sec_pointer && is_mouse_button_pressed(MouseButton::Left) {
+                let aspect = screen_width() / screen_height();
+                let half_h = section_zoom;
+                let half_w = half_h * aspect;
+                let (mx, my) = mouse_position();
+                let wx = (mx / screen_width()) * 2.0 * half_w + (section_pan.x - half_w);
+                let wy = (1.0 - my / screen_height()) * 2.0 * half_h + (section_pan.y - half_h);
+                let pos = glam::Vec2::new(wx, wy);
+                match app_mode {
+                    AppMode::SectionMeasureFirst => {
+                        sec_measure_a = Some(pos);
+                        sec_measure_b = None;
+                        app_mode = AppMode::SectionMeasureSecond;
+                    }
+                    AppMode::SectionMeasureSecond => {
+                        sec_measure_b = Some(pos);
+                    }
+                    _ => {}
+                }
+            }
 
             if color_mode != prev_color_mode &&
                 let (Some(start), Some(end)) = (section_start, section_end) {
@@ -875,7 +1000,7 @@ async fn main() {
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
-                            AppMode::SectionView => "Back to 3D",
+                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond => "Back to 3D",
                         };
                         if ui.button(section_label).clicked() {
                             match app_mode {
@@ -1063,7 +1188,265 @@ async fn main() {
                 let Some(ref mut stg) = stage {
                     let gl = unsafe { get_internal_gl() };
                     stg.rebuild_colors(&mut *gl.quad_context, color_mode);
-                
+
+            }
+        }
+
+        // ---- COPC mode rendering ----
+        if let Some(ref mut cs) = copc_stage {
+            // Update LOD: load/unload nodes for current view (non-blocking).
+            {
+                let mut gl = unsafe { get_internal_gl() };
+                gl.flush();
+                cs.update_view(&mut *gl.quad_context, &view_proj, ortho_scale, screen_height(), color_mode);
+            }
+
+            // Section corridor preview in 3D.
+            match app_mode {
+                AppMode::SectionPickEnd => {
+                    if let (Some(start), Some((wx, wy))) = (section_start, cursor_world) {
+                        draw_line_3d(vec3(start.0, start.1, mid_z), vec3(wx, wy, mid_z), YELLOW);
+                    }
+                }
+                AppMode::SectionAdjustDepth => {
+                    if let (Some(start), Some(end)) = (section_start, section_end) {
+                        draw_section_corridor(start, end, section_depth, height_range);
+                    }
+                }
+                _ => {}
+            }
+
+            // Render visible chunks (with optional EDL).
+            let drawn = {
+                let mut gl = unsafe { get_internal_gl() };
+                gl.flush();
+                edl_renderer.resize_if_needed(
+                    &mut *gl.quad_context,
+                    screen_width() as u32,
+                    screen_height() as u32,
+                );
+                if edl_enabled {
+                    edl_renderer.begin(&mut *gl.quad_context);
+                } else {
+                    gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
+                }
+                let drawn = cs.draw_visible(&mut *gl.quad_context, &view_proj, point_size);
+                if edl_enabled {
+                    edl_renderer.apply(&mut *gl.quad_context, edl_strength);
+                } else {
+                    gl.quad_context.end_render_pass();
+                }
+                drawn
+            };
+
+            set_default_camera();
+
+            // View cube
+            let vc_interactive = app_mode == AppMode::View3D || app_mode == AppMode::PointPick;
+            if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive) {
+                let old_front = front;
+                yaw = new_yaw;
+                pitch = new_pitch;
+                front = vec3(yaw.cos() * pitch.cos(), yaw.sin() * pitch.cos(), pitch.sin()).normalize();
+                right = front.cross(world_up).normalize();
+                up = right.cross(front).normalize();
+                position = orbit_pivot + front * (position - orbit_pivot).dot(old_front);
+            }
+
+            // egui UI
+            let prev_color_mode = color_mode;
+            let mut egui_wants_pointer = false;
+            let mut do_zoom_all = false;
+            egui_macroquad::ui(|egui_ctx| {
+                egui_wants_pointer = egui_ctx.is_pointer_over_area();
+                egui_macroquad::egui::Window::new("Controls")
+                    .default_pos([10.0, 10.0])
+                    .show(egui_ctx, |ui| {
+                        let section_label = match app_mode {
+                            AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst | AppMode::MeasureSecond => "Cross Section",
+                            AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
+                            AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
+                            AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
+                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond => "Back to 3D",
+                        };
+                        if ui.button(section_label).clicked() {
+                            match app_mode {
+                                AppMode::View3D | AppMode::PointPick => {
+                                    app_mode = AppMode::SectionPickStart;
+                                    section_start = None;
+                                    section_end = None;
+                                    picked_point = None;
+                                }
+                                _ => { app_mode = AppMode::View3D; section_data = None; }
+                            }
+                        }
+                        let pick_label = if app_mode == AppMode::PointPick {
+                            "Click a point... (Esc to cancel)"
+                        } else { "Point Info" };
+                        if ui.button(pick_label).clicked() {
+                            if app_mode == AppMode::PointPick { app_mode = AppMode::View3D; }
+                            else { app_mode = AppMode::PointPick; picked_copc_point = None; }
+                        }
+                        let measure_label = match app_mode {
+                            AppMode::MeasureFirst => "Click point A... (Esc to cancel)",
+                            AppMode::MeasureSecond => "Click point B... (Esc to cancel)",
+                            _ => "Measure",
+                        };
+                        if ui.button(measure_label).clicked() {
+                            if matches!(app_mode, AppMode::MeasureFirst | AppMode::MeasureSecond) {
+                                app_mode = AppMode::View3D;
+                            } else {
+                                app_mode = AppMode::MeasureFirst;
+                                measure_a = None; measure_b = None;
+                            }
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Color:");
+                            egui_macroquad::egui::ComboBox::from_id_salt("color_mode")
+                                .selected_text(color_mode.label())
+                                .show_ui(ui, |ui| {
+                                    for mode in &ColorMode::ALL {
+                                        ui.selectable_value(&mut color_mode, *mode, mode.label());
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Background:");
+                            let mut bg_egui = mq_to_egui(background);
+                            if ui.color_edit_button_srgba(&mut bg_egui).changed() {
+                                background = egui_to_mq(bg_egui);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("Zoom All").clicked() { do_zoom_all = true; }
+                            ui.label("Pt size:");
+                            if ui.button("-").clicked() { point_size = (point_size - 1.0).max(1.0); }
+                            ui.label(format!("{:.0}", point_size));
+                            if ui.button("+").clicked() { point_size = (point_size + 1.0).min(10.0); }
+                        });
+                        ui.horizontal(|ui| {
+                            let edl_label = if edl_enabled { "EDL: ON" } else { "EDL: OFF" };
+                            if ui.button(edl_label).clicked() { edl_enabled = !edl_enabled; }
+                            if edl_enabled {
+                                ui.label("Strength:");
+                                ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
+                            }
+                        });
+                        let mpp = ortho_scale * 2.0 / screen_height().max(1.0);
+                        let target_depth = if mpp > 0.0 && cs.spacing > 0.0 {
+                            ((cs.spacing as f32 / mpp).log2().ceil() as i32).max(0)
+                        } else { 0 };
+                        if app_mode == AppMode::SectionAdjustDepth {
+                            ui.label(format!("Section depth: {:.1}m", section_depth));
+                        }
+                        ui.label(format!(
+                            "COPC | {}/{} pts | {} nodes | LOD {} | {} in-flight | FPS: {:.0}",
+                            drawn, cs.total_loaded_points(),
+                            cs.loaded_node_count(), target_depth,
+                            cs.pending_count(),
+                            1.0 / get_frame_time(),
+                        ));
+                        if let (Some(a), Some(b)) = (measure_a, measure_b) {
+                            let off = glam::Vec3::new(
+                                cs.global_min[0] as f32, cs.global_min[1] as f32, cs.global_min[2] as f32,
+                            );
+                            let wa = a + off; let wb = b + off;
+                            let dx = wb.x - wa.x; let dy = wb.y - wa.y; let dz = wb.z - wa.z;
+                            let dist3d = (dx*dx + dy*dy + dz*dz).sqrt();
+                            let dist2d = (dx*dx + dy*dy).sqrt();
+                            ui.separator();
+                            ui.label("Measurement:");
+                            ui.label(format!("  A: ({:.3}, {:.3}, {:.3})", wa.x, wa.y, wa.z));
+                            ui.label(format!("  B: ({:.3}, {:.3}, {:.3})", wb.x, wb.y, wb.z));
+                            ui.label(format!("  dX: {:.3}  dY: {:.3}  dZ: {:.3}", dx, dy, dz));
+                            ui.label(format!("  3D dist: {:.3}m", dist3d));
+                            ui.label(format!("  Horiz:   {:.3}m  ΔZ: {:.3}m", dist2d, dz));
+                        } else if measure_a.is_some() {
+                            ui.separator();
+                            ui.label("A set — click point B");
+                        }
+                        if let Some(ref p) = picked_copc_point {
+                            ui.separator();
+                            ui.label("Point Info:");
+                            ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
+                            ui.label(format!("  Intensity: {}", p.intensity));
+                            ui.label(format!("  Classification: {}", class_label(p.classification, &class_defs)));
+                            ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
+                            if let Some(ref color) = p.color {
+                                ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
+                            }
+                            if let Some(time) = p.gps_time {
+                                ui.label(format!("  GPS time: {:.6}", time));
+                            }
+                            ui.label(format!("  Point Source Id: {}", p.point_source_id));
+                        }
+                    });
+                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
+            });
+            egui_macroquad::draw();
+
+            if do_zoom_all {
+                let aspect = screen_width() / screen_height().max(1.0);
+                ortho_scale = (data_extent_y * 0.5).max(data_extent_x * 0.5 / aspect) * 1.05;
+                position = vec3(data_extent_x * 0.5, data_extent_y * 0.5, height_range * 0.5)
+                    - front * (data_extent_x.max(data_extent_y) * 2.0);
+            }
+
+            // Mouse clicks
+            if !egui_wants_pointer && is_mouse_button_pressed(MouseButton::Left) {
+                match app_mode {
+                    AppMode::PointPick => {
+                        if let Some((p, _vpos)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
+                            picked_copc_point = Some(p.clone());
+                        }
+                    }
+                    AppMode::SectionPickStart => {
+                        if let Some(world) = cursor_world {
+                            section_start = Some(world);
+                            app_mode = AppMode::SectionPickEnd;
+                        }
+                    }
+                    AppMode::SectionPickEnd => {
+                        if let Some(world) = cursor_world {
+                            section_end = Some(world);
+                            app_mode = AppMode::SectionAdjustDepth;
+                        }
+                    }
+                    AppMode::SectionAdjustDepth => {
+                        if let (Some(start), Some(end)) = (section_start, section_end) {
+                            let gl = unsafe { get_internal_gl() };
+                            let sec = cs.extract_section(
+                                &mut *gl.quad_context, start, end, section_depth, color_mode,
+                            );
+                            section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
+                            section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
+                            section_data = Some(sec);
+                            app_mode = AppMode::SectionView;
+                        }
+                    }
+                    AppMode::MeasureFirst => {
+                        if let Some((_p, vpos)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
+                            measure_a = Some(vpos);
+                            measure_b = None;
+                            app_mode = AppMode::MeasureSecond;
+                        }
+                    }
+                    AppMode::MeasureSecond => {
+                        if let Some((_p, vpos)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
+                            measure_b = Some(vpos);
+                        }
+                    }
+                    AppMode::View3D => {
+                        selected_poly = polylines::pick(&poly_files, &view_proj, mx, my, screen_width(), screen_height(), 12.0);
+                    }
+                    _ => {}
+                }
+            }
+
+            if color_mode != prev_color_mode {
+                let gl = unsafe { get_internal_gl() };
+                cs.rebuild_colors(&mut *gl.quad_context, color_mode);
             }
         }
 
@@ -1184,7 +1567,7 @@ async fn main() {
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
-                            AppMode::SectionView => "Back to 3D",
+                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond => "Back to 3D",
                         };
                         if ui.button(section_label).clicked() {
                             match app_mode {
