@@ -103,6 +103,8 @@
         pub length: f32,
         pub height_min: f32,
         pub height_max: f32,
+        /// Full Z span of the source dataset — used by the shader for height-based colouring.
+        pub height_range: f32,
     }
 
     pub struct Stage {
@@ -493,6 +495,7 @@
                 length: len,
                 height_min: h_min,
                 height_max: h_max,
+                height_range: self.height_range(),
             }
         }
 
@@ -500,7 +503,7 @@
             ctx.apply_pipeline(&self.pipeline);
             ctx.apply_bindings(&section.bindings);
             ctx.apply_uniforms(miniquad::UniformsSource::table(
-                &shader::Uniforms { mvp: *mvp, point_size, height_range: self.height_range() },
+                &shader::Uniforms { mvp: *mvp, point_size, height_range: section.height_range },
             ));
             ctx.draw(0, section.num_points, 1);
         }
@@ -572,6 +575,29 @@
             .collect()
     }
 
+    /// Return paths to all COPC files in `dir_path`.
+    pub fn scan_dir_for_copc(dir_path: &str) -> Vec<String> {
+        let mut paths = Vec::new();
+        let Ok(read_dir) = std::fs::read_dir(dir_path) else { return paths; };
+        let mut entries: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                let ext_lower = ext.to_string_lossy().to_lowercase();
+                if ext_lower == "laz" || ext_lower == "las" {
+                    let is_copc = Reader::from_path(&path)
+                        .map(|r| r.header().copc_info_vlr().is_some())
+                        .unwrap_or(false);
+                    if is_copc {
+                        paths.push(path.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        paths
+    }
+
     fn generate_index(dir_path: &str) {
         println!("Generating index.txt for {}", dir_path);
         let mut entries = Vec::new();
@@ -586,6 +612,8 @@
                 let ext_lower = ext.to_string_lossy().to_lowercase();
                 if ext_lower == "laz" || ext_lower == "las" {
                     let reader = Reader::from_path(&path).unwrap();
+                    // Skip COPC files — they are handled separately as CopcStage instances.
+                    if reader.header().copc_info_vlr().is_some() { continue; }
                     let bounds = reader.header().bounds();
                     let filename = path.file_name().unwrap().to_string_lossy();
                     entries.push(format!("{} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3}",
@@ -863,6 +891,7 @@
                 length: len,
                 height_min: h_min,
                 height_max: h_max,
+                height_range: self.height_range(),
             }
         }
 
@@ -870,7 +899,7 @@
             ctx.apply_pipeline(&self.pipeline);
             ctx.apply_bindings(&section.bindings);
             ctx.apply_uniforms(miniquad::UniformsSource::table(
-                &shader::Uniforms { mvp: *mvp, point_size, height_range: self.height_range() },
+                &shader::Uniforms { mvp: *mvp, point_size, height_range: section.height_range },
             ));
             ctx.draw(0, section.num_points, 1);
         }
@@ -1097,6 +1126,10 @@
         loaded_nodes: HashMap<VoxelKey, CopcLoadedNode>,
         pub global_min: [f64; 3],
         pub global_max: [f64; 3],
+        /// World-space origin used for viewer-space coordinate conversion.
+        /// Equals `global_min` for single-file mode; set to a shared minimum
+        /// across all files in directory mode so all stages share one coordinate space.
+        pub viewer_origin: [f64; 3],
         pub intensity_min: u16,
         pub intensity_max: u16,
         pub class_defs: Option<ClassDefs>,
@@ -1167,6 +1200,7 @@
         pub fn new(
             ctx: &mut dyn RenderingBackend,
             filepath: &str,
+            viewer_origin: Option<[f64; 3]>,
             _color_mode: ColorMode,
             class_defs: Option<ClassDefs>,
         ) -> Self {
@@ -1186,6 +1220,7 @@
             let bounds = header.bounds();
             let global_min = [bounds.min.x, bounds.min.y, bounds.min.z];
             let global_max = [bounds.max.x, bounds.max.y, bounds.max.z];
+            let viewer_origin = viewer_origin.unwrap_or(global_min);
 
             let hier_entries = reader.hierarchy_entries()
                 .expect("No COPC hierarchy");
@@ -1229,6 +1264,7 @@
                 loaded_nodes: HashMap::new(),
                 global_min,
                 global_max,
+                viewer_origin,
                 intensity_min: u16::MAX,
                 intensity_max: 0,
                 class_defs,
@@ -1291,9 +1327,9 @@
             }
 
             let positions: Vec<[f32; 3]> = pts.iter().map(|p| [
-                (p.x - self.global_min[0]) as f32,
-                (p.y - self.global_min[1]) as f32,
-                (p.z - self.global_min[2]) as f32,
+                (p.x - self.viewer_origin[0]) as f32,
+                (p.y - self.viewer_origin[1]) as f32,
+                (p.z - self.viewer_origin[2]) as f32,
             ]).collect();
 
             let vertices: Vec<Vertex> = pts.iter().enumerate().map(|(i, p)| Vertex {
@@ -1362,14 +1398,14 @@
                 .filter(|e| e.key.l <= target_depth)
                 .filter(|e| {
                     let vmin = [
-                        (e.xmin - self.global_min[0]) as f32,
-                        (e.ymin - self.global_min[1]) as f32,
-                        (e.zmin - self.global_min[2]) as f32,
+                        (e.xmin - self.viewer_origin[0]) as f32,
+                        (e.ymin - self.viewer_origin[1]) as f32,
+                        (e.zmin - self.viewer_origin[2]) as f32,
                     ];
                     let vmax = [
-                        (e.xmax - self.global_min[0]) as f32,
-                        (e.ymax - self.global_min[1]) as f32,
-                        (e.zmax - self.global_min[2]) as f32,
+                        (e.xmax - self.viewer_origin[0]) as f32,
+                        (e.ymax - self.viewer_origin[1]) as f32,
+                        (e.zmax - self.viewer_origin[2]) as f32,
                     ];
                     !aabb_outside_frustum(&planes, &vmin, &vmax)
                 })
@@ -1412,9 +1448,9 @@
                 to_dispatch.sort_by(|a, b| {
                     let ndc_dist = |key: &VoxelKey| -> f32 {
                         if let Some(e) = entry_map.get(key) {
-                            let cx = ((e.xmin + e.xmax) * 0.5 - self.global_min[0]) as f32;
-                            let cy = ((e.ymin + e.ymax) * 0.5 - self.global_min[1]) as f32;
-                            let cz = ((e.zmin + e.zmax) * 0.5 - self.global_min[2]) as f32;
+                            let cx = ((e.xmin + e.xmax) * 0.5 - self.viewer_origin[0]) as f32;
+                            let cy = ((e.ymin + e.ymax) * 0.5 - self.viewer_origin[1]) as f32;
+                            let cz = ((e.zmin + e.zmax) * 0.5 - self.viewer_origin[2]) as f32;
                             let p = view_proj.project_point3(glam::Vec3::new(cx, cy, cz));
                             // Combine screen distance with a per-level bias so coarse
                             // nodes are preferred when they are roughly as close.
@@ -1467,16 +1503,19 @@
             self.loaded_nodes.len()
         }
 
+        /// Returns `(point, viewer_pos, ndc_dist_sq)` for the loaded point closest
+        /// to the given screen coordinate.  The distance is returned so callers with
+        /// multiple stages can pick the globally nearest point.
         pub fn find_nearest_point(
             &self,
             view_proj: &glam::Mat4,
             screen_x: f32, screen_y: f32,
             screen_w: f32, screen_h: f32,
-        ) -> Option<(&Point, glam::Vec3)> {
+        ) -> Option<(&Point, glam::Vec3, f32)> {
             let ndc_x = screen_x / screen_w * 2.0 - 1.0;
             let ndc_y = 1.0 - screen_y / screen_h * 2.0;
             let mut best_dist = f32::MAX;
-            let mut best: Option<(&Point, glam::Vec3)> = None;
+            let mut best: Option<(&Point, glam::Vec3, f32)> = None;
             for node in self.loaded_nodes.values() {
                 for (i, pos) in node.positions.iter().enumerate() {
                     let p = *view_proj * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
@@ -1485,7 +1524,7 @@
                     let dist = (px - ndc_x) * (px - ndc_x) + (py - ndc_y) * (py - ndc_y);
                     if dist < best_dist {
                         best_dist = dist;
-                        best = Some((&node.points[i], glam::Vec3::from(*pos)));
+                        best = Some((&node.points[i], glam::Vec3::from(*pos), dist));
                     }
                 }
             }
@@ -1514,14 +1553,15 @@
             }
         }
 
-        pub fn extract_section(
+        /// Collect section vertices from currently loaded nodes.
+        /// Returns `(verts, length, height_min, height_max)`.
+        pub fn extract_section_verts(
             &self,
-            ctx: &mut dyn RenderingBackend,
             start: (f32, f32),
             end: (f32, f32),
             depth: f32,
             color_mode: ColorMode,
-        ) -> SectionData {
+        ) -> (Vec<Vertex>, f32, f32, f32) {
             let dx = end.0 - start.0;
             let dy = end.1 - start.1;
             let len = (dx * dx + dy * dy).sqrt();
@@ -1535,7 +1575,7 @@
                 65535.0
             };
 
-            let mut section_verts = Vec::new();
+            let mut verts = Vec::new();
             let mut h_min = f32::MAX;
             let mut h_max = f32::MIN;
 
@@ -1548,7 +1588,7 @@
                     if along >= 0.0 && along <= len && perp.abs() <= depth {
                         h_min = h_min.min(pos[2]);
                         h_max = h_max.max(pos[2]);
-                        section_verts.push(Vertex {
+                        verts.push(Vertex {
                             pos: [along, pos[2], 0.0],
                             color: color_for_point(
                                 &node.points[i], pos[2], height_range,
@@ -1560,31 +1600,22 @@
                 }
             }
 
-            let num_points = section_verts.len() as i32;
-            println!("COPC Section: {:.1}m long, {:.1}m depth, {} points", len, depth, num_points);
+            let h_min = if h_min == f32::MAX { 0.0 } else { h_min };
+            let h_max = if h_max == f32::MIN { 0.0 } else { h_max };
+            (verts, len, h_min, h_max)
+        }
 
-            let vertex_buffer = ctx.new_buffer(
-                BufferType::VertexBuffer,
-                BufferUsage::Immutable,
-                BufferSource::slice(&section_verts),
-            );
-            let indices: Vec<u32> = (0..num_points as u32).collect();
-            let index_buffer = ctx.new_buffer(
-                BufferType::IndexBuffer,
-                BufferUsage::Immutable,
-                BufferSource::slice(&indices),
-            );
-            SectionData {
-                bindings: Bindings {
-                    vertex_buffers: vec![vertex_buffer],
-                    index_buffer,
-                    images: vec![],
-                },
-                num_points,
-                length: len,
-                height_min: if h_min == f32::MAX { 0.0 } else { h_min },
-                height_max: if h_max == f32::MIN { 0.0 } else { h_max },
-            }
+        pub fn extract_section(
+            &self,
+            ctx: &mut dyn RenderingBackend,
+            start: (f32, f32),
+            end: (f32, f32),
+            depth: f32,
+            color_mode: ColorMode,
+        ) -> SectionData {
+            let (verts, len, h_min, h_max) = self.extract_section_verts(start, end, depth, color_mode);
+            println!("COPC Section: {:.1}m long, {:.1}m depth, {} points", len, depth, verts.len());
+            make_section_data(ctx, verts, len, h_min, h_max, self.height_range())
         }
 
         pub fn draw_section(
@@ -1597,9 +1628,44 @@
             ctx.apply_pipeline(&self.pipeline);
             ctx.apply_bindings(&section.bindings);
             ctx.apply_uniforms(miniquad::UniformsSource::table(
-                &shader::Uniforms { mvp: *mvp, point_size, height_range: self.height_range() },
+                &shader::Uniforms { mvp: *mvp, point_size, height_range: section.height_range },
             ));
             ctx.draw(0, section.num_points, 1);
+        }
+    }
+
+    /// Build a `SectionData` GPU object from raw vertices.
+    pub fn make_section_data(
+        ctx: &mut dyn RenderingBackend,
+        verts: Vec<Vertex>,
+        length: f32,
+        height_min: f32,
+        height_max: f32,
+        height_range: f32,
+    ) -> SectionData {
+        let num_points = verts.len() as i32;
+        let vertex_buffer = ctx.new_buffer(
+            BufferType::VertexBuffer,
+            BufferUsage::Immutable,
+            BufferSource::slice(&verts),
+        );
+        let indices: Vec<u32> = (0..num_points as u32).collect();
+        let index_buffer = ctx.new_buffer(
+            BufferType::IndexBuffer,
+            BufferUsage::Immutable,
+            BufferSource::slice(&indices),
+        );
+        SectionData {
+            bindings: Bindings {
+                vertex_buffers: vec![vertex_buffer],
+                index_buffer,
+                images: vec![],
+            },
+            num_points,
+            length,
+            height_min,
+            height_max,
+            height_range,
         }
     }
 

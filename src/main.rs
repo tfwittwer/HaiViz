@@ -7,7 +7,7 @@ use crate::glam::vec3;
 
 use macroquad::prelude::*;
 
-use crate::raw_miniquad::{CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, load_class_defs};
+use crate::raw_miniquad::{CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, load_class_defs, make_section_data, scan_dir_for_copc};
 use las::Point as LasPoint;
 
 const MOVE_SPEED: f32 = 0.5;
@@ -449,8 +449,8 @@ async fn main() {
     let mut stage: Option<Stage> = None;
     // Tile mode state
     let mut tile_mgr: Option<TileStageManager> = None;
-    // COPC mode state
-    let mut copc_stage: Option<CopcStage> = None;
+    // COPC stages: one entry in single-file mode, one per COPC file in directory mode.
+    let mut copc_stages: Vec<CopcStage> = Vec::new();
 
     let height_range;
 
@@ -459,15 +459,41 @@ async fn main() {
             let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
             TileStageManager::new(ctx, input_path, class_defs.clone())
         };
+
+        // Also load any COPC files in the same directory.
+        let copc_paths = scan_dir_for_copc(input_path);
+        if !copc_paths.is_empty() {
+            println!("Found {} COPC file(s) in directory", copc_paths.len());
+            // Compute a unified viewer origin: min of tile bounds and all COPC file bounds.
+            let mut unified_min = mgr.global_min;
+            let mut unified_max = mgr.global_max;
+            for path in &copc_paths {
+                if let Ok(r) = las::Reader::from_path(path) {
+                    let b = r.header().bounds();
+                    unified_min[0] = unified_min[0].min(b.min.x);
+                    unified_min[1] = unified_min[1].min(b.min.y);
+                    unified_min[2] = unified_min[2].min(b.min.z);
+                    unified_max[0] = unified_max[0].max(b.max.x);
+                    unified_max[1] = unified_max[1].max(b.max.y);
+                    unified_max[2] = unified_max[2].max(b.max.z);
+                }
+            }
+            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+            for path in &copc_paths {
+                let cs = CopcStage::new(ctx, path, Some(unified_min), color_mode, class_defs.clone());
+                copc_stages.push(cs);
+            }
+        }
+
         height_range = mgr.height_range();
         tile_mgr = Some(mgr);
     } else if is_copc {
         let cs = {
             let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
-            CopcStage::new(ctx, input_path, color_mode, class_defs.clone())
+            CopcStage::new(ctx, input_path, None, color_mode, class_defs.clone())
         };
         height_range = cs.height_range();
-        copc_stage = Some(cs);
+        copc_stages.push(cs);
     } else {
         let s = {
             let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
@@ -492,15 +518,20 @@ async fn main() {
 
     // Compute initial camera position and ortho_scale to fit the data on screen.
     let (data_extent_x, data_extent_y) = if let Some(ref mgr) = tile_mgr {
-        (
-            (mgr.global_max[0] - mgr.global_min[0]) as f32,
-            (mgr.global_max[1] - mgr.global_min[1]) as f32,
-        )
-    } else if let Some(ref cs) = copc_stage {
-        (
-            (cs.global_max[0] - cs.global_min[0]) as f32,
-            (cs.global_max[1] - cs.global_min[1]) as f32,
-        )
+        let mut gmax = mgr.global_max;
+        let mut gmin = mgr.global_min;
+        for cs in &copc_stages {
+            gmin[0] = gmin[0].min(cs.global_min[0]); gmin[1] = gmin[1].min(cs.global_min[1]);
+            gmax[0] = gmax[0].max(cs.global_max[0]); gmax[1] = gmax[1].max(cs.global_max[1]);
+        }
+        ((gmax[0] - gmin[0]) as f32, (gmax[1] - gmin[1]) as f32)
+    } else if !copc_stages.is_empty() {
+        let (mut gmin, mut gmax) = (copc_stages[0].global_min, copc_stages[0].global_max);
+        for cs in &copc_stages[1..] {
+            gmin[0] = gmin[0].min(cs.global_min[0]); gmin[1] = gmin[1].min(cs.global_min[1]);
+            gmax[0] = gmax[0].max(cs.global_max[0]); gmax[1] = gmax[1].max(cs.global_max[1]);
+        }
+        ((gmax[0] - gmin[0]) as f32, (gmax[1] - gmin[1]) as f32)
     } else if let Some(ref stg) = stage {
         (
             (stg.cloud.max[0] - stg.cloud.min[0]) as f32,
@@ -547,8 +578,9 @@ async fn main() {
     // Compute viewer-space offset (world coords of the viewer origin)
     let data_offset: [f64; 3] = if let Some(ref mgr) = tile_mgr {
         mgr.global_min
-    } else if let Some(ref cs) = copc_stage {
-        cs.global_min
+    } else if !copc_stages.is_empty() {
+        // viewer_origin is the shared coordinate origin (== global_min for single-file mode).
+        copc_stages[0].viewer_origin
     } else if let Some(ref stg) = stage {
         stg.cloud.min
     } else {
@@ -630,7 +662,7 @@ async fn main() {
                         stg.draw_section(&mut *gl.quad_context, sec, &section_mvp, point_size);
                     } else if let Some(ref mgr) = tile_mgr {
                         mgr.draw_section(&mut *gl.quad_context, sec, &section_mvp, point_size);
-                    } else if let Some(ref cs) = copc_stage {
+                    } else if let Some(cs) = copc_stages.first() {
                         cs.draw_section(&mut *gl.quad_context, sec, &section_mvp, point_size);
                     }
                     gl.quad_context.end_render_pass();
@@ -1193,12 +1225,14 @@ async fn main() {
         }
 
         // ---- COPC mode rendering ----
-        if let Some(ref mut cs) = copc_stage {
+        if !copc_stages.is_empty() {
             // Update LOD: load/unload nodes for current view (non-blocking).
             {
                 let mut gl = unsafe { get_internal_gl() };
                 gl.flush();
-                cs.update_view(&mut *gl.quad_context, &view_proj, ortho_scale, screen_height(), color_mode);
+                for cs in copc_stages.iter_mut() {
+                    cs.update_view(&mut *gl.quad_context, &view_proj, ortho_scale, screen_height(), color_mode);
+                }
             }
 
             // Section corridor preview in 3D.
@@ -1230,7 +1264,7 @@ async fn main() {
                 } else {
                     gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
                 }
-                let drawn = cs.draw_visible(&mut *gl.quad_context, &view_proj, point_size);
+                let drawn: i32 = copc_stages.iter().map(|cs| cs.draw_visible(&mut *gl.quad_context, &view_proj, point_size)).sum();
                 if edl_enabled {
                     edl_renderer.apply(&mut *gl.quad_context, edl_strength);
                 } else {
@@ -1334,23 +1368,24 @@ async fn main() {
                             }
                         });
                         let mpp = ortho_scale * 2.0 / screen_height().max(1.0);
-                        let target_depth = if mpp > 0.0 && cs.spacing > 0.0 {
-                            ((cs.spacing as f32 / mpp).log2().ceil() as i32).max(0)
+                        let spacing0 = copc_stages[0].spacing;
+                        let target_depth = if mpp > 0.0 && spacing0 > 0.0 {
+                            ((spacing0 as f32 / mpp).log2().ceil() as i32).max(0)
                         } else { 0 };
                         if app_mode == AppMode::SectionAdjustDepth {
                             ui.label(format!("Section depth: {:.1}m", section_depth));
                         }
+                        let total_pts: i32 = copc_stages.iter().map(|cs| cs.total_loaded_points()).sum();
+                        let total_nodes: usize = copc_stages.iter().map(|cs| cs.loaded_node_count()).sum();
+                        let total_inflight: usize = copc_stages.iter().map(|cs| cs.pending_count()).sum();
                         ui.label(format!(
                             "COPC | {}/{} pts | {} nodes | LOD {} | {} in-flight | FPS: {:.0}",
-                            drawn, cs.total_loaded_points(),
-                            cs.loaded_node_count(), target_depth,
-                            cs.pending_count(),
+                            drawn, total_pts, total_nodes, target_depth, total_inflight,
                             1.0 / get_frame_time(),
                         ));
                         if let (Some(a), Some(b)) = (measure_a, measure_b) {
-                            let off = glam::Vec3::new(
-                                cs.global_min[0] as f32, cs.global_min[1] as f32, cs.global_min[2] as f32,
-                            );
+                            let vo = copc_stages[0].viewer_origin;
+                            let off = glam::Vec3::new(vo[0] as f32, vo[1] as f32, vo[2] as f32);
                             let wa = a + off; let wb = b + off;
                             let dx = wb.x - wa.x; let dy = wb.y - wa.y; let dz = wb.z - wa.z;
                             let dist3d = (dx*dx + dy*dy + dz*dz).sqrt();
@@ -1397,8 +1432,11 @@ async fn main() {
             if !egui_wants_pointer && is_mouse_button_pressed(MouseButton::Left) {
                 match app_mode {
                     AppMode::PointPick => {
-                        if let Some((p, _vpos)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
-                            picked_copc_point = Some(p.clone());
+                        let mut best_dist = f32::MAX;
+                        for cs in &copc_stages {
+                            if let Some((p, _vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
+                                if dist < best_dist { best_dist = dist; picked_copc_point = Some(p.clone()); }
+                            }
                         }
                     }
                     AppMode::SectionPickStart => {
@@ -1416,9 +1454,21 @@ async fn main() {
                     AppMode::SectionAdjustDepth => {
                         if let (Some(start), Some(end)) = (section_start, section_end) {
                             let gl = unsafe { get_internal_gl() };
-                            let sec = cs.extract_section(
-                                &mut *gl.quad_context, start, end, section_depth, color_mode,
-                            );
+                            // Combine verts from all COPC stages into one SectionData.
+                            let mut all_verts = Vec::new();
+                            let (mut h_min, mut h_max) = (f32::MAX, f32::MIN);
+                            let mut length = 0.0_f32;
+                            let height_range = copc_stages[0].height_range();
+                            for cs in &copc_stages {
+                                let (verts, len, hmin, hmax) = cs.extract_section_verts(start, end, section_depth, color_mode);
+                                all_verts.extend(verts);
+                                h_min = h_min.min(hmin); h_max = h_max.max(hmax);
+                                length = length.max(len);
+                            }
+                            let h_min = if h_min == f32::MAX { 0.0 } else { h_min };
+                            let h_max = if h_max == f32::MIN { 0.0 } else { h_max };
+                            println!("COPC Section: {:.1}m long, {} points", length, all_verts.len());
+                            let sec = make_section_data(&mut *gl.quad_context, all_verts, length, h_min, h_max, height_range);
                             section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
                             section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
                             section_data = Some(sec);
@@ -1426,15 +1476,19 @@ async fn main() {
                         }
                     }
                     AppMode::MeasureFirst => {
-                        if let Some((_p, vpos)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
-                            measure_a = Some(vpos);
-                            measure_b = None;
-                            app_mode = AppMode::MeasureSecond;
+                        let mut best_dist = f32::MAX;
+                        for cs in &copc_stages {
+                            if let Some((_p, vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
+                                if dist < best_dist { best_dist = dist; measure_a = Some(vpos); measure_b = None; app_mode = AppMode::MeasureSecond; }
+                            }
                         }
                     }
                     AppMode::MeasureSecond => {
-                        if let Some((_p, vpos)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
-                            measure_b = Some(vpos);
+                        let mut best_dist = f32::MAX;
+                        for cs in &copc_stages {
+                            if let Some((_p, vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
+                                if dist < best_dist { best_dist = dist; measure_b = Some(vpos); }
+                            }
                         }
                     }
                     AppMode::View3D => {
@@ -1446,7 +1500,9 @@ async fn main() {
 
             if color_mode != prev_color_mode {
                 let gl = unsafe { get_internal_gl() };
-                cs.rebuild_colors(&mut *gl.quad_context, color_mode);
+                for cs in copc_stages.iter_mut() {
+                    cs.rebuild_colors(&mut *gl.quad_context, color_mode);
+                }
             }
         }
 
