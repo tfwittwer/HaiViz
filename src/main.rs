@@ -385,6 +385,16 @@ fn egui_to_mq(c: egui_macroquad::egui::Color32) -> Color {
     Color::new(c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, c.a() as f32 / 255.0)
 }
 
+fn rgb_arr_to_egui(c: [f32; 3]) -> egui_macroquad::egui::Color32 {
+    egui_macroquad::egui::Color32::from_rgb(
+        (c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8,
+    )
+}
+
+fn egui_to_rgb_arr(c: egui_macroquad::egui::Color32) -> [f32; 3] {
+    [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0]
+}
+
 fn gen_icon() -> miniquad::conf::Icon {
     let mut seed: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -502,6 +512,12 @@ async fn main() {
         height_range = s.height_range();
         stage = Some(s);
     }
+
+    let mut tile_rgb_overrides: Vec<Option<[f32; 3]>> = if let Some(ref mgr) = tile_mgr {
+        vec![None; mgr.tiles.len()]
+    } else {
+        Vec::new()
+    };
 
     let world_up = vec3(0.0, 0.0, 1.0);
     let mut yaw: f32 = std::f32::consts::FRAC_PI_4;       // 45°
@@ -1020,6 +1036,8 @@ async fn main() {
 
             // egui UI
             let prev_color_mode = color_mode;
+            let single_override_before = stage.as_ref().and_then(|s| s.rgb_override);
+            let mut new_single_override = single_override_before;
             let mut egui_wants_pointer = false;
             let mut do_zoom_all = false;
             egui_macroquad::ui(|egui_ctx| {
@@ -1109,6 +1127,21 @@ async fn main() {
                                 ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
                             }
                         });
+                        if color_mode == ColorMode::Rgb {
+                            ui.horizontal(|ui| {
+                                ui.label("Override color:");
+                                let mut enabled = new_single_override.is_some();
+                                if ui.checkbox(&mut enabled, "").changed() {
+                                    new_single_override = if enabled { Some([1.0, 1.0, 1.0]) } else { None };
+                                }
+                                if let Some(ref mut ov) = new_single_override {
+                                    let mut c32 = rgb_arr_to_egui(*ov);
+                                    if ui.color_edit_button_srgba(&mut c32).changed() {
+                                        *ov = egui_to_rgb_arr(c32);
+                                    }
+                                }
+                            });
+                        }
                         ui.label(format!(
                             "{}/{} points | {} chunks | FPS: {:.0} | zoom: {:.1}",
                             drawn, stg.total_points, stg.chunks.len(),
@@ -1222,6 +1255,13 @@ async fn main() {
                     stg.rebuild_colors(&mut *gl.quad_context, color_mode);
 
             }
+            if new_single_override != single_override_before &&
+                let Some(ref mut stg) = stage {
+                    stg.rgb_override = new_single_override;
+                    let gl = unsafe { get_internal_gl() };
+                    stg.rebuild_colors(&mut *gl.quad_context, color_mode);
+
+            }
         }
 
         // ---- COPC mode rendering ----
@@ -1234,6 +1274,8 @@ async fn main() {
                     cs.update_view(&mut *gl.quad_context, &view_proj, ortho_scale, screen_height(), color_mode);
                 }
             }
+            let copc_overrides_before: Vec<Option<[f32; 3]>> = copc_stages.iter().map(|cs| cs.rgb_override).collect();
+            let mut new_copc_overrides = copc_overrides_before.clone();
 
             // Section corridor preview in 3D.
             match app_mode {
@@ -1367,6 +1409,28 @@ async fn main() {
                                 ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
                             }
                         });
+                        if color_mode == ColorMode::Rgb {
+                            for (i, ov) in new_copc_overrides.iter_mut().enumerate() {
+                                let label = if copc_stages.len() > 1 {
+                                    format!("Cloud {} override:", i + 1)
+                                } else {
+                                    "Override color:".to_string()
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(&label);
+                                    let mut enabled = ov.is_some();
+                                    if ui.checkbox(&mut enabled, "").changed() {
+                                        *ov = if enabled { Some([1.0, 1.0, 1.0]) } else { None };
+                                    }
+                                    if let Some(c) = ov {
+                                        let mut c32 = rgb_arr_to_egui(*c);
+                                        if ui.color_edit_button_srgba(&mut c32).changed() {
+                                            *c = egui_to_rgb_arr(c32);
+                                        }
+                                    }
+                                });
+                            }
+                        }
                         let mpp = ortho_scale * 2.0 / screen_height().max(1.0);
                         let spacing0 = copc_stages[0].spacing;
                         let target_depth = if mpp > 0.0 && spacing0 > 0.0 {
@@ -1504,6 +1568,15 @@ async fn main() {
                     cs.rebuild_colors(&mut *gl.quad_context, color_mode);
                 }
             }
+            if new_copc_overrides != copc_overrides_before {
+                let gl = unsafe { get_internal_gl() };
+                for (i, new_ov) in new_copc_overrides.into_iter().enumerate() {
+                    if new_ov != copc_overrides_before[i] {
+                        copc_stages[i].rgb_override = new_ov;
+                        copc_stages[i].rebuild_colors(&mut *gl.quad_context, color_mode);
+                    }
+                }
+            }
         }
 
         // ---- Tile mode rendering ----
@@ -1612,6 +1685,7 @@ async fn main() {
             let mut request_unload: Option<usize> = None;
             let mut do_zoom_all = false;
             let mut do_zoom_selected = false;
+            let mut tile_override_changed: Option<usize> = None;
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_pointer = egui_ctx.is_pointer_over_area();
                 egui_macroquad::egui::Window::new("Controls")
@@ -1751,6 +1825,23 @@ async fn main() {
                             }
                             if let Some(ref lt) = mgr.loaded[sel] {
                                 ui.label(format!("  {} points loaded", lt.total_points));
+                                if color_mode == ColorMode::Rgb {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Override color:");
+                                        let mut enabled = tile_rgb_overrides[sel].is_some();
+                                        if ui.checkbox(&mut enabled, "").changed() {
+                                            tile_rgb_overrides[sel] = if enabled { Some([1.0, 1.0, 1.0]) } else { None };
+                                            tile_override_changed = Some(sel);
+                                        }
+                                        if let Some(ref mut c) = tile_rgb_overrides[sel] {
+                                            let mut c32 = rgb_arr_to_egui(*c);
+                                            if ui.color_edit_button_srgba(&mut c32).changed() {
+                                                *c = egui_to_rgb_arr(c32);
+                                                tile_override_changed = Some(sel);
+                                            }
+                                        }
+                                    });
+                                }
                             }
                         }
 
@@ -1861,7 +1952,7 @@ async fn main() {
             if let Some(idx) = request_load &&
                 let Some(ref mut mgr) = tile_mgr {
                     let gl = unsafe { get_internal_gl() };
-                    mgr.load_tile(&mut *gl.quad_context, idx, color_mode);
+                    mgr.load_tile(&mut *gl.quad_context, idx, color_mode, tile_rgb_overrides[idx]);
                 
             }
             if let Some(idx) = request_unload &&
@@ -1875,7 +1966,16 @@ async fn main() {
                 let Some(ref mut mgr) = tile_mgr {
                     let gl = unsafe { get_internal_gl() };
                     mgr.rebuild_colors(&mut *gl.quad_context, color_mode);
-                
+
+            }
+            if let Some(idx) = tile_override_changed &&
+                let Some(ref mut mgr) = tile_mgr {
+                    if let Some(ref mut loaded) = mgr.loaded[idx] {
+                        loaded.rgb_override = tile_rgb_overrides[idx];
+                    }
+                    let gl = unsafe { get_internal_gl() };
+                    mgr.rebuild_tile_colors(&mut *gl.quad_context, idx, color_mode);
+
             }
         }
 

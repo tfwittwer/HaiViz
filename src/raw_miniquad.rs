@@ -114,12 +114,14 @@
         pub cloud: VizPointcloud,
         pub positions: Vec<[f32; 3]>,
         pub class_defs: Option<ClassDefs>,
+        pub rgb_override: Option<[f32; 3]>,
     }
 
     fn color_for_point(
         point: &Point, pos_z: f32, height_range: f32,
         intensity_min: u16, intensity_range: f32,
         mode: ColorMode, class_defs: &Option<ClassDefs>,
+        override_rgb: Option<[f32; 3]>,
     ) -> [f32; 3] {
         match mode {
             ColorMode::Height => {
@@ -151,6 +153,9 @@
                 classification_color(class_id)
             }
             ColorMode::Rgb => {
+                if let Some(c) = override_rgb {
+                    return c;
+                }
                 if let Some(color) = &point.color {
                     let r = color.red as f32 / 65535.0;
                     let g = color.green as f32 / 65535.0;
@@ -354,7 +359,7 @@
                 .enumerate()
                 .map(|(i, p)| Vertex {
                     pos: positions[i],
-                    color: color_for_point(p, positions[i][2], height_range, cloud.intensity_min, intensity_range, color_mode, &class_defs),
+                    color: color_for_point(p, positions[i][2], height_range, cloud.intensity_min, intensity_range, color_mode, &class_defs, None),
                 })
                 .collect();
 
@@ -372,6 +377,7 @@
                 cloud,
                 positions,
                 class_defs,
+                rgb_override: None,
             }
         }
 
@@ -419,7 +425,7 @@
                         let p = &self.cloud.points[i];
                         Vertex {
                             pos: self.positions[i],
-                            color: color_for_point(p, self.positions[i][2], height_range, self.cloud.intensity_min, intensity_range, color_mode, &self.class_defs),
+                            color: color_for_point(p, self.positions[i][2], height_range, self.cloud.intensity_min, intensity_range, color_mode, &self.class_defs, self.rgb_override),
                         }
                     })
                     .collect();
@@ -464,7 +470,7 @@
                     h_max = h_max.max(pos[2]);
                     section_verts.push(Vertex {
                         pos: [along, pos[2], 0.0],
-                        color: color_for_point(p, pos[2], height_range, self.cloud.intensity_min, intensity_range, color_mode, &self.class_defs),
+                        color: color_for_point(p, pos[2], height_range, self.cloud.intensity_min, intensity_range, color_mode, &self.class_defs, self.rgb_override),
                     });
                 }
             }
@@ -543,6 +549,7 @@
         pub positions: Vec<[f32; 3]>,
         chunks: Vec<Chunk>,
         pub total_points: i32,
+        pub rgb_override: Option<[f32; 3]>,
     }
 
     pub struct TileStageManager {
@@ -705,7 +712,7 @@
             None
         }
 
-        pub fn load_tile(&mut self, ctx: &mut dyn RenderingBackend, index: usize, color_mode: ColorMode) {
+        pub fn load_tile(&mut self, ctx: &mut dyn RenderingBackend, index: usize, color_mode: ColorMode, override_rgb: Option<[f32; 3]>) {
             if self.loaded[index].is_some() { return; }
 
             let cloud = VizPointcloud::load(&self.tiles[index].filepath);
@@ -720,7 +727,7 @@
 
             let vertices: Vec<Vertex> = cloud.points.iter().enumerate().map(|(i, p)| Vertex {
                 pos: positions[i],
-                color: color_for_point(p, positions[i][2], height_range, cloud.intensity_min, intensity_range, color_mode, &self.class_defs),
+                color: color_for_point(p, positions[i][2], height_range, cloud.intensity_min, intensity_range, color_mode, &self.class_defs, override_rgb),
             }).collect();
 
             let total_points = vertices.len() as i32;
@@ -734,6 +741,7 @@
                 positions,
                 chunks,
                 total_points,
+                rgb_override: override_rgb,
             });
         }
 
@@ -773,14 +781,35 @@
 
         pub fn rebuild_colors(&mut self, ctx: &mut dyn RenderingBackend, color_mode: ColorMode) {
             let height_range = self.height_range();
+            let class_defs = self.class_defs.clone();
             for loaded in self.loaded.iter_mut().flatten() {
                 let intensity_range = (loaded.cloud.intensity_max - loaded.cloud.intensity_min) as f32;
+                let override_rgb = loaded.rgb_override;
                 for chunk in &mut loaded.chunks {
                     let chunk_verts: Vec<Vertex> = chunk.point_indices.iter().map(|&i| {
                         let p = &loaded.cloud.points[i];
                         Vertex {
                             pos: loaded.positions[i],
-                            color: color_for_point(p, loaded.positions[i][2], height_range, loaded.cloud.intensity_min, intensity_range, color_mode, &self.class_defs),
+                            color: color_for_point(p, loaded.positions[i][2], height_range, loaded.cloud.intensity_min, intensity_range, color_mode, &class_defs, override_rgb),
+                        }
+                    }).collect();
+                    ctx.buffer_update(chunk.bindings.vertex_buffers[0], BufferSource::slice(&chunk_verts));
+                }
+            }
+        }
+
+        pub fn rebuild_tile_colors(&mut self, ctx: &mut dyn RenderingBackend, index: usize, color_mode: ColorMode) {
+            let height_range = self.height_range();
+            let class_defs = self.class_defs.clone();
+            if let Some(ref mut loaded) = self.loaded[index] {
+                let intensity_range = (loaded.cloud.intensity_max - loaded.cloud.intensity_min) as f32;
+                let override_rgb = loaded.rgb_override;
+                for chunk in &mut loaded.chunks {
+                    let chunk_verts: Vec<Vertex> = chunk.point_indices.iter().map(|&i| {
+                        let p = &loaded.cloud.points[i];
+                        Vertex {
+                            pos: loaded.positions[i],
+                            color: color_for_point(p, loaded.positions[i][2], height_range, loaded.cloud.intensity_min, intensity_range, color_mode, &class_defs, override_rgb),
                         }
                     }).collect();
                     ctx.buffer_update(chunk.bindings.vertex_buffers[0], BufferSource::slice(&chunk_verts));
@@ -859,7 +888,7 @@
                         h_max = h_max.max(pos[2]);
                         section_verts.push(Vertex {
                             pos: [along, pos[2], 0.0],
-                            color: color_for_point(p, pos[2], height_range, loaded.cloud.intensity_min, intensity_range, color_mode, &self.class_defs),
+                            color: color_for_point(p, pos[2], height_range, loaded.cloud.intensity_min, intensity_range, color_mode, &self.class_defs, loaded.rgb_override),
                         });
                     }
                 }
@@ -1133,6 +1162,7 @@
         pub intensity_min: u16,
         pub intensity_max: u16,
         pub class_defs: Option<ClassDefs>,
+        pub rgb_override: Option<[f32; 3]>,
         /// Nodes dispatched to the loader thread but not yet ingested.
         in_flight: HashSet<VoxelKey>,
         /// Send requests to the background loader thread.
@@ -1268,6 +1298,7 @@
                 intensity_min: u16::MAX,
                 intensity_max: 0,
                 class_defs,
+                rgb_override: None,
                 in_flight: HashSet::new(),
                 load_tx,
                 result_rx,
@@ -1337,7 +1368,7 @@
                 color: color_for_point(
                     p, positions[i][2], height_range,
                     self.intensity_min, intensity_range,
-                    color_mode, &self.class_defs,
+                    color_mode, &self.class_defs, self.rgb_override,
                 ),
             }).collect();
 
@@ -1545,7 +1576,7 @@
                         color: color_for_point(
                             &node.points[i], node.positions[i][2], height_range,
                             self.intensity_min, intensity_range,
-                            color_mode, &self.class_defs,
+                            color_mode, &self.class_defs, self.rgb_override,
                         ),
                     }).collect();
                     ctx.buffer_update(chunk.bindings.vertex_buffers[0], BufferSource::slice(&verts));
@@ -1593,7 +1624,7 @@
                             color: color_for_point(
                                 &node.points[i], pos[2], height_range,
                                 self.intensity_min, intensity_range,
-                                color_mode, &self.class_defs,
+                                color_mode, &self.class_defs, self.rgb_override,
                             ),
                         });
                     }
