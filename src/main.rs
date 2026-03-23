@@ -232,6 +232,23 @@ enum AppMode {
     SectionMeasureSecond,
 }
 
+impl AppMode {
+    fn label(&self) -> &'static str {
+        match self {
+            AppMode::View3D => "View3D",
+            AppMode::PointPick => "PointPick",
+            AppMode::SectionPickStart => "SectionPickStart",
+            AppMode::SectionPickEnd => "SectionPickEnd",
+            AppMode::SectionAdjustDepth => "SectionAdjustDepth",
+            AppMode::SectionView => "SectionView",
+            AppMode::MeasureFirst => "MeasureFirst",
+            AppMode::MeasureSecond => "MeasureSecond",
+            AppMode::SectionMeasureFirst => "SectionMeasureFirst",
+            AppMode::SectionMeasureSecond => "SectionMeasureSecond",
+        }
+    }
+}
+
 /// Unproject screen coordinates to world XY plane at given Z height.
 fn screen_to_world_xy(sx: f32, sy: f32, view_proj: &glam::Mat4, z_plane: f32) -> Option<(f32, f32)> {
     let inv = view_proj.inverse();
@@ -268,6 +285,7 @@ fn draw_section_corridor(
     depth: f32,
     height_range: f32,
 ) {
+    //println!("{} {} {} {}",start.0,start.1,end.0,end.1);
     let dx = end.0 - start.0;
     let dy = end.1 - start.1;
     let len = (dx * dx + dy * dy).sqrt();
@@ -465,7 +483,7 @@ async fn main() {
     let height_range;
 
     if is_tile_mode {
-        let mgr = {
+        let mut mgr = {
             let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
             TileStageManager::new(ctx, input_path, class_defs.clone())
         };
@@ -485,9 +503,11 @@ async fn main() {
                     unified_min[2] = unified_min[2].min(b.min.z);
                     unified_max[0] = unified_max[0].max(b.max.x);
                     unified_max[1] = unified_max[1].max(b.max.y);
-                    unified_max[2] = unified_max[2].max(b.max.z);
+                    unified_max[2] = unified_max[2].max(b.max.z);                    
                 }
             }
+            mgr.global_max = unified_max;
+            mgr.global_min = unified_min;
             let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
             for path in &copc_paths {
                 let cs = CopcStage::new(ctx, path, Some(unified_min), color_mode, class_defs.clone());
@@ -560,9 +580,11 @@ async fn main() {
     let mut position = data_center - front * (data_extent_x.max(data_extent_y) * 2.0);
     let mut last_mouse_position: Vec2 = mouse_position().into();
 
+    let mut orbit_pivot = data_center;
     let mut grabbed = false;
     set_cursor_grab(grabbed);
     show_mouse(!grabbed);
+    let mut pivot_locked = false;
 
     let aspect = screen_width() / screen_height().max(1.0);
     let mut ortho_scale: f32 = (data_extent_y * 0.5).max(data_extent_x * 0.5 / aspect) * 1.05;
@@ -615,6 +637,7 @@ async fn main() {
     };
 
     loop {
+        //println!("{}",app_mode.label());
         let delta = get_frame_time();
 
         if is_key_pressed(KeyCode::Escape) {
@@ -645,7 +668,7 @@ async fn main() {
             let sec_mouse_pos: Vec2 = mouse_position().into();
             let sec_mouse_delta = sec_mouse_pos - last_mouse_position;
             last_mouse_position = sec_mouse_pos;
-            if is_mouse_button_down(MouseButton::Middle) {
+            if is_mouse_button_down(MouseButton::Right) {
                 let units_per_pixel = section_zoom * 2.0 / screen_height();
                 section_pan.x -= sec_mouse_delta.x * units_per_pixel;
                 section_pan.y += sec_mouse_delta.y * units_per_pixel;
@@ -910,15 +933,31 @@ async fn main() {
         let mid_z = height_range * 0.5;
 
         // Orbit pivot: screen-center ray intersected with mid_z plane
-        let orbit_pivot = if front.z.abs() > 0.01 {
+        /*let orbit_pivot = if front.z.abs() > 0.01 {
+            //println!("orbit {} {}",position + front * ((mid_z - position.z) / front.z),mid_z);
             position + front * ((mid_z - position.z) / front.z)
         } else {
+            //println!("data_center {}",data_center);
             data_center
-        };
+        };*/
+        if !pivot_locked {
+            orbit_pivot = position + front * ((mid_z - position.z) / front.z);
+            //println!("not locked");
+        }
+        
+        let mode_uses_click = matches!(app_mode,
+            AppMode::SectionPickStart | AppMode::SectionPickEnd |
+            AppMode::SectionAdjustDepth |
+            AppMode::PointPick | AppMode::MeasureFirst | AppMode::MeasureSecond
+        );
+        pivot_locked = false;
 
-        if grabbed || is_mouse_button_down(MouseButton::Right) {
+        if (grabbed || is_mouse_button_down(MouseButton::Left)) && !mode_uses_click {
+
+            pivot_locked = true;
+
             let old_front = front;
-            yaw += mouse_delta.x * delta * LOOK_SPEED;
+            yaw += mouse_delta.x * delta * -LOOK_SPEED;
             pitch += mouse_delta.y * delta * -LOOK_SPEED;
             pitch = pitch.clamp(-1.5, 1.5);
 
@@ -929,14 +968,19 @@ async fn main() {
             )
             .normalize();
 
-            right = front.cross(world_up).normalize();
-            up = right.cross(front).normalize();
 
             // Orbit: keep pivot at screen center after rotation
             position = orbit_pivot + front * (position - orbit_pivot).dot(old_front);
+
+            //front = (orbit_pivot-position).normalize();
+            right = front.cross(world_up).normalize();
+            up = right.cross(front).normalize();
+            
+            //println!("{}",front);
+            
         }
 
-        if is_mouse_button_down(MouseButton::Middle) {
+        if is_mouse_button_down(MouseButton::Right) {
             let units_per_pixel = ortho_scale * 2.0 / screen_height();
             position -= right * mouse_delta.x * units_per_pixel;
             position += up * mouse_delta.y * units_per_pixel;
@@ -947,7 +991,7 @@ async fn main() {
         let camera = Camera3D {
             position,
             up,
-            target: position + front,
+            target: orbit_pivot,
             projection: Projection::Orthographics,
             fovy: ortho_scale * 2.0,
             z_far: 100000.0,
@@ -1270,8 +1314,10 @@ async fn main() {
             {
                 let mut gl = unsafe { get_internal_gl() };
                 gl.flush();
+                let mut loaded_so_far: i32 = 0;
                 for cs in copc_stages.iter_mut() {
-                    cs.update_view(&mut *gl.quad_context, &view_proj, ortho_scale, screen_height(), color_mode);
+                    cs.update_view(&mut *gl.quad_context, &view_proj, ortho_scale, screen_height(), color_mode, loaded_so_far);
+                    loaded_so_far += cs.total_loaded_points();
                 }
             }
             let copc_overrides_before: Vec<Option<[f32; 3]>> = copc_stages.iter().map(|cs| cs.rgb_override).collect();
@@ -1580,7 +1626,8 @@ async fn main() {
         }
 
         // ---- Tile mode rendering ----
-        if let Some(ref mgr) = tile_mgr {
+        if copc_stages.is_empty() && let Some(ref mgr) = tile_mgr {
+            //println!("tile mode");
             // Section preview (in 3D)
             match app_mode {
                 AppMode::SectionPickEnd => {

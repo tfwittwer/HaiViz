@@ -661,9 +661,11 @@
             let n = tiles.len();
             let loaded = (0..n).map(|_| None).collect();
 
+            if n > 0 {
             println!("{} tiles, bounds: x {:.1}..{:.1}  y {:.1}..{:.1}  z {:.1}..{:.1}",
                 n, global_min[0], global_max[0], global_min[1], global_max[1], global_min[2], global_max[2]);
-
+            }
+            
             let pipeline = create_pipeline(ctx);
 
             TileStageManager {
@@ -1379,6 +1381,8 @@
         }
 
         /// Called every frame. Drains completed results, then dispatches new requests.
+        /// `already_loaded` is the total point count already loaded by all other stages
+        /// that share the same global point budget.
         pub fn update_view(
             &mut self,
             ctx: &mut dyn RenderingBackend,
@@ -1386,7 +1390,9 @@
             ortho_scale: f32,
             screen_h: f32,
             color_mode: ColorMode,
+            already_loaded: i32,
         ) {
+            const GLOBAL_POINT_BUDGET: i32 = 20_000_000;
             // Detect view changes: cancel all queued loads and bump the generation so
             // any results that were already in-flight get discarded when they arrive.
             if *view_proj != self.prev_view_proj {
@@ -1409,9 +1415,9 @@
                 if !self.loaded_nodes.contains_key(&result.key) {
                     let n = result.points.len();
                     self.ingest_node(ctx, result.key, result.points, color_mode);
-                    println!("COPC ingested ({},{},{},{}) — {} pts, {} in-flight",
-                        result.key.l, result.key.x, result.key.y, result.key.z,
-                        n, self.in_flight.len());
+                    // println!("COPC ingested ({},{},{},{}) — {} pts, {} in-flight",
+                    //     result.key.l, result.key.x, result.key.y, result.key.z,
+                    //     n, self.in_flight.len());
                 }
             }
 
@@ -1461,9 +1467,11 @@
             // Only dispatch once the view has settled (no changes for SETTLE_MS).
             // Sort by NDC distance from screen centre so the most visible nodes load first.
             // Cap the queue depth so we never flood the channel on a sudden zoom-in.
+            // Also respect the global point budget shared across all COPC stages.
             const MAX_IN_FLIGHT: usize = 4;
             let budget = MAX_IN_FLIGHT.saturating_sub(self.in_flight.len());
-            if view_settled && budget > 0 {
+            let points_remaining = GLOBAL_POINT_BUDGET - already_loaded - self.total_loaded_points();
+            if view_settled && budget > 0 && points_remaining > 0 {
                 // Build a lookup from key → entry for centre-distance sorting.
                 let entry_map: HashMap<VoxelKey, &CopcEntry> =
                     self.entries.iter().map(|e| (e.key, e)).collect();
