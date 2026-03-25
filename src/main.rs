@@ -1,8 +1,8 @@
 use std::env;
 use std::path::Path;
 //use rfd;
-
-use console::style;
+use log::{info,error};
+//use console::style;
 use crate::glam::vec3;
 
 use macroquad::prelude::*;
@@ -232,7 +232,7 @@ enum AppMode {
     SectionMeasureSecond,
 }
 
-impl AppMode {
+/*impl AppMode {
     fn label(&self) -> &'static str {
         match self {
             AppMode::View3D => "View3D",
@@ -247,7 +247,7 @@ impl AppMode {
             AppMode::SectionMeasureSecond => "SectionMeasureSecond",
         }
     }
-}
+}*/
 
 /// Unproject screen coordinates to world XY plane at given Z height.
 fn screen_to_world_xy(sx: f32, sy: f32, view_proj: &glam::Mat4, z_plane: f32) -> Option<(f32, f32)> {
@@ -309,6 +309,7 @@ fn draw_section_corridor(
 
     let col = YELLOW;
     for i in 0..4 {
+        //println!("{} {}",b[i],t[i]);
         draw_line_3d(b[i], b[(i + 1) % 4], col);
     }
     for i in 0..4 {
@@ -449,9 +450,11 @@ fn conf() -> Conf {
 
 #[macroquad::main(conf)]
 async fn main() {
-    println!(" *** HaiViz {} ***",env!("CARGO_PKG_VERSION"));
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    info!(" *** HaiViz {} ***",env!("CARGO_PKG_VERSION"));
     if env::args().count() != 2 {
-        println!("{}", style("Usage: haiviz <pointcloud.laz | directory>").red());
+        error!("Usage: haiviz <pointcloud.laz | directory>");
         return;
     }
     let args: Vec<String> = env::args().collect();
@@ -462,11 +465,11 @@ async fn main() {
             .map(|r| r.header().copc_info_vlr().is_some())
             .unwrap_or(false)
     };
-    if is_copc { println!("Detected COPC format"); }
+    if is_copc { info!("Detected COPC format"); }
 
     let class_defs = load_class_defs();
     if let Some(ref cd) = class_defs {
-        println!("Custom classes: {:?}", cd.keys().collect::<Vec<_>>());
+        info!("Custom classes: {:?}", cd.keys().collect::<Vec<_>>());
     }
 
     let mut color_mode = ColorMode::Height;
@@ -491,7 +494,7 @@ async fn main() {
         // Also load any COPC files in the same directory.
         let copc_paths = scan_dir_for_copc(input_path);
         if !copc_paths.is_empty() {
-            println!("Found {} COPC file(s) in directory", copc_paths.len());
+            info!("Found {} COPC file(s) in directory", copc_paths.len());
             // Compute a unified viewer origin: min of tile bounds and all COPC file bounds.
             let mut unified_min = mgr.global_min;
             let mut unified_max = mgr.global_max;
@@ -1332,6 +1335,8 @@ async fn main() {
                 }
                 AppMode::SectionAdjustDepth => {
                     if let (Some(start), Some(end)) = (section_start, section_end) {
+                        //println!("here!");
+                        //set_camera(&camera);
                         draw_section_corridor(start, end, section_depth, height_range);
                     }
                 }
@@ -1544,8 +1549,8 @@ async fn main() {
                     AppMode::PointPick => {
                         let mut best_dist = f32::MAX;
                         for cs in &copc_stages {
-                            if let Some((p, _vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
-                                if dist < best_dist { best_dist = dist; picked_copc_point = Some(p.clone()); }
+                            if let Some((p, _vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) 
+                                && dist < best_dist { best_dist = dist; picked_copc_point = Some(p.clone()); 
                             }
                         }
                     }
@@ -1577,7 +1582,7 @@ async fn main() {
                             }
                             let h_min = if h_min == f32::MAX { 0.0 } else { h_min };
                             let h_max = if h_max == f32::MIN { 0.0 } else { h_max };
-                            println!("COPC Section: {:.1}m long, {} points", length, all_verts.len());
+                            info!("COPC Section: {:.1}m long, {} points", length, all_verts.len());
                             let sec = make_section_data(&mut *gl.quad_context, all_verts, length, h_min, h_max, height_range);
                             section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
                             section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
@@ -1588,16 +1593,16 @@ async fn main() {
                     AppMode::MeasureFirst => {
                         let mut best_dist = f32::MAX;
                         for cs in &copc_stages {
-                            if let Some((_p, vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
-                                if dist < best_dist { best_dist = dist; measure_a = Some(vpos); measure_b = None; app_mode = AppMode::MeasureSecond; }
+                            if let Some((_p, vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) 
+                                && dist < best_dist { best_dist = dist; measure_a = Some(vpos); measure_b = None; app_mode = AppMode::MeasureSecond; 
                             }
                         }
                     }
                     AppMode::MeasureSecond => {
                         let mut best_dist = f32::MAX;
                         for cs in &copc_stages {
-                            if let Some((_p, vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
-                                if dist < best_dist { best_dist = dist; measure_b = Some(vpos); }
+                            if let Some((_p, vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) 
+                                && dist < best_dist { best_dist = dist; measure_b = Some(vpos); 
                             }
                         }
                     }
@@ -1641,6 +1646,8 @@ async fn main() {
                 }
                 AppMode::SectionAdjustDepth => {
                     if let (Some(start), Some(end)) = (section_start, section_end) {
+                        //println!("here!");
+                        //set_camera(&camera);
                         draw_section_corridor(start, end, section_depth, height_range);
                     }
                 }

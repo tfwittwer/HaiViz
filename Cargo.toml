@@ -6,8 +6,10 @@ edition = "2024"
 [dependencies]
 macroquad = "0.4"
 egui-macroquad = "0.17"
-las = { version = "0.9.9", features = ["laz-parallel"] }
-console = "0.16"
+las = { version = "0.9", features = ["laz-parallel"] }
+#console = "0.16"
 miniquad = "0.4"
 glam = { version="0.27" }
 rfd = "0.15"
+env_logger = "0.11"
+log = "0.4"

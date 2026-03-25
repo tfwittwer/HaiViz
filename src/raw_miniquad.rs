@@ -3,6 +3,8 @@
     use std::fs::File;
     use std::io::BufReader;
     use std::path::Path;
+    use ::log::{info,error};
+
 
     use las::{Point, Reader};
     use las::copc::{CopcEntryReader, VoxelKey};
@@ -38,7 +40,7 @@
             }
         }
         if defs.is_empty() { None } else {
-            println!("Loaded {} class definitions from classes.txt", defs.len());
+            info!("Loaded {} class definitions from classes.txt", defs.len());
             Some(defs)
         }
     }
@@ -76,8 +78,8 @@
                 intensity_max = intensity_max.max(point.intensity);
             }
 
-            println!("{} points loaded from {}", points.len(), filename);
-            println!("Intensity range: {}..{}", intensity_min, intensity_max);
+            info!("{} points loaded from {}", points.len(), filename);
+            info!("Intensity range: {}..{}", intensity_min, intensity_max);
             VizPointcloud { points, min, max, intensity_min, intensity_max }
         }
     }
@@ -367,7 +369,7 @@
             let total_points = vertices.len() as i32;
             let chunks = build_chunks(ctx, &positions, &vertices);
 
-            println!("{} points in {} chunks ({}m cells), height range: {:.1}m",
+            info!("{} points in {} chunks ({}m cells), height range: {:.1}m",
                 total_points, chunks.len(), CHUNK_SIZE, height_range);
 
             Stage {
@@ -476,7 +478,7 @@
             }
 
             let num_points = section_verts.len() as i32;
-            println!("Section: {:.1}m long, {:.1}m depth, {} points, height {:.1}..{:.1}m",
+            info!("Section: {:.1}m long, {:.1}m depth, {} points, height {:.1}..{:.1}m",
                 len, depth, num_points, h_min, h_max);
 
             let vertex_buffer = ctx.new_buffer(
@@ -606,7 +608,7 @@
     }
 
     fn generate_index(dir_path: &str) {
-        println!("Generating index.txt for {}", dir_path);
+        info!("Generating index.txt for {}", dir_path);
         let mut entries = Vec::new();
         let mut dir_entries: Vec<_> = std::fs::read_dir(dir_path).unwrap()
             .filter_map(|e| e.ok())
@@ -633,7 +635,7 @@
         }
         let index_path = Path::new(dir_path).join("index.txt");
         std::fs::write(&index_path, entries.join("\n")).unwrap();
-        println!("Wrote {} tile entries to index.txt", entries.len());
+        info!("Wrote {} tile entries to index.txt", entries.len());
     }
 
     impl TileStageManager {
@@ -662,7 +664,7 @@
             let loaded = (0..n).map(|_| None).collect();
 
             if n > 0 {
-            println!("{} tiles, bounds: x {:.1}..{:.1}  y {:.1}..{:.1}  z {:.1}..{:.1}",
+            info!("{} tiles, bounds: x {:.1}..{:.1}  y {:.1}..{:.1}  z {:.1}..{:.1}",
                 n, global_min[0], global_max[0], global_min[1], global_max[1], global_min[2], global_max[2]);
             }
             
@@ -735,7 +737,7 @@
             let total_points = vertices.len() as i32;
             let chunks = build_chunks(ctx, &positions, &vertices);
 
-            println!("Tile {} loaded: {} points, {} chunks",
+            info!("Tile {} loaded: {} points, {} chunks",
                 self.tiles[index].filename, total_points, chunks.len());
 
             self.loaded[index] = Some(LoadedTile {
@@ -753,7 +755,7 @@
                     ctx.delete_buffer(chunk.bindings.vertex_buffers[0]);
                     ctx.delete_buffer(chunk.bindings.index_buffer);
                 }
-                println!("Tile {} unloaded", self.tiles[index].filename);
+                info!("Tile {} unloaded", self.tiles[index].filename);
             }
         }
 
@@ -897,7 +899,7 @@
             }
 
             let num_points = section_verts.len() as i32;
-            println!("Section: {:.1}m long, {:.1}m depth, {} points, height {:.1}..{:.1}m",
+            info!("Section: {:.1}m long, {:.1}m depth, {} points, height {:.1}..{:.1}m",
                 len, depth, num_points, h_min, h_max);
 
             let vertex_buffer = ctx.new_buffer(
@@ -1206,11 +1208,11 @@
                 for req in rx {
                     let file = match File::open(&filepath) {
                         Ok(f) => BufReader::new(f),
-                        Err(e) => { eprintln!("COPC loader: open error: {}", e); continue; }
+                        Err(e) => { error!("COPC loader: open error: {}", e); continue; }
                     };
                     let mut reader = match CopcEntryReader::new(file) {
                         Ok(r) => r,
-                        Err(e) => { eprintln!("COPC loader: reader error: {}", e); continue; }
+                        Err(e) => { error!("COPC loader: reader error: {}", e); continue; }
                     };
                     let las_entry = las::copc::Entry {
                         key: req.key,
@@ -1221,7 +1223,7 @@
                     let mut points = Vec::new();
                     match reader.read_entry_points(&las_entry, &mut points) {
                         Ok(_) => { let _ = tx.send(CopcLoadResult { key: req.key, points, generation: req.generation }); }
-                        Err(e) => eprintln!("COPC loader error for {:?}: {}", req.key, e),
+                        Err(e) => error!("COPC loader error for {:?}: {}", req.key, e),
                     }
                 }
             })
@@ -1274,7 +1276,7 @@
 
             let max_level = entries.iter().map(|e| e.key.l).max().unwrap_or(0);
 
-            println!(
+            info!(
                 "COPC: {} entries (max depth {}), root spacing {:.2}m, \
                  bounds x {:.1}..{:.1}  y {:.1}..{:.1}  z {:.1}..{:.1}",
                 entries.len(), max_level, spacing,
@@ -1413,7 +1415,7 @@
                 if result.generation != self.generation { continue; }
                 // Only ingest if not already loaded (might have been unloaded mid-flight).
                 if !self.loaded_nodes.contains_key(&result.key) {
-                    let n = result.points.len();
+                    //let n = result.points.len();
                     self.ingest_node(ctx, result.key, result.points, color_mode);
                     // println!("COPC ingested ({},{},{},{}) — {} pts, {} in-flight",
                     //     result.key.l, result.key.x, result.key.y, result.key.z,
@@ -1423,12 +1425,11 @@
 
             // Meters per screen pixel determines the required LOD.
             let mpp = (ortho_scale * 2.0 / screen_h.max(1.0)) as f64;
-            let target_depth = if mpp > 0.0 && self.spacing > 0.0 {
-                (self.spacing / mpp).log2().ceil() as i32
-            } else {
-                0
-            }.max(0).min(20);
-
+            let target_depth = (if mpp > 0.0 && self.spacing > 0.0 {
+                 (self.spacing / mpp).log2().ceil() as i32
+             } else {
+                 0
+            }).clamp(0, 20);
             let planes = extract_frustum_planes(view_proj);
 
             let desired: HashSet<VoxelKey> = self.entries.iter()
@@ -1644,7 +1645,7 @@
             (verts, len, h_min, h_max)
         }
 
-        pub fn extract_section(
+        /*pub fn extract_section(
             &self,
             ctx: &mut dyn RenderingBackend,
             start: (f32, f32),
@@ -1653,9 +1654,9 @@
             color_mode: ColorMode,
         ) -> SectionData {
             let (verts, len, h_min, h_max) = self.extract_section_verts(start, end, depth, color_mode);
-            println!("COPC Section: {:.1}m long, {:.1}m depth, {} points", len, depth, verts.len());
+            info!("COPC Section: {:.1}m long, {:.1}m depth, {} points", len, depth, verts.len());
             make_section_data(ctx, verts, len, h_min, h_max, self.height_range())
-        }
+        }*/
 
         pub fn draw_section(
             &self,
