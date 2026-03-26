@@ -78,6 +78,23 @@
                 intensity_max = intensity_max.max(point.intensity);
             }
 
+            // Detect 8-bit colors stored in 16-bit fields (common in older LAS files)
+            // and scale to the full 16-bit range so the 65535 divisor works correctly.
+            let max_color = points.iter()
+                .filter_map(|p| p.color.as_ref())
+                .flat_map(|c| [c.red, c.green, c.blue])
+                .max()
+                .unwrap_or(0);
+            if max_color > 0 && max_color <= 255 {
+                for p in &mut points {
+                    if let Some(ref mut c) = p.color {
+                        c.red = c.red.saturating_mul(257);
+                        c.green = c.green.saturating_mul(257);
+                        c.blue = c.blue.saturating_mul(257);
+                    }
+                }
+            }
+
             info!("{} points loaded from {}", points.len(), filename);
             info!("Intensity range: {}..{}", intensity_min, intensity_max);
             VizPointcloud { points, min, max, intensity_min, intensity_max }

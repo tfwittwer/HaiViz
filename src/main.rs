@@ -301,23 +301,23 @@ fn draw_section_corridor(
         vec3(end.0 + nx,   end.1 + ny,   0.0),
     ];
     let t = [
-        vec3(start.0 + nx, start.1 + ny, height_range),
-        vec3(start.0 - nx, start.1 - ny, height_range),
-        vec3(end.0 - nx,   end.1 - ny,   height_range),
-        vec3(end.0 + nx,   end.1 + ny,   height_range),
+        vec3(start.0 + nx, start.1 + ny, height_range* 0.5),
+        vec3(start.0 - nx, start.1 - ny, height_range* 0.5),
+        vec3(end.0 - nx,   end.1 - ny,   height_range* 0.5),
+        vec3(end.0 + nx,   end.1 + ny,   height_range* 0.5),
     ];
 
     let col = YELLOW;
-    for i in 0..4 {
+    /*for i in 0..4 {
         //println!("{} {}",b[i],t[i]);
         draw_line_3d(b[i], b[(i + 1) % 4], col);
-    }
+    }*/
     for i in 0..4 {
         draw_line_3d(t[i], t[(i + 1) % 4], col);
     }
-    for i in 0..4 {
+    /*for i in 0..4 {
         draw_line_3d(b[i], t[i], col);
-    }
+    }*/
     draw_line_3d(
         vec3(start.0, start.1, height_range * 0.5),
         vec3(end.0, end.1, height_range * 0.5),
@@ -588,6 +588,7 @@ async fn main() {
     set_cursor_grab(grabbed);
     show_mouse(!grabbed);
     let mut pivot_locked = false;
+    let mut egui_wants_pointer_prev = false;
 
     let aspect = screen_width() / screen_height().max(1.0);
     let mut ortho_scale: f32 = (data_extent_y * 0.5).max(data_extent_x * 0.5 / aspect) * 1.05;
@@ -955,7 +956,7 @@ async fn main() {
         );
         pivot_locked = false;
 
-        if (grabbed || is_mouse_button_down(MouseButton::Left)) && !mode_uses_click {
+        if (grabbed || is_mouse_button_down(MouseButton::Left)) && !mode_uses_click && !egui_wants_pointer_prev {
 
             pivot_locked = true;
 
@@ -983,7 +984,7 @@ async fn main() {
             
         }
 
-        if is_mouse_button_down(MouseButton::Right) {
+        if is_mouse_button_down(MouseButton::Right) && !egui_wants_pointer_prev {
             let units_per_pixel = ortho_scale * 2.0 / screen_height();
             position -= right * mouse_delta.x * units_per_pixel;
             position += up * mouse_delta.y * units_per_pixel;
@@ -1239,6 +1240,7 @@ async fn main() {
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
             });
             egui_macroquad::draw();
+            egui_wants_pointer_prev = egui_wants_pointer;
 
             if do_zoom_all {
                 let aspect = screen_width() / screen_height().max(1.0);
@@ -1535,6 +1537,7 @@ async fn main() {
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
             });
             egui_macroquad::draw();
+            egui_wants_pointer_prev = egui_wants_pointer;
 
             if do_zoom_all {
                 let aspect = screen_width() / screen_height().max(1.0);
@@ -1922,6 +1925,7 @@ async fn main() {
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
             });
             egui_macroquad::draw();
+            egui_wants_pointer_prev = egui_wants_pointer;
 
             if do_zoom_all {
                 let aspect = screen_width() / screen_height().max(1.0);
