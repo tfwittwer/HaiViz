@@ -7,7 +7,7 @@ use crate::glam::vec3;
 
 use macroquad::prelude::*;
 
-use crate::raw_miniquad::{CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, load_class_defs, make_section_data, scan_dir_for_copc};
+use crate::raw_miniquad::{CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, build_section_from_raw_stages, load_class_defs, make_section_data, scan_dir_for_copc};
 use las::Point as LasPoint;
 
 const MOVE_SPEED: f32 = 0.5;
@@ -598,6 +598,8 @@ async fn main() {
     let mut section_end: Option<(f32, f32)> = None;
     let mut section_depth: f32 = 2.0;
     let mut section_data: Option<SectionData> = None;
+    // Cache of raw COPC section points (one Vec per stage) used to recolour on mode change.
+    let mut copc_section_raw: Option<(Vec<Vec<(LasPoint, f32, f32)>>, f32, f32, f32)> = None;
     let mut section_pan = glam::Vec2::ZERO;
     let mut section_zoom: f32 = 50.0;
     let mut sec_measure_a: Option<glam::Vec2> = None;
@@ -885,12 +887,18 @@ async fn main() {
                         section_data = Some(stg.extract_section(
                             &mut *gl.quad_context, start, end, section_depth, color_mode,
                         ));
+                    } else if !copc_stages.is_empty() {
+                        if let Some((ref per_stage_raw, length, h_min, h_max)) = copc_section_raw {
+                            section_data = Some(build_section_from_raw_stages(
+                                &mut *gl.quad_context, &copc_stages, per_stage_raw,
+                                length, h_min, h_max, color_mode,
+                            ));
+                        }
                     } else if let Some(ref mgr) = tile_mgr {
                         section_data = Some(mgr.extract_section(
                             &mut *gl.quad_context, start, end, section_depth, color_mode,
                         ));
                     }
-                
             }
 
             next_frame().await;
@@ -986,8 +994,8 @@ async fn main() {
 
         if is_mouse_button_down(MouseButton::Right) && !egui_wants_pointer_prev {
             let units_per_pixel = ortho_scale * 2.0 / screen_height();
-            position -= right * mouse_delta.x * units_per_pixel;
-            position += up * mouse_delta.y * units_per_pixel;
+            position -= right * mouse_delta.x * units_per_pixel * 10.0;
+            position += up * mouse_delta.y * units_per_pixel * 10.0;
         }
 
         clear_background(background);
@@ -1574,18 +1582,21 @@ async fn main() {
                             let gl = unsafe { get_internal_gl() };
                             // Combine verts from all COPC stages into one SectionData.
                             let mut all_verts = Vec::new();
+                            let mut per_stage_raw: Vec<Vec<(LasPoint, f32, f32)>> = Vec::new();
                             let (mut h_min, mut h_max) = (f32::MAX, f32::MIN);
                             let mut length = 0.0_f32;
                             let height_range = copc_stages[0].height_range();
                             for cs in &copc_stages {
-                                let (verts, len, hmin, hmax) = cs.extract_section_verts(start, end, section_depth, color_mode);
+                                let (verts, raw, len, hmin, hmax) = cs.extract_section_verts(start, end, section_depth, color_mode);
                                 all_verts.extend(verts);
+                                per_stage_raw.push(raw);
                                 h_min = h_min.min(hmin); h_max = h_max.max(hmax);
                                 length = length.max(len);
                             }
                             let h_min = if h_min == f32::MAX { 0.0 } else { h_min };
                             let h_max = if h_max == f32::MIN { 0.0 } else { h_max };
                             info!("COPC Section: {:.1}m long, {} points", length, all_verts.len());
+                            copc_section_raw = Some((per_stage_raw, length, h_min, h_max));
                             let sec = make_section_data(&mut *gl.quad_context, all_verts, length, h_min, h_max, height_range);
                             section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
                             section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;

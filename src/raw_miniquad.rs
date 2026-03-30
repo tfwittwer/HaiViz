@@ -1618,7 +1618,7 @@
             end: (f32, f32),
             depth: f32,
             color_mode: ColorMode,
-        ) -> (Vec<Vertex>, f32, f32, f32) {
+        ) -> (Vec<Vertex>, Vec<(Point, f32, f32)>, f32, f32, f32) {
             let dx = end.0 - start.0;
             let dy = end.1 - start.1;
             let len = (dx * dx + dy * dy).sqrt();
@@ -1633,6 +1633,7 @@
             };
 
             let mut verts = Vec::new();
+            let mut raw: Vec<(Point, f32, f32)> = Vec::new();
             let mut h_min = f32::MAX;
             let mut h_max = f32::MIN;
 
@@ -1645,6 +1646,7 @@
                     if along >= 0.0 && along <= len && perp.abs() <= depth {
                         h_min = h_min.min(pos[2]);
                         h_max = h_max.max(pos[2]);
+                        raw.push((node.points[i].clone(), along, pos[2]));
                         verts.push(Vertex {
                             pos: [along, pos[2], 0.0],
                             color: color_for_point(
@@ -1659,7 +1661,7 @@
 
             let h_min = if h_min == f32::MAX { 0.0 } else { h_min };
             let h_max = if h_max == f32::MIN { 0.0 } else { h_max };
-            (verts, len, h_min, h_max)
+            (verts, raw, len, h_min, h_max)
         }
 
         /*pub fn extract_section(
@@ -1724,6 +1726,41 @@
             height_max,
             height_range,
         }
+    }
+
+    /// Rebuild a combined COPC `SectionData` from cached raw point data with a new colour mode.
+    /// `per_stage_raw[i]` contains `(Point, along, pos_z)` triples extracted from `stages[i]`.
+    pub fn build_section_from_raw_stages(
+        ctx: &mut dyn RenderingBackend,
+        stages: &[CopcStage],
+        per_stage_raw: &[Vec<(Point, f32, f32)>],
+        length: f32,
+        h_min: f32,
+        h_max: f32,
+        color_mode: ColorMode,
+    ) -> SectionData {
+        let height_range = stages.first().map(|s| s.height_range()).unwrap_or(1.0);
+        let mut all_verts = Vec::new();
+        for (stage_idx, raw) in per_stage_raw.iter().enumerate() {
+            if let Some(cs) = stages.get(stage_idx) {
+                let intensity_range = if cs.intensity_max > cs.intensity_min {
+                    (cs.intensity_max - cs.intensity_min) as f32
+                } else {
+                    65535.0
+                };
+                for (pt, along, pos_z) in raw {
+                    all_verts.push(Vertex {
+                        pos: [*along, *pos_z, 0.0],
+                        color: color_for_point(
+                            pt, *pos_z, cs.height_range(),
+                            cs.intensity_min, intensity_range,
+                            color_mode, &cs.class_defs, cs.rgb_override,
+                        ),
+                    });
+                }
+            }
+        }
+        make_section_data(ctx, all_verts, length, h_min, h_max, height_range)
     }
 
     pub mod shader {
