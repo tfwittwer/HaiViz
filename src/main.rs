@@ -45,8 +45,8 @@ mod view_cube {
 
     fn faces() -> [FaceDef; 6] {
         [
-            FaceDef { corners: [4, 5, 6, 7], label: "Top",    normal: [ 0.0, 0.0, 1.0], snap_yaw: PI/2.0, snap_pitch: -1.5,     color: Color::new(0.3, 0.5, 0.8, 0.85) },
-            FaceDef { corners: [3, 2, 1, 0], label: "Bot",    normal: [ 0.0, 0.0,-1.0], snap_yaw: PI/2.0, snap_pitch:  1.5,     color: Color::new(0.2, 0.3, 0.5, 0.85) },
+            FaceDef { corners: [4, 5, 6, 7], label: "Top",    normal: [ 0.0, 0.0, 1.0], snap_yaw: PI/2.0, snap_pitch: -PI/2.0, color: Color::new(0.3, 0.5, 0.8, 0.85) },
+            FaceDef { corners: [3, 2, 1, 0], label: "Bot",    normal: [ 0.0, 0.0,-1.0], snap_yaw: PI/2.0, snap_pitch:  PI/2.0, color: Color::new(0.2, 0.3, 0.5, 0.85) },
             FaceDef { corners: [1, 2, 6, 5], label: "E",      normal: [ 1.0, 0.0, 0.0], snap_yaw: 0.0,    snap_pitch:  0.0,     color: Color::new(0.8, 0.3, 0.3, 0.85) },
             FaceDef { corners: [0, 3, 7, 4], label: "W",      normal: [-1.0, 0.0, 0.0], snap_yaw: PI,     snap_pitch:  0.0,     color: Color::new(0.5, 0.2, 0.2, 0.85) },
             FaceDef { corners: [3, 2, 6, 7], label: "N",      normal: [ 0.0, 1.0, 0.0], snap_yaw: PI/2.0, snap_pitch:  0.0,     color: Color::new(0.3, 0.7, 0.3, 0.85) },
@@ -167,7 +167,7 @@ mod view_cube {
         }
 
         if interactive && is_key_pressed(KeyCode::T) {
-            return Some((PI / 2.0, -1.5));
+            return Some((std::f32::consts::FRAC_PI_2, -std::f32::consts::FRAC_PI_2));
         }
 
 
@@ -301,23 +301,23 @@ fn draw_section_corridor(
         vec3(end.0 + nx,   end.1 + ny,   0.0),
     ];
     let t = [
-        vec3(start.0 + nx, start.1 + ny, height_range* 0.5),
-        vec3(start.0 - nx, start.1 - ny, height_range* 0.5),
-        vec3(end.0 - nx,   end.1 - ny,   height_range* 0.5),
-        vec3(end.0 + nx,   end.1 + ny,   height_range* 0.5),
+        vec3(start.0 + nx, start.1 + ny, height_range),
+        vec3(start.0 - nx, start.1 - ny, height_range),
+        vec3(end.0 - nx,   end.1 - ny,   height_range),
+        vec3(end.0 + nx,   end.1 + ny,   height_range),
     ];
 
     let col = YELLOW;
-    /*for i in 0..4 {
+    for i in 0..4 {
         //println!("{} {}",b[i],t[i]);
         draw_line_3d(b[i], b[(i + 1) % 4], col);
-    }*/
+    }
     for i in 0..4 {
         draw_line_3d(t[i], t[(i + 1) % 4], col);
     }
-    /*for i in 0..4 {
+    for i in 0..4 {
         draw_line_3d(b[i], t[i], col);
-    }*/
+    }
     draw_line_3d(
         vec3(start.0, start.1, height_range * 0.5),
         vec3(end.0, end.1, height_range * 0.5),
@@ -543,8 +543,20 @@ async fn main() {
     };
 
     let world_up = vec3(0.0, 0.0, 1.0);
-    let mut yaw: f32 = std::f32::consts::FRAC_PI_4;       // 45°
-    let mut pitch: f32 = -(1.0_f32 / 2.0_f32.sqrt()).atan(); // -35.26° (isometric)
+    let mut yaw: f32 = std::f32::consts::FRAC_PI_2; //std::f32::consts::FRAC_PI_4;       // 45°
+    let mut pitch: f32 = -std::f32::consts::FRAC_PI_2;    // -90° (true top-down)
+
+    // Compute camera right/up from yaw+pitch, handling the top-down gimbal-lock case.
+    // At pitch=-90°, front=(0,0,-1) is parallel to world_up so cross product is degenerate;
+    // use the yaw direction as the horizontal reference instead.
+    let recompute_right_up = |yaw: f32, pitch: f32, front: Vec3| -> (Vec3, Vec3) {
+        let r = if pitch.abs() > std::f32::consts::FRAC_PI_2 - 0.01 {
+            front.cross(vec3(yaw.cos(), yaw.sin(), 0.0)).normalize()
+        } else {
+            front.cross(world_up).normalize()
+        };
+        (r, r.cross(front).normalize())
+    };
 
     let mut front = vec3(
         yaw.cos() * pitch.cos(),
@@ -552,8 +564,7 @@ async fn main() {
         pitch.sin(),
     )
     .normalize();
-    let mut right = front.cross(world_up).normalize();
-    let mut up = right.cross(front).normalize();
+    let (mut right, mut up) = recompute_right_up(yaw, pitch, front);
 
     // Compute initial camera position and ortho_scale to fit the data on screen.
     let (data_extent_x, data_extent_y) = if let Some(ref mgr) = tile_mgr {
@@ -643,6 +654,7 @@ async fn main() {
     };
 
     loop {
+        //println!("{} {}",yaw,pitch);
         //println!("{}",app_mode.label());
         let delta = get_frame_time();
 
@@ -971,7 +983,7 @@ async fn main() {
             let old_front = front;
             yaw += mouse_delta.x * delta * -LOOK_SPEED;
             pitch += mouse_delta.y * delta * -LOOK_SPEED;
-            pitch = pitch.clamp(-1.5, 1.5);
+            pitch = pitch.clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
 
             front = vec3(
                 yaw.cos() * pitch.cos(),
@@ -985,8 +997,7 @@ async fn main() {
             position = orbit_pivot + front * (position - orbit_pivot).dot(old_front);
 
             //front = (orbit_pivot-position).normalize();
-            right = front.cross(world_up).normalize();
-            up = right.cross(front).normalize();
+            (right, up) = recompute_right_up(yaw, pitch, front);
             
             //println!("{}",front);
             
@@ -1012,6 +1023,7 @@ async fn main() {
         };
         set_camera(&camera);
         let view_proj: glam::Mat4 = camera.matrix();
+        //println!("{}",view_proj);
 
         let (mx, my) = macroquad::input::mouse_position();
         let cursor_world = screen_to_world_xy(mx, my, &view_proj, mid_z);
@@ -1085,8 +1097,7 @@ async fn main() {
                 yaw = new_yaw;
                 pitch = new_pitch;
                 front = vec3(yaw.cos() * pitch.cos(), yaw.sin() * pitch.cos(), pitch.sin()).normalize();
-                right = front.cross(world_up).normalize();
-                up = right.cross(front).normalize();
+                (right, up) = recompute_right_up(yaw, pitch, front);
                 position = orbit_pivot + front * (position - orbit_pivot).dot(old_front);
             }
 
@@ -1385,8 +1396,7 @@ async fn main() {
                 yaw = new_yaw;
                 pitch = new_pitch;
                 front = vec3(yaw.cos() * pitch.cos(), yaw.sin() * pitch.cos(), pitch.sin()).normalize();
-                right = front.cross(world_up).normalize();
-                up = right.cross(front).normalize();
+                (right, up) = recompute_right_up(yaw, pitch, front);
                 position = orbit_pivot + front * (position - orbit_pivot).dot(old_front);
             }
 
@@ -1680,8 +1690,8 @@ async fn main() {
                     let k = (j + 1) % 4;
                     // draw_line_3d doesn't support thickness, use it anyway
                     draw_line_3d(
-                        vec3(corners[j].0, corners[j].1, 0.0),
-                        vec3(corners[k].0, corners[k].1, 0.0),
+                        vec3(corners[j].0, corners[j].1, 0.),
+                        vec3(corners[k].0, corners[k].1, 0.),
                         col,
                     );
                     if thickness > 1.0 {
@@ -1741,8 +1751,7 @@ async fn main() {
                 yaw = new_yaw;
                 pitch = new_pitch;
                 front = vec3(yaw.cos() * pitch.cos(), yaw.sin() * pitch.cos(), pitch.sin()).normalize();
-                right = front.cross(world_up).normalize();
-                up = right.cross(front).normalize();
+                (right, up) = recompute_right_up(yaw, pitch, front);
                 position = orbit_pivot + front * (position - orbit_pivot).dot(old_front);
             }
 
