@@ -195,6 +195,7 @@ pub enum ColorMode {
     Classification,
     Rgb,
     PointSourceId,
+    Time,
 }
 
 impl ColorMode {
@@ -205,15 +206,17 @@ impl ColorMode {
             ColorMode::Classification => "Classification",
             ColorMode::Rgb => "RGB",
             ColorMode::PointSourceId => "PointSourceId",
+            ColorMode::Time => "Time",
         }
     }
 
-    const ALL: [ColorMode; 5] = [
+    const ALL: [ColorMode; 6] = [
         ColorMode::Height,
         ColorMode::Intensity,
         ColorMode::Classification,
         ColorMode::Rgb,
         ColorMode::PointSourceId,
+        ColorMode::Time,
     ];
 }
 

@@ -52,6 +52,8 @@
         pub max: [f64; 3],
         pub intensity_min: u16,
         pub intensity_max: u16,
+        pub time_min: f64,
+        pub time_max: f64,
     }
 
     impl VizPointcloud {
@@ -66,6 +68,8 @@
             let mut max = [f64::MIN; 3];
             let mut intensity_min = u16::MAX;
             let mut intensity_max = u16::MIN;
+            let mut time_min = f64::MAX;
+            let mut time_max = f64::MIN;
 
             for point in &points {
                 min[0] = min[0].min(point.x);
@@ -76,6 +80,11 @@
                 max[2] = max[2].max(point.z);
                 intensity_min = intensity_min.min(point.intensity);
                 intensity_max = intensity_max.max(point.intensity);
+
+                if let Some(time) = point.gps_time {
+                    time_min = time_min.min(time);
+                    time_max = time_max.max(time);
+                }
             }
 
             // Detect 8-bit colors stored in 16-bit fields (common in older LAS files)
@@ -97,7 +106,8 @@
 
             info!("{} points loaded from {}", points.len(), filename);
             info!("Intensity range: {}..{}", intensity_min, intensity_max);
-            VizPointcloud { points, min, max, intensity_min, intensity_max }
+            info!("Time range: {}..{}", time_min, time_max);
+            VizPointcloud { points, min, max, intensity_min, intensity_max, time_min, time_max}
         }
     }
 
@@ -138,13 +148,24 @@
 
     fn color_for_point(
         point: &Point, pos_z: f32, height_range: f32,
-        intensity_min: u16, intensity_range: f32,
+        intensity_min: u16, intensity_range: f32, time: f32, time_min: f32, time_range: f32,
         mode: ColorMode, class_defs: &Option<ClassDefs>,
         override_rgb: Option<[f32; 3]>,
     ) -> [f32; 3] {
         match mode {
             ColorMode::Height => {
                 let h = if height_range > 0.0 { (pos_z / height_range).clamp(0.0, 1.0) } else { 0.5 };
+                let r = (2.0 * h - 0.5).clamp(0.0, 1.0);
+                let g = (1.0 - 2.0 * (h - 0.5).abs()).clamp(0.0, 1.0);
+                let b = (1.0 - 2.0 * h).clamp(0.0, 1.0);
+                [r, g, b]
+            }
+            ColorMode::Time => {
+                let h = if time_range > 0.0 {
+                    (time - time_min) as f32 / time_range
+                } else {
+                    0.5
+                };
                 let r = (2.0 * h - 0.5).clamp(0.0, 1.0);
                 let g = (1.0 - 2.0 * (h - 0.5).abs()).clamp(0.0, 1.0);
                 let b = (1.0 - 2.0 * h).clamp(0.0, 1.0);
@@ -361,6 +382,7 @@
 
             let height_range = (cloud.max[2] - cloud.min[2]) as f32;
             let intensity_range = (cloud.intensity_max - cloud.intensity_min) as f32;
+            let time_range = (cloud.time_max - cloud.time_min) as f32;
 
             let positions: Vec<[f32; 3]> = cloud
                 .points
@@ -378,7 +400,7 @@
                 .enumerate()
                 .map(|(i, p)| Vertex {
                     pos: positions[i],
-                    color: color_for_point(p, positions[i][2], height_range, cloud.intensity_min, intensity_range, color_mode, &class_defs, None),
+                    color: color_for_point(p, positions[i][2], height_range, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.) as f32, cloud.time_min as f32, time_range, color_mode, &class_defs, None),
                 })
                 .collect();
 
@@ -435,6 +457,7 @@
         pub fn rebuild_colors(&mut self, ctx: &mut dyn RenderingBackend, color_mode: ColorMode) {
             let height_range = self.height_range();
             let intensity_range = (self.cloud.intensity_max - self.cloud.intensity_min) as f32;
+            let time_range = (self.cloud.time_max - self.cloud.time_min) as f32;
 
             for chunk in &mut self.chunks {
                 let chunk_verts: Vec<Vertex> = chunk
@@ -444,7 +467,7 @@
                         let p = &self.cloud.points[i];
                         Vertex {
                             pos: self.positions[i],
-                            color: color_for_point(p, self.positions[i][2], height_range, self.cloud.intensity_min, intensity_range, color_mode, &self.class_defs, self.rgb_override),
+                            color: color_for_point(p, self.positions[i][2], height_range, self.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.) as f32, self.cloud.time_min as f32, time_range, color_mode, &self.class_defs, self.rgb_override),
                         }
                     })
                     .collect();
@@ -472,6 +495,7 @@
 
             let height_range = self.height_range();
             let intensity_range = (self.cloud.intensity_max - self.cloud.intensity_min) as f32;
+            let time_range = (self.cloud.time_max - self.cloud.time_min) as f32;
 
             let mut section_verts = Vec::new();
             let mut h_min = f32::MAX;
@@ -489,7 +513,7 @@
                     h_max = h_max.max(pos[2]);
                     section_verts.push(Vertex {
                         pos: [along, pos[2], 0.0],
-                        color: color_for_point(p, pos[2], height_range, self.cloud.intensity_min, intensity_range, color_mode, &self.class_defs, self.rgb_override),
+                        color: color_for_point(p, pos[2], height_range, self.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.) as f32, self.cloud.time_min as f32, time_range, color_mode, &self.class_defs, self.rgb_override),
                     });
                 }
             }
@@ -739,6 +763,7 @@
             let cloud = VizPointcloud::load(&self.tiles[index].filepath);
             let height_range = self.height_range();
             let intensity_range = (cloud.intensity_max - cloud.intensity_min) as f32;
+            let time_range = (cloud.time_max - cloud.time_min) as f32;
 
             let positions: Vec<[f32; 3]> = cloud.points.iter().map(|p| [
                 (p.x - self.global_min[0]) as f32,
@@ -748,7 +773,7 @@
 
             let vertices: Vec<Vertex> = cloud.points.iter().enumerate().map(|(i, p)| Vertex {
                 pos: positions[i],
-                color: color_for_point(p, positions[i][2], height_range, cloud.intensity_min, intensity_range, color_mode, &self.class_defs, override_rgb),
+                color: color_for_point(p, positions[i][2], height_range, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.) as f32, cloud.time_min as f32, time_range, color_mode, &self.class_defs, override_rgb),
             }).collect();
 
             let total_points = vertices.len() as i32;
@@ -805,13 +830,14 @@
             let class_defs = self.class_defs.clone();
             for loaded in self.loaded.iter_mut().flatten() {
                 let intensity_range = (loaded.cloud.intensity_max - loaded.cloud.intensity_min) as f32;
+                let time_range = (loaded.cloud.time_max - loaded.cloud.time_min) as f32;
                 let override_rgb = loaded.rgb_override;
                 for chunk in &mut loaded.chunks {
                     let chunk_verts: Vec<Vertex> = chunk.point_indices.iter().map(|&i| {
                         let p = &loaded.cloud.points[i];
                         Vertex {
                             pos: loaded.positions[i],
-                            color: color_for_point(p, loaded.positions[i][2], height_range, loaded.cloud.intensity_min, intensity_range, color_mode, &class_defs, override_rgb),
+                            color: color_for_point(p, loaded.positions[i][2], height_range, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.) as f32, loaded.cloud.time_min as f32, time_range, color_mode, &class_defs, override_rgb),
                         }
                     }).collect();
                     ctx.buffer_update(chunk.bindings.vertex_buffers[0], BufferSource::slice(&chunk_verts));
@@ -824,13 +850,14 @@
             let class_defs = self.class_defs.clone();
             if let Some(ref mut loaded) = self.loaded[index] {
                 let intensity_range = (loaded.cloud.intensity_max - loaded.cloud.intensity_min) as f32;
+                let time_range = (loaded.cloud.time_max - loaded.cloud.time_min) as f32;
                 let override_rgb = loaded.rgb_override;
                 for chunk in &mut loaded.chunks {
                     let chunk_verts: Vec<Vertex> = chunk.point_indices.iter().map(|&i| {
                         let p = &loaded.cloud.points[i];
                         Vertex {
                             pos: loaded.positions[i],
-                            color: color_for_point(p, loaded.positions[i][2], height_range, loaded.cloud.intensity_min, intensity_range, color_mode, &class_defs, override_rgb),
+                            color: color_for_point(p, loaded.positions[i][2], height_range, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.) as f32, loaded.cloud.time_min as f32, time_range, color_mode, &class_defs, override_rgb),
                         }
                     }).collect();
                     ctx.buffer_update(chunk.bindings.vertex_buffers[0], BufferSource::slice(&chunk_verts));
@@ -897,6 +924,7 @@
 
             for loaded in self.loaded.iter().flatten() {
                 let intensity_range = (loaded.cloud.intensity_max - loaded.cloud.intensity_min) as f32;
+                let time_range = (loaded.cloud.time_max - loaded.cloud.time_min) as f32;
                 for (i, pos) in loaded.positions.iter().enumerate() {
                     let rel_x = pos[0] - start.0;
                     let rel_y = pos[1] - start.1;
@@ -909,7 +937,7 @@
                         h_max = h_max.max(pos[2]);
                         section_verts.push(Vertex {
                             pos: [along, pos[2], 0.0],
-                            color: color_for_point(p, pos[2], height_range, loaded.cloud.intensity_min, intensity_range, color_mode, &self.class_defs, loaded.rgb_override),
+                            color: color_for_point(p, pos[2], height_range, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.) as f32, loaded.cloud.time_min as f32, time_range, color_mode, &self.class_defs, loaded.rgb_override),
                         });
                     }
                 }
@@ -1182,6 +1210,8 @@
         pub viewer_origin: [f64; 3],
         pub intensity_min: u16,
         pub intensity_max: u16,
+        pub time_min: f64,
+        pub time_max: f64,
         pub class_defs: Option<ClassDefs>,
         pub rgb_override: Option<[f32; 3]>,
         /// Nodes dispatched to the loader thread but not yet ingested.
@@ -1318,6 +1348,8 @@
                 viewer_origin,
                 intensity_min: u16::MAX,
                 intensity_max: 0,
+                time_min: f64::MAX,
+                time_max: f64::MIN,
                 class_defs,
                 rgb_override: None,
                 in_flight: HashSet::new(),
@@ -1372,10 +1404,20 @@
             } else {
                 65535.0
             };
+            let time_range = if self.time_max > self.time_min {
+                (self.time_max - self.time_min) as f32
+            }
+            else {
+                1.0
+            };
 
             for p in &pts {
                 self.intensity_min = self.intensity_min.min(p.intensity);
                 self.intensity_max = self.intensity_max.max(p.intensity);
+
+                let time = p.gps_time.unwrap_or(0.);
+                self.time_min = self.time_min.min(time);
+                self.time_max = self.time_max.max(time);
             }
 
             let positions: Vec<[f32; 3]> = pts.iter().map(|p| [
@@ -1388,7 +1430,7 @@
                 pos: positions[i],
                 color: color_for_point(
                     p, positions[i][2], height_range,
-                    self.intensity_min, intensity_range,
+                    self.intensity_min, intensity_range, p.gps_time.unwrap_or(0.) as f32, self.time_min as f32, time_range,
                     color_mode, &self.class_defs, self.rgb_override,
                 ),
             }).collect();
@@ -1595,13 +1637,19 @@
             } else {
                 65535.0
             };
+            let time_range = if self.time_max > self.time_min {
+                (self.time_max - self.time_min) as f32
+            }
+            else {
+                1.0
+            };
             for node in self.loaded_nodes.values_mut() {
                 for chunk in &mut node.chunks {
                     let verts: Vec<Vertex> = chunk.point_indices.iter().map(|&i| Vertex {
                         pos: node.positions[i],
                         color: color_for_point(
                             &node.points[i], node.positions[i][2], height_range,
-                            self.intensity_min, intensity_range,
+                            self.intensity_min, intensity_range, node.points[i].gps_time.unwrap_or(0.) as f32, self.time_min as f32, time_range,
                             color_mode, &self.class_defs, self.rgb_override,
                         ),
                     }).collect();
@@ -1631,6 +1679,12 @@
             } else {
                 65535.0
             };
+            let time_range = if self.time_max > self.time_min {
+                (self.time_max - self.time_min) as f32
+            }
+            else {
+                1.0
+            };
 
             let mut verts = Vec::new();
             let mut raw: Vec<(Point, f32, f32)> = Vec::new();
@@ -1651,7 +1705,7 @@
                             pos: [along, pos[2], 0.0],
                             color: color_for_point(
                                 &node.points[i], pos[2], height_range,
-                                self.intensity_min, intensity_range,
+                                self.intensity_min, intensity_range, node.points[i].gps_time.unwrap_or(0.) as f32, self.time_min as f32, time_range,
                                 color_mode, &self.class_defs, self.rgb_override,
                             ),
                         });
@@ -1748,12 +1802,18 @@
                 } else {
                     65535.0
                 };
+                let time_range = if cs.time_max > cs.time_min {
+                    (cs.time_max - cs.time_min) as f32
+                }
+                else {
+                    1.0
+                };
                 for (pt, along, pos_z) in raw {
                     all_verts.push(Vertex {
                         pos: [*along, *pos_z, 0.0],
                         color: color_for_point(
                             pt, *pos_z, cs.height_range(),
-                            cs.intensity_min, intensity_range,
+                            cs.intensity_min, intensity_range, pt.gps_time.unwrap_or(0.) as f32, cs.time_min as f32, time_range,
                             color_mode, &cs.class_defs, cs.rgb_override,
                         ),
                     });
