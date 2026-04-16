@@ -80,6 +80,7 @@ pub fn draw_3d(files: &[PolylineFile]) {
 /// Draw polylines projected into section view 2D space.
 /// Only the parts of each segment within `|perp| <= depth` of the section plane are drawn,
 /// where perp is the perpendicular distance from the section line.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_section(
     files: &[PolylineFile],
     section_start: (f32, f32),

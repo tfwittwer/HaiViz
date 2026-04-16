@@ -146,6 +146,7 @@
         pub rgb_override: Option<[f32; 3]>,
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn color_for_point(
         point: &Point, pos_z: f32, height_range: f32,
         intensity_min: u16, intensity_range: f32, time: f32, time_min: f32, time_range: f32,
@@ -162,7 +163,7 @@
             }
             ColorMode::Time => {
                 let h = if time_range > 0.0 {
-                    (time - time_min) as f32 / time_range
+                    (time - time_min) / time_range
                 } else {
                     0.5
                 };
@@ -1660,6 +1661,7 @@
 
         /// Collect section vertices from currently loaded nodes.
         /// Returns `(verts, length, height_min, height_max)`.
+        #[allow(clippy::type_complexity)]
         pub fn extract_section_verts(
             &self,
             start: (f32, f32),

@@ -613,6 +613,7 @@ async fn main() {
     let mut section_depth: f32 = 2.0;
     let mut section_data: Option<SectionData> = None;
     // Cache of raw COPC section points (one Vec per stage) used to recolour on mode change.
+    #[allow(clippy::type_complexity)]
     let mut copc_section_raw: Option<(Vec<Vec<(LasPoint, f32, f32)>>, f32, f32, f32)> = None;
     let mut section_pan = glam::Vec2::ZERO;
     let mut section_zoom: f32 = 50.0;
