@@ -185,7 +185,7 @@
                 [r, g, b]
             }
             ColorMode::Classification => {
-                let class_id: u8 = point.classification.into();
+                let class_id: u8 = if point.is_overlap { 12 } else { point.classification.into() };
                 if let Some(defs) = class_defs &&
                     let Some((_label, color)) = defs.get(&class_id) {
                         return *color;

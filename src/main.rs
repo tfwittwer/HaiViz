@@ -329,14 +329,20 @@ fn draw_section_corridor(
 }
 
 /// Format classification label using custom class_defs or default debug format.
-fn class_label(class: las::point::Classification, class_defs: &Option<crate::raw_miniquad::ClassDefs>) -> String {
-    let id: u8 = class.into();
+/// Recovers class 12 (Overlap) from the `is_overlap` flag, since the `las` crate
+/// strips it from the classification field per LAS 1.4 semantics.
+fn class_label(point: &las::Point, class_defs: &Option<crate::raw_miniquad::ClassDefs>) -> String {
+    let id: u8 = if point.is_overlap { 12 } else { point.classification.into() };
     if let Some(defs) = class_defs &&
         let Some((label, _)) = defs.get(&id) {
             return format!("{} ({})", id, label);
-        
+
     }
-    format!("{} ({:?})", id, class)
+    if point.is_overlap {
+        format!("{} (OverlapPoints)", id)
+    } else {
+        format!("{} ({:?})", id, point.classification)
+    }
 }
 
 fn polylines_window(
@@ -1249,7 +1255,7 @@ async fn main() {
                             ui.label("Point Info:");
                             ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
                             ui.label(format!("  Intensity: {}", p.intensity));
-                            ui.label(format!("  Classification: {}", class_label(p.classification, &class_defs)));
+                            ui.label(format!("  Classification: {}", class_label(p, &class_defs)));
                             ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
                             if let Some(ref color) = p.color {
                                 ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
@@ -1545,7 +1551,7 @@ async fn main() {
                             ui.label("Point Info:");
                             ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
                             ui.label(format!("  Intensity: {}", p.intensity));
-                            ui.label(format!("  Classification: {}", class_label(p.classification, &class_defs)));
+                            ui.label(format!("  Classification: {}", class_label(p, &class_defs)));
                             ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
                             if let Some(ref color) = p.color {
                                 ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
@@ -1934,7 +1940,7 @@ async fn main() {
                                 ui.label(format!("Point Info ({})", mgr.tiles[tile_idx].filename));
                                 ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
                                 ui.label(format!("  Intensity: {}", p.intensity));
-                                ui.label(format!("  Classification: {}", class_label(p.classification, &class_defs)));
+                                ui.label(format!("  Classification: {}", class_label(p, &class_defs)));
                                 ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
                                 if let Some(ref color) = p.color {
                                     ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
