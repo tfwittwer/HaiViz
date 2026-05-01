@@ -1241,41 +1241,60 @@
         (xmin, ymin, zmin, xmin + span, ymin + span, zmin + span)
     }
 
-    /// Spawn a background thread that services COPC load requests.
-    /// The file is reopened for every request so that the LAZ decompressor
-    /// starts from a clean state — each COPC node is a self-contained LAZ chunk
-    /// and reusing the reader across nodes can leave stale decompressor state.
-    fn spawn_copc_loader(
+    /// Number of background threads decompressing COPC nodes in parallel.
+    /// LAZ decompression is CPU-bound and per-node independent, so a small pool
+    /// gives near-linear speedup on cold zoom-ins. Capped to avoid oversubscribing
+    /// a typical workstation when other stages are also active.
+    const COPC_LOADER_THREADS: usize = 4;
+
+    /// Spawn a pool of background threads that service COPC load requests.
+    /// Each thread reopens the file per request so the LAZ decompressor starts
+    /// from a clean state — each COPC node is a self-contained LAZ chunk and
+    /// reusing a reader across nodes can leave stale decompressor state.
+    /// All threads share one request receiver via `Arc<Mutex<_>>`; the lock is
+    /// only held during `recv()`, so decompression itself runs concurrently.
+    fn spawn_copc_loader_pool(
         filepath: String,
         rx: std::sync::mpsc::Receiver<CopcLoadReq>,
         tx: std::sync::mpsc::Sender<CopcLoadResult>,
+        worker_count: usize,
     ) {
-        std::thread::Builder::new()
-            .name("copc-loader".into())
-            .spawn(move || {
-                for req in rx {
-                    let file = match File::open(&filepath) {
-                        Ok(f) => BufReader::new(f),
-                        Err(e) => { error!("COPC loader: open error: {}", e); continue; }
-                    };
-                    let mut reader = match CopcEntryReader::new(file) {
-                        Ok(r) => r,
-                        Err(e) => { error!("COPC loader: reader error: {}", e); continue; }
-                    };
-                    let las_entry = las::copc::Entry {
-                        key: req.key,
-                        offset: req.offset,
-                        byte_size: req.byte_size,
-                        point_count: req.point_count,
-                    };
-                    let mut points = Vec::new();
-                    match reader.read_entry_points(&las_entry, &mut points) {
-                        Ok(_) => { let _ = tx.send(CopcLoadResult { key: req.key, points, generation: req.generation }); }
-                        Err(e) => error!("COPC loader error for {:?}: {}", req.key, e),
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        for i in 0..worker_count {
+            let filepath = filepath.clone();
+            let rx = rx.clone();
+            let tx = tx.clone();
+            std::thread::Builder::new()
+                .name(format!("copc-loader-{i}"))
+                .spawn(move || {
+                    loop {
+                        let req = match rx.lock().unwrap().recv() {
+                            Ok(req) => req,
+                            Err(_) => break,
+                        };
+                        let file = match File::open(&filepath) {
+                            Ok(f) => BufReader::new(f),
+                            Err(e) => { error!("COPC loader: open error: {}", e); continue; }
+                        };
+                        let mut reader = match CopcEntryReader::new(file) {
+                            Ok(r) => r,
+                            Err(e) => { error!("COPC loader: reader error: {}", e); continue; }
+                        };
+                        let las_entry = las::copc::Entry {
+                            key: req.key,
+                            offset: req.offset,
+                            byte_size: req.byte_size,
+                            point_count: req.point_count,
+                        };
+                        let mut points = Vec::new();
+                        match reader.read_entry_points(&las_entry, &mut points) {
+                            Ok(_) => { let _ = tx.send(CopcLoadResult { key: req.key, points, generation: req.generation }); }
+                            Err(e) => error!("COPC loader error for {:?}: {}", req.key, e),
+                        }
                     }
-                }
-            })
-            .expect("Cannot spawn COPC loader thread");
+                })
+                .expect("Cannot spawn COPC loader thread");
+        }
     }
 
     impl CopcStage {
@@ -1337,7 +1356,7 @@
 
             let (load_tx, load_rx) = std::sync::mpsc::channel::<CopcLoadReq>();
             let (result_tx, result_rx) = std::sync::mpsc::channel::<CopcLoadResult>();
-            spawn_copc_loader(filepath.to_string(), load_rx, result_tx);
+            spawn_copc_loader_pool(filepath.to_string(), load_rx, result_tx, COPC_LOADER_THREADS);
 
             let mut stage = CopcStage {
                 pipeline,
@@ -1529,8 +1548,10 @@
             // Sort by NDC distance from screen centre so the most visible nodes load first.
             // Cap the queue depth so we never flood the channel on a sudden zoom-in.
             // Also respect the global point budget shared across all COPC stages.
-            const MAX_IN_FLIGHT: usize = 4;
-            let budget = MAX_IN_FLIGHT.saturating_sub(self.in_flight.len());
+            // Keep the pool fed: 2× the worker count means each thread always
+            // has a follow-up node queued when it finishes its current one.
+            let max_in_flight = COPC_LOADER_THREADS * 2;
+            let budget = max_in_flight.saturating_sub(self.in_flight.len());
             let points_remaining = GLOBAL_POINT_BUDGET - already_loaded - self.total_loaded_points();
             if view_settled && budget > 0 && points_remaining > 0 {
                 // Build a lookup from key → entry for centre-distance sorting.
