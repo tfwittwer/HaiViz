@@ -462,18 +462,17 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     info!(" *** HaiViz {} ***",env!("CARGO_PKG_VERSION"));
-    if env::args().count() != 2 {
-        error!("Usage: haiviz <pointcloud.laz | directory>");
-        return;
-    }
     let args: Vec<String> = env::args().collect();
-    let input_path = &args[1];
-    let is_tile_mode = Path::new(input_path).is_dir();
-    let is_copc = !is_tile_mode && {
-        las::Reader::from_path(input_path)
+    let input_path: Option<&str> = if args.len() >= 2 { Some(args[1].as_str()) } else { None };
+    if input_path.is_none() {
+        info!("Launched with no input — drag .laz / .copc.laz files onto the window to load.");
+    }
+    let is_tile_mode = input_path.map(|p| Path::new(p).is_dir()).unwrap_or(false);
+    let is_copc = !is_tile_mode && input_path.map(|p| {
+        las::Reader::from_path(p)
             .map(|r| r.header().copc_info_vlr().is_some())
             .unwrap_or(false)
-    };
+    }).unwrap_or(false);
     if is_copc { info!("Detected COPC format"); }
 
     let class_defs = load_class_defs();
@@ -485,64 +484,68 @@ async fn main() {
     let mut background: Color = BLACK;
     let mut app_mode = AppMode::View3D;
 
-    // Single-file mode state
-    let mut stage: Option<Stage> = None;
+    // Non-COPC LAZ stages. First entry pins the shared viewer_origin used by
+    // any subsequent stages added via drag-and-drop.
+    let mut stages: Vec<Stage> = Vec::new();
     // Tile mode state
     let mut tile_mgr: Option<TileStageManager> = None;
     // COPC stages: one entry in single-file mode, one per COPC file in directory mode.
     let mut copc_stages: Vec<CopcStage> = Vec::new();
 
-    let height_range;
+    // Default height range used for camera framing and section-corridor depth when
+    // nothing is loaded yet. Overwritten by the first data source that loads.
+    let mut height_range: f32 = 100.0;
 
-    if is_tile_mode {
-        let mut mgr = {
-            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
-            TileStageManager::new(ctx, input_path, class_defs.clone())
-        };
+    if let Some(input_path) = input_path {
+        if is_tile_mode {
+            let mut mgr = {
+                let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+                TileStageManager::new(ctx, input_path, class_defs.clone())
+            };
 
-        // Also load any COPC files in the same directory.
-        let copc_paths = scan_dir_for_copc(input_path);
-        if !copc_paths.is_empty() {
-            info!("Found {} COPC file(s) in directory", copc_paths.len());
-            // Compute a unified viewer origin: min of tile bounds and all COPC file bounds.
-            let mut unified_min = mgr.global_min;
-            let mut unified_max = mgr.global_max;
-            for path in &copc_paths {
-                if let Ok(r) = las::Reader::from_path(path) {
-                    let b = r.header().bounds();
-                    unified_min[0] = unified_min[0].min(b.min.x);
-                    unified_min[1] = unified_min[1].min(b.min.y);
-                    unified_min[2] = unified_min[2].min(b.min.z);
-                    unified_max[0] = unified_max[0].max(b.max.x);
-                    unified_max[1] = unified_max[1].max(b.max.y);
-                    unified_max[2] = unified_max[2].max(b.max.z);                    
+            // Also load any COPC files in the same directory.
+            let copc_paths = scan_dir_for_copc(input_path);
+            if !copc_paths.is_empty() {
+                info!("Found {} COPC file(s) in directory", copc_paths.len());
+                let mut unified_min = mgr.global_min;
+                let mut unified_max = mgr.global_max;
+                for path in &copc_paths {
+                    if let Ok(r) = las::Reader::from_path(path) {
+                        let b = r.header().bounds();
+                        unified_min[0] = unified_min[0].min(b.min.x);
+                        unified_min[1] = unified_min[1].min(b.min.y);
+                        unified_min[2] = unified_min[2].min(b.min.z);
+                        unified_max[0] = unified_max[0].max(b.max.x);
+                        unified_max[1] = unified_max[1].max(b.max.y);
+                        unified_max[2] = unified_max[2].max(b.max.z);
+                    }
+                }
+                mgr.global_max = unified_max;
+                mgr.global_min = unified_min;
+                let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+                for path in &copc_paths {
+                    let cs = CopcStage::new(ctx, path, Some(unified_min), color_mode, class_defs.clone());
+                    copc_stages.push(cs);
                 }
             }
-            mgr.global_max = unified_max;
-            mgr.global_min = unified_min;
-            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
-            for path in &copc_paths {
-                let cs = CopcStage::new(ctx, path, Some(unified_min), color_mode, class_defs.clone());
-                copc_stages.push(cs);
-            }
-        }
 
-        height_range = mgr.height_range();
-        tile_mgr = Some(mgr);
-    } else if is_copc {
-        let cs = {
-            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
-            CopcStage::new(ctx, input_path, None, color_mode, class_defs.clone())
-        };
-        height_range = cs.height_range();
-        copc_stages.push(cs);
-    } else {
-        let s = {
-            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
-            Stage::new(ctx, input_path, color_mode, class_defs.clone())
-        };
-        height_range = s.height_range();
-        stage = Some(s);
+            height_range = mgr.height_range();
+            tile_mgr = Some(mgr);
+        } else if is_copc {
+            let cs = {
+                let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+                CopcStage::new(ctx, input_path, None, color_mode, class_defs.clone())
+            };
+            height_range = cs.height_range();
+            copc_stages.push(cs);
+        } else {
+            let s = {
+                let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+                Stage::new(ctx, input_path, None, color_mode, class_defs.clone())
+            };
+            height_range = s.height_range();
+            stages.push(s);
+        }
     }
 
     let mut tile_rgb_overrides: Vec<Option<[f32; 3]>> = if let Some(ref mgr) = tile_mgr {
@@ -576,7 +579,8 @@ async fn main() {
     let (mut right, mut up) = recompute_right_up(yaw, pitch, front);
 
     // Compute initial camera position and ortho_scale to fit the data on screen.
-    let (data_extent_x, data_extent_y) = if let Some(ref mgr) = tile_mgr {
+    // Mutable: the first drag-and-drop load updates these if nothing was loaded at startup.
+    let (mut data_extent_x, mut data_extent_y): (f32, f32) = if let Some(ref mgr) = tile_mgr {
         let mut gmax = mgr.global_max;
         let mut gmin = mgr.global_min;
         for cs in &copc_stages {
@@ -591,7 +595,7 @@ async fn main() {
             gmax[0] = gmax[0].max(cs.global_max[0]); gmax[1] = gmax[1].max(cs.global_max[1]);
         }
         ((gmax[0] - gmin[0]) as f32, (gmax[1] - gmin[1]) as f32)
-    } else if let Some(ref stg) = stage {
+    } else if let Some(stg) = stages.first() {
         (
             (stg.cloud.max[0] - stg.cloud.min[0]) as f32,
             (stg.cloud.max[1] - stg.cloud.min[1]) as f32,
@@ -627,7 +631,8 @@ async fn main() {
     let mut sec_measure_b: Option<glam::Vec2> = None;
 
     // Point pick state
-    let mut picked_point: Option<usize> = None;
+    // (stage_idx, point_idx) — picked point in the multi-Stage list.
+    let mut picked_point: Option<(usize, usize)> = None;
     let mut picked_tile_point: Option<(usize, usize)> = None;
     let mut picked_copc_point: Option<LasPoint> = None;
 
@@ -640,14 +645,14 @@ async fn main() {
 
     let mut point_size: f32 = 2.0;
 
-    // Compute viewer-space offset (world coords of the viewer origin)
-    let data_offset: [f64; 3] = if let Some(ref mgr) = tile_mgr {
+    // Compute viewer-space offset (world coords of the viewer origin).
+    // Mutable: updated when the first file is loaded via drag-and-drop.
+    let mut data_offset: [f64; 3] = if let Some(ref mgr) = tile_mgr {
         mgr.global_min
     } else if !copc_stages.is_empty() {
-        // viewer_origin is the shared coordinate origin (== global_min for single-file mode).
         copc_stages[0].viewer_origin
-    } else if let Some(ref stg) = stage {
-        stg.cloud.min
+    } else if let Some(stg) = stages.first() {
+        stg.viewer_origin
     } else {
         [0.0, 0.0, 0.0]
     };
@@ -663,10 +668,101 @@ async fn main() {
         EdlRenderer::new(ctx, screen_width() as u32, screen_height() as u32)
     };
 
+    // Pinned viewer origin for drag-and-drop. Seeded from whatever was loaded at
+    // startup; if nothing was loaded and the user drops a file, it's set from
+    // that file's bounds. Never reassigned for the rest of the session so all
+    // stages share one coordinate space.
+    let mut pinned_viewer_origin: Option<[f64; 3]> = if !copc_stages.is_empty() {
+        Some(copc_stages[0].viewer_origin)
+    } else if let Some(ref mgr) = tile_mgr {
+        Some(mgr.global_min)
+    } else if let Some(s) = stages.first() {
+        Some(s.viewer_origin)
+    } else {
+        None
+    };
+    // Stages requested for unload this frame, applied after the egui block to
+    // avoid borrow conflicts.
+    let mut copc_unload_request: Option<usize> = None;
+    let mut stage_unload_request: Option<usize> = None;
+    // File paths queued for loading. Populated by the drag-and-drop handler
+    // and by the "Open file…" button; drained at the top of each frame.
+    let mut pending_loads: Vec<String> = Vec::new();
+
     loop {
         //println!("{} {}",yaw,pitch);
         //println!("{}",app_mode.label());
         let delta = get_frame_time();
+
+        // ---- Collect drag-and-dropped files into the load queue ----
+        // (DnD only works on X11/XWayland; on Wayland use the "Open file…" button.)
+        for df in get_dropped_files() {
+            if let Some(path) = df.path {
+                pending_loads.push(path.to_string_lossy().to_string());
+            }
+        }
+
+        // ---- Drain the pending-load queue ----
+        for path_str in pending_loads.drain(..) {
+            let header = match las::Reader::from_path(&path_str) {
+                Ok(r) => r.header().clone(),
+                Err(e) => { error!("Cannot open file {}: {}", path_str, e); continue; }
+            };
+            let is_copc = header.copc_info_vlr().is_some();
+            // Seed the session's viewer origin from the first load; reuse
+            // afterwards so every stage lives in the same coordinate space.
+            let origin = pinned_viewer_origin.unwrap_or_else(|| {
+                let b = header.bounds();
+                let o = [b.min.x, b.min.y, b.min.z];
+                info!("Pinning viewer origin to first loaded file: {:?}", o);
+                let dx = (b.max.x - b.min.x) as f32;
+                let dy = (b.max.y - b.min.y) as f32;
+                let dz = (b.max.z - b.min.z) as f32;
+                if data_extent_x <= 100.5 && data_extent_y <= 100.5 {
+                    data_extent_x = dx.max(1.0);
+                    data_extent_y = dy.max(1.0);
+                }
+                if height_range <= 100.5 { height_range = dz.max(1.0); }
+                data_offset = o;
+                o
+            });
+            pinned_viewer_origin = Some(origin);
+            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+            if is_copc {
+                let cs = CopcStage::new(ctx, &path_str, Some(origin), color_mode, class_defs.clone());
+                info!("Loaded COPC file: {}", path_str);
+                copc_stages.push(cs);
+            } else {
+                let s = Stage::new(ctx, &path_str, Some(origin), color_mode, class_defs.clone());
+                info!("Loaded LAZ file: {}", path_str);
+                stages.push(s);
+            }
+        }
+
+        // ---- Apply any pending unload requests from last frame's UI ----
+        if let Some(idx) = copc_unload_request.take()
+            && idx < copc_stages.len()
+        {
+            let cs = copc_stages.remove(idx);
+            info!("Unloading COPC file: {}", cs.filepath);
+            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+            cs.unload(ctx);
+            section_data = None;
+            copc_section_raw = None;
+        }
+        if let Some(idx) = stage_unload_request.take()
+            && idx < stages.len()
+        {
+            let s = stages.remove(idx);
+            info!("Unloading LAZ file: {}", s.filepath);
+            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+            s.unload(ctx);
+            section_data = None;
+            // Picked point may reference an unloaded stage.
+            if let Some((si, _)) = picked_point && si >= stages.len() {
+                picked_point = None;
+            }
+        }
 
         if is_key_pressed(KeyCode::Escape) {
             if app_mode != AppMode::View3D {
@@ -725,7 +821,7 @@ async fn main() {
                     let mut gl = unsafe { get_internal_gl() };
                     gl.flush();
                     gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
-                    if let Some(ref stg) = stage {
+                    if let Some(stg) = stages.first() {
                         stg.draw_section(&mut *gl.quad_context, sec, &section_mvp, point_size);
                     } else if let Some(ref mgr) = tile_mgr {
                         mgr.draw_section(&mut *gl.quad_context, sec, &section_mvp, point_size);
@@ -905,7 +1001,7 @@ async fn main() {
             if color_mode != prev_color_mode &&
                 let (Some(start), Some(end)) = (section_start, section_end) {
                     let gl = unsafe { get_internal_gl() };
-                    if let Some(ref stg) = stage {
+                    if let Some(stg) = stages.first() {
                         section_data = Some(stg.extract_section(
                             &mut *gl.quad_context, start, end, section_depth, color_mode,
                         ));
@@ -1054,8 +1150,8 @@ async fn main() {
             draw_line_3d(a, b, WHITE);
         }
 
-        // ---- Single-file mode rendering ----
-        if let Some(ref stg) = stage {
+        // ---- Single-file (multi-Stage) mode rendering ----
+        if !stages.is_empty() {
             // Section preview
             match app_mode {
                 AppMode::SectionPickEnd => {
@@ -1075,7 +1171,7 @@ async fn main() {
                 _ => {}
             }
 
-            // Render points (with optional EDL post-process)
+            // Render points across all stages (with optional EDL post-process)
             let drawn = {
                 let mut gl = unsafe { get_internal_gl() };
                 gl.flush();
@@ -1089,7 +1185,9 @@ async fn main() {
                 } else {
                     gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
                 }
-                let drawn = stg.draw_visible(&mut *gl.quad_context, &view_proj, point_size);
+                let drawn: i32 = stages.iter()
+                    .map(|s| s.draw_visible(&mut *gl.quad_context, &view_proj, point_size))
+                    .sum();
                 if edl_enabled {
                     edl_renderer.apply(&mut *gl.quad_context, edl_strength);
                 } else {
@@ -1113,8 +1211,9 @@ async fn main() {
 
             // egui UI
             let prev_color_mode = color_mode;
-            let single_override_before = stage.as_ref().and_then(|s| s.rgb_override);
-            let mut new_single_override = single_override_before;
+            let overrides_before: Vec<Option<[f32; 3]>> =
+                stages.iter().map(|s| s.rgb_override).collect();
+            let mut new_overrides = overrides_before.clone();
             let mut egui_wants_pointer = false;
             let mut do_zoom_all = false;
             egui_macroquad::ui(|egui_ctx| {
@@ -1205,31 +1304,67 @@ async fn main() {
                             }
                         });
                         if color_mode == ColorMode::Rgb {
-                            ui.horizontal(|ui| {
-                                ui.label("Override color:");
-                                let mut enabled = new_single_override.is_some();
-                                if ui.checkbox(&mut enabled, "").changed() {
-                                    new_single_override = if enabled { Some([1.0, 1.0, 1.0]) } else { None };
-                                }
-                                if let Some(ref mut ov) = new_single_override {
-                                    let mut c32 = rgb_arr_to_egui(*ov);
-                                    if ui.color_edit_button_srgba(&mut c32).changed() {
-                                        *ov = egui_to_rgb_arr(c32);
+                            for (i, ov) in new_overrides.iter_mut().enumerate() {
+                                let label = if stages.len() > 1 {
+                                    format!("Cloud {} override:", i + 1)
+                                } else {
+                                    "Override color:".to_string()
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(&label);
+                                    let mut enabled = ov.is_some();
+                                    if ui.checkbox(&mut enabled, "").changed() {
+                                        *ov = if enabled { Some([1.0, 1.0, 1.0]) } else { None };
                                     }
-                                }
-                            });
+                                    if let Some(c) = ov {
+                                        let mut c32 = rgb_arr_to_egui(*c);
+                                        if ui.color_edit_button_srgba(&mut c32).changed() {
+                                            *c = egui_to_rgb_arr(c32);
+                                        }
+                                    }
+                                });
+                            }
                         }
+                        let total_points: i32 = stages.iter().map(|s| s.total_points).sum();
+                        let total_chunks: usize = stages.iter().map(|s| s.chunks.len()).sum();
                         ui.label(format!(
                             "{}/{} points | {} chunks | FPS: {:.0} | zoom: {:.1}",
-                            drawn, stg.total_points, stg.chunks.len(),
+                            drawn, total_points, total_chunks,
                             1.0 / get_frame_time(), ortho_scale
                         ));
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Loaded files:");
+                            if ui.button("Open file…").clicked()
+                                && let Some(paths) = rfd::FileDialog::new()
+                                    .add_filter("LAS / LAZ", &["laz", "las"])
+                                    .pick_files()
+                            {
+                                for p in paths {
+                                    pending_loads.push(p.to_string_lossy().to_string());
+                                }
+                            }
+                        });
+                        for (i, s) in stages.iter().enumerate() {
+                            let name = std::path::Path::new(&s.filepath)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| s.filepath.clone());
+                            ui.horizontal(|ui| {
+                                if ui.button("Unload").clicked() {
+                                    stage_unload_request = Some(i);
+                                }
+                                ui.label(name);
+                            });
+                        }
                         if app_mode == AppMode::SectionAdjustDepth {
                             ui.label(format!("Section depth: {:.1}m", section_depth));
                         }
                         if let (Some(a), Some(b)) = (measure_a, measure_b) {
+                            // All stages share `data_offset` as the viewer origin,
+                            // so measure positions translate back to world coords with it.
                             let off = glam::Vec3::new(
-                                stg.cloud.min[0] as f32, stg.cloud.min[1] as f32, stg.cloud.min[2] as f32,
+                                data_offset[0] as f32, data_offset[1] as f32, data_offset[2] as f32,
                             );
                             let wa = a + off;
                             let wb = b + off;
@@ -1249,9 +1384,11 @@ async fn main() {
                             ui.separator();
                             ui.label("A set — click point B");
                         }
-                        if let Some(idx) = picked_point {
+                        if let Some((si, idx)) = picked_point
+                            && let Some(s) = stages.get(si)
+                            && let Some(p) = s.cloud.points.get(idx)
+                        {
                             ui.separator();
-                            let p = &stg.cloud.points[idx];
                             ui.label("Point Info:");
                             ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
                             ui.label(format!("  Intensity: {}", p.intensity));
@@ -1278,11 +1415,30 @@ async fn main() {
                     - front * (data_extent_x.max(data_extent_y) * 2.0);
             }
 
+            // Helper closure: find nearest point across all stages, returning
+            // (stage_idx, point_idx) plus the viewer-space position.
+            let pick_across = |view_proj: &glam::Mat4, mx: f32, my: f32| -> Option<(usize, usize)> {
+                let mut best: Option<(usize, usize, f32)> = None;
+                for (si, s) in stages.iter().enumerate() {
+                    if let Some(idx) = s.find_nearest_point(view_proj, mx, my, screen_width(), screen_height()) {
+                        let pos = s.positions[idx];
+                        let p = *view_proj * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
+                        let ndc_x = mx / screen_width() * 2.0 - 1.0;
+                        let ndc_y = 1.0 - my / screen_height() * 2.0;
+                        let d = (p.x / p.w - ndc_x).powi(2) + (p.y / p.w - ndc_y).powi(2);
+                        if best.map_or(true, |(_, _, bd)| d < bd) {
+                            best = Some((si, idx, d));
+                        }
+                    }
+                }
+                best.map(|(si, idx, _)| (si, idx))
+            };
+
             // Handle clicks
             if !egui_wants_pointer && is_mouse_button_pressed(MouseButton::Left) {
                 match app_mode {
                     AppMode::PointPick => {
-                        picked_point = stg.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height());
+                        picked_point = pick_across(&view_proj, mx, my);
                     }
                     AppMode::SectionPickStart => {
                         if let Some(world) = cursor_world {
@@ -1297,9 +1453,10 @@ async fn main() {
                         }
                     }
                     AppMode::SectionAdjustDepth => {
+                        // Section currently extracts only from the first stage.
                         if let (Some(start), Some(end)) = (section_start, section_end) {
                             let gl = unsafe { get_internal_gl() };
-                            let sec = stg.extract_section(
+                            let sec = stages[0].extract_section(
                                 &mut *gl.quad_context, start, end, section_depth, color_mode,
                             );
                             section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
@@ -1309,15 +1466,15 @@ async fn main() {
                         }
                     }
                     AppMode::MeasureFirst => {
-                        if let Some(idx) = stg.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
-                            measure_a = Some(glam::Vec3::from(stg.positions[idx]));
+                        if let Some((si, idx)) = pick_across(&view_proj, mx, my) {
+                            measure_a = Some(glam::Vec3::from(stages[si].positions[idx]));
                             measure_b = None;
                             app_mode = AppMode::MeasureSecond;
                         }
                     }
                     AppMode::MeasureSecond => {
-                        if let Some(idx) = stg.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
-                            measure_b = Some(glam::Vec3::from(stg.positions[idx]));
+                        if let Some((si, idx)) = pick_across(&view_proj, mx, my) {
+                            measure_b = Some(glam::Vec3::from(stages[si].positions[idx]));
                         }
                     }
                     AppMode::View3D => {
@@ -1327,18 +1484,18 @@ async fn main() {
                 }
             }
 
-            if color_mode != prev_color_mode &&
-                let Some(ref mut stg) = stage {
-                    let gl = unsafe { get_internal_gl() };
-                    stg.rebuild_colors(&mut *gl.quad_context, color_mode);
-
+            if color_mode != prev_color_mode {
+                let gl = unsafe { get_internal_gl() };
+                for s in stages.iter_mut() {
+                    s.rebuild_colors(&mut *gl.quad_context, color_mode);
+                }
             }
-            if new_single_override != single_override_before &&
-                let Some(ref mut stg) = stage {
-                    stg.rgb_override = new_single_override;
+            for (i, ov) in new_overrides.iter().enumerate() {
+                if *ov != overrides_before[i] {
+                    stages[i].rgb_override = *ov;
                     let gl = unsafe { get_internal_gl() };
-                    stg.rebuild_colors(&mut *gl.quad_context, color_mode);
-
+                    stages[i].rebuild_colors(&mut *gl.quad_context, color_mode);
+                }
             }
         }
 
@@ -1528,6 +1685,31 @@ async fn main() {
                             drawn, total_pts, total_nodes, target_depth, total_inflight,
                             1.0 / get_frame_time(),
                         ));
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Loaded COPC files:");
+                            if ui.button("Open file…").clicked()
+                                && let Some(paths) = rfd::FileDialog::new()
+                                    .add_filter("LAS / LAZ", &["laz", "las"])
+                                    .pick_files()
+                            {
+                                for p in paths {
+                                    pending_loads.push(p.to_string_lossy().to_string());
+                                }
+                            }
+                        });
+                        for (i, cs) in copc_stages.iter().enumerate() {
+                            let name = std::path::Path::new(&cs.filepath)
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| cs.filepath.clone());
+                            ui.horizontal(|ui| {
+                                if ui.button("Unload").clicked() {
+                                    copc_unload_request = Some(i);
+                                }
+                                ui.label(name);
+                            });
+                        }
                         if let (Some(a), Some(b)) = (measure_a, measure_b) {
                             let vo = copc_stages[0].viewer_origin;
                             let off = glam::Vec3::new(vo[0] as f32, vo[1] as f32, vo[2] as f32);
@@ -2072,6 +2254,29 @@ async fn main() {
             set_camera(&camera);
             polylines::draw_3d(&poly_files);
             set_default_camera();
+        }
+
+        // ---- Empty state: no data loaded ----
+        // Show a minimal Controls window so the user knows how to load files.
+        if stages.is_empty() && copc_stages.is_empty() && tile_mgr.is_none() {
+            egui_macroquad::ui(|egui_ctx| {
+                egui_macroquad::egui::Window::new("Controls")
+                    .default_pos([10.0, 10.0])
+                    .show(egui_ctx, |ui| {
+                        ui.label("No point cloud loaded.");
+                        if ui.button("Open file…").clicked()
+                            && let Some(paths) = rfd::FileDialog::new()
+                                .add_filter("LAS / LAZ", &["laz", "las"])
+                                .pick_files()
+                        {
+                            for p in paths {
+                                pending_loads.push(p.to_string_lossy().to_string());
+                            }
+                        }
+                        ui.label("…or drag a .laz / .copc.laz file onto the window (X11 only).");
+                    });
+            });
+            egui_macroquad::draw();
         }
 
         next_frame().await

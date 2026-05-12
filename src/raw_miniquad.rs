@@ -138,10 +138,16 @@
 
     pub struct Stage {
         pipeline: Pipeline,
+        /// Source file path — used as the UI label and to identify the stage.
+        pub filepath: String,
         pub chunks: Vec<Chunk>,
         pub total_points: i32,
         pub cloud: VizPointcloud,
         pub positions: Vec<[f32; 3]>,
+        /// Origin used to convert world coords → viewer-space `positions`.
+        /// In single-file mode this equals `cloud.min`; in multi-stage mode all
+        /// stages share one origin so they live in the same coordinate space.
+        pub viewer_origin: [f64; 3],
         pub class_defs: Option<ClassDefs>,
         pub rgb_override: Option<[f32; 3]>,
     }
@@ -378,20 +384,28 @@
     }
 
     impl Stage {
-        pub fn new(ctx: &mut dyn RenderingBackend, filename: &str, color_mode: ColorMode, class_defs: Option<ClassDefs>) -> Stage {
+        pub fn new(
+            ctx: &mut dyn RenderingBackend,
+            filename: &str,
+            viewer_origin: Option<[f64; 3]>,
+            color_mode: ColorMode,
+            class_defs: Option<ClassDefs>,
+        ) -> Stage {
             let cloud = VizPointcloud::load(filename);
 
             let height_range = (cloud.max[2] - cloud.min[2]) as f32;
             let intensity_range = (cloud.intensity_max - cloud.intensity_min) as f32;
             let time_range = (cloud.time_max - cloud.time_min) as f32;
 
+            let viewer_origin = viewer_origin.unwrap_or(cloud.min);
+
             let positions: Vec<[f32; 3]> = cloud
                 .points
                 .iter()
                 .map(|p| [
-                    (p.x - cloud.min[0]) as f32,
-                    (p.y - cloud.min[1]) as f32,
-                    (p.z - cloud.min[2]) as f32,
+                    (p.x - viewer_origin[0]) as f32,
+                    (p.y - viewer_origin[1]) as f32,
+                    (p.z - viewer_origin[2]) as f32,
                 ])
                 .collect();
 
@@ -414,12 +428,22 @@
 
             Stage {
                 pipeline,
+                filepath: filename.to_string(),
                 chunks,
                 total_points,
                 cloud,
                 positions,
+                viewer_origin,
                 class_defs,
                 rgb_override: None,
+            }
+        }
+
+        /// Free all GPU buffers held by this stage. Consumes the stage.
+        pub fn unload(mut self, ctx: &mut dyn RenderingBackend) {
+            for chunk in self.chunks.drain(..) {
+                ctx.delete_buffer(chunk.bindings.vertex_buffers[0]);
+                ctx.delete_buffer(chunk.bindings.index_buffer);
             }
         }
 
@@ -1199,6 +1223,8 @@
 
     pub struct CopcStage {
         pipeline: Pipeline,
+        /// Source file path — used as the UI label and to identify the stage.
+        pub filepath: String,
         /// Root spacing in metres (halved at each level)
         pub spacing: f64,
         entries: Vec<CopcEntry>,
@@ -1360,6 +1386,7 @@
 
             let mut stage = CopcStage {
                 pipeline,
+                filepath: filepath.to_string(),
                 spacing,
                 entries,
                 loaded_nodes: HashMap::new(),
@@ -1618,6 +1645,19 @@
 
         pub fn total_loaded_points(&self) -> i32 {
             self.loaded_nodes.values().map(|n| n.total_points).sum()
+        }
+
+        /// Free all GPU buffers held by this stage and shut down the loader pool.
+        /// Consumes the stage; the loader threads exit when `load_tx` drops and
+        /// their `recv()` returns `Err`.
+        pub fn unload(mut self, ctx: &mut dyn RenderingBackend) {
+            for (_, node) in self.loaded_nodes.drain() {
+                for chunk in node.chunks {
+                    ctx.delete_buffer(chunk.bindings.vertex_buffers[0]);
+                    ctx.delete_buffer(chunk.bindings.index_buffer);
+                }
+            }
+            // `self` drops here, which drops `load_tx`, signalling workers to exit.
         }
 
         pub fn loaded_node_count(&self) -> usize {
