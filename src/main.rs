@@ -709,6 +709,10 @@ async fn main() {
                 Err(e) => { error!("Cannot open file {}: {}", path_str, e); continue; }
             };
             let is_copc = header.copc_info_vlr().is_some();
+            // A drop into a previously-empty viewer should also re-fit the camera;
+            // otherwise the default startup framing (sized for the 100×100 placeholder
+            // extents) leaves the new data way off-screen until the user clicks Zoom All.
+            let was_empty = pinned_viewer_origin.is_none();
             // Seed the session's viewer origin from the first load; reuse
             // afterwards so every stage lives in the same coordinate space.
             let origin = pinned_viewer_origin.unwrap_or_else(|| {
@@ -736,6 +740,13 @@ async fn main() {
                 let s = Stage::new(ctx, &path_str, Some(origin), color_mode, class_defs.clone());
                 info!("Loaded LAZ file: {}", path_str);
                 stages.push(s);
+            }
+            if was_empty {
+                let aspect = screen_width() / screen_height().max(1.0);
+                ortho_scale = (data_extent_y * 0.5).max(data_extent_x * 0.5 / aspect) * 1.05;
+                position = vec3(data_extent_x * 0.5, data_extent_y * 0.5, height_range * 0.5)
+                    - front * (data_extent_x.max(data_extent_y) * 2.0);
+                orbit_pivot = vec3(data_extent_x * 0.5, data_extent_y * 0.5, height_range * 0.5);
             }
         }
 

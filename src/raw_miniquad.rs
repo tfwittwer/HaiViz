@@ -1255,6 +1255,67 @@
         generation: u64,
     }
 
+    /// Flat snapshot of one COPC hierarchy entry: a leaf pointing at a data chunk.
+    struct RawCopcEntry {
+        key: VoxelKey,
+        offset: u64,
+        byte_size: i32,
+        point_count: i32,
+    }
+
+    /// Walk the COPC hierarchy EVLR recursively and return every leaf entry
+    /// (point_count > 0). The `las` 0.9 crate's `CopcEntryReader::hierarchy_entries`
+    /// only resolves one level of sub-pages, so files written with deeply nested
+    /// pages (e.g. copc-converter, which boundaries every 3 octree levels) appear
+    /// to contain only a handful of coarse-LOD nodes. We bypass it by parsing the
+    /// raw EVLR bytes ourselves and following page pointers to any depth.
+    fn read_full_hierarchy(reader: &CopcEntryReader<BufReader<File>>) -> Vec<RawCopcEntry> {
+        let header = reader.header();
+        let Some(info_vlr) = header.vlrs().iter().find(|v| v.is_copc_info()) else {
+            return Vec::new();
+        };
+        // CopcInfo VLR payload layout (160 bytes): the page-table fields we need are
+        //   root_hier_offset: u64 @ byte 40,  root_hier_size: u64 @ byte 48.
+        // These are private on las::copc::CopcInfoVlr so we read them from the raw payload.
+        if info_vlr.data.len() < 56 { return Vec::new(); }
+        let root_hier_offset = u64::from_le_bytes(info_vlr.data[40..48].try_into().unwrap());
+        let root_hier_size = u64::from_le_bytes(info_vlr.data[48..56].try_into().unwrap());
+
+        let Some(hier_vlr) = header.evlrs().iter().find(|v| v.is_copc_hierarchy()) else {
+            return Vec::new();
+        };
+        let data = &hier_vlr.data;
+
+        let mut out = Vec::new();
+        let mut stack: Vec<(u64, u64)> = vec![(root_hier_offset, root_hier_size)];
+        while let Some((page_offset, page_size)) = stack.pop() {
+            // Page pointer offsets are absolute file offsets; the EVLR payload begins
+            // at root_hier_offset (the writer lays the root page first in the EVLR data,
+            // and all sub-pages live in the same payload).
+            let Some(start) = page_offset.checked_sub(root_hier_offset).map(|v| v as usize) else { continue; };
+            let end = start.saturating_add(page_size as usize);
+            if end > data.len() { continue; }
+            for chunk in data[start..end].chunks_exact(32) {
+                let l = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
+                let x = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                let y = i32::from_le_bytes(chunk[8..12].try_into().unwrap());
+                let z = i32::from_le_bytes(chunk[12..16].try_into().unwrap());
+                let offset = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
+                let byte_size = i32::from_le_bytes(chunk[24..28].try_into().unwrap());
+                let point_count = i32::from_le_bytes(chunk[28..32].try_into().unwrap());
+                if point_count == -1 {
+                    stack.push((offset, byte_size as u64));
+                } else if point_count > 0 {
+                    out.push(RawCopcEntry {
+                        key: VoxelKey { l, x, y, z },
+                        offset, byte_size, point_count,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Compute (xmin,ymin,zmin,xmax,ymax,zmax) for a VoxelKey given COPC octree params.
     fn voxel_bounds(key: &VoxelKey, cx: f64, cy: f64, cz: f64, halfsize: f64) -> (f64, f64, f64, f64, f64, f64) {
         let root_min_x = cx - halfsize;
@@ -1349,11 +1410,9 @@
             let global_max = [bounds.max.x, bounds.max.y, bounds.max.z];
             let viewer_origin = viewer_origin.unwrap_or(global_min);
 
-            let hier_entries = reader.hierarchy_entries()
-                .expect("No COPC hierarchy");
+            let hier_entries = read_full_hierarchy(&reader);
 
             let entries: Vec<CopcEntry> = hier_entries.iter()
-                .filter(|e| e.point_count > 0)
                 .map(|e| {
                     let (xmin, ymin, zmin, xmax, ymax, zmax) =
                         voxel_bounds(&e.key, cx, cy, cz, halfsize);
@@ -1369,10 +1428,24 @@
 
             let max_level = entries.iter().map(|e| e.key.l).max().unwrap_or(0);
 
+            // Normalise `spacing` to the spec convention (root-level spacing,
+            // halved at each octree level). The COPC spec says the field IS the
+            // root spacing, but copc-converter writes the finest-level voxel
+            // size instead (halfsize / 2^max_depth). Detect that case: if
+            // scaling the written value up by 2^max_depth still fits inside
+            // the root cube it must have been a fine-level value; otherwise
+            // trust it as-is.
+            let scaled = spacing * (1u64 << max_level) as f64;
+            let root_spacing = if max_level > 0 && scaled <= halfsize * 2.0 {
+                scaled
+            } else {
+                spacing
+            };
+
             info!(
-                "COPC: {} entries (max depth {}), root spacing {:.2}m, \
+                "COPC: {} entries (max depth {}), spacing {:.4}m (root {:.2}m), \
                  bounds x {:.1}..{:.1}  y {:.1}..{:.1}  z {:.1}..{:.1}",
-                entries.len(), max_level, spacing,
+                entries.len(), max_level, spacing, root_spacing,
                 global_min[0], global_max[0],
                 global_min[1], global_max[1],
                 global_min[2], global_max[2],
@@ -1387,7 +1460,7 @@
             let mut stage = CopcStage {
                 pipeline,
                 filepath: filepath.to_string(),
-                spacing,
+                spacing: root_spacing,
                 entries,
                 loaded_nodes: HashMap::new(),
                 global_min,
