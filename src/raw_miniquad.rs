@@ -504,14 +504,15 @@
             }
         }
 
-        pub fn extract_section(
+        /// Extract section vertices for this stage (no GPU upload), so several
+        /// stages can be combined into a single SectionData.
+        pub fn extract_section_verts(
             &self,
-            ctx: &mut dyn RenderingBackend,
             start: (f32, f32),
             end: (f32, f32),
             depth: f32,
             color_mode: ColorMode,
-        ) -> SectionData {
+        ) -> (Vec<Vertex>, f32, f32, f32) {
             let dx = end.0 - start.0;
             let dy = end.1 - start.1;
             let len = (dx * dx + dy * dy).sqrt();
@@ -543,34 +544,7 @@
                 }
             }
 
-            let num_points = section_verts.len() as i32;
-            info!("Section: {:.1}m long, {:.1}m depth, {} points, height {:.1}..{:.1}m",
-                len, depth, num_points, h_min, h_max);
-
-            let vertex_buffer = ctx.new_buffer(
-                BufferType::VertexBuffer,
-                BufferUsage::Immutable,
-                BufferSource::slice(&section_verts),
-            );
-            let indices: Vec<u32> = (0..num_points as u32).collect();
-            let index_buffer = ctx.new_buffer(
-                BufferType::IndexBuffer,
-                BufferUsage::Immutable,
-                BufferSource::slice(&indices),
-            );
-
-            SectionData {
-                bindings: Bindings {
-                    vertex_buffers: vec![vertex_buffer],
-                    index_buffer,
-                    images: vec![],
-                },
-                num_points,
-                length: len,
-                height_min: h_min,
-                height_max: h_max,
-                height_range: self.height_range(),
-            }
+            (section_verts, len, h_min, h_max)
         }
 
         pub fn draw_section(&self, ctx: &mut dyn RenderingBackend, section: &SectionData, mvp: &glam::Mat4, point_size: f32) {
@@ -1916,6 +1890,34 @@
             height_max,
             height_range,
         }
+    }
+
+    /// Build one combined `SectionData` from all manually-loaded raw `Stage`s,
+    /// so a cross section shows every loaded cloud, not just the first.
+    pub fn build_section_from_stages(
+        ctx: &mut dyn RenderingBackend,
+        stages: &[Stage],
+        start: (f32, f32),
+        end: (f32, f32),
+        depth: f32,
+        color_mode: ColorMode,
+    ) -> SectionData {
+        let height_range = stages.first().map(|s| s.height_range()).unwrap_or(1.0);
+        let mut all_verts = Vec::new();
+        let (mut h_min, mut h_max) = (f32::MAX, f32::MIN);
+        let mut length = 0.0_f32;
+        for s in stages {
+            let (verts, len, hmin, hmax) = s.extract_section_verts(start, end, depth, color_mode);
+            all_verts.extend(verts);
+            h_min = h_min.min(hmin);
+            h_max = h_max.max(hmax);
+            length = length.max(len);
+        }
+        let h_min = if h_min == f32::MAX { 0.0 } else { h_min };
+        let h_max = if h_max == f32::MIN { 0.0 } else { h_max };
+        info!("Section: {:.1}m long, {:.1}m depth, {} points, height {:.1}..{:.1}m",
+            length, depth, all_verts.len(), h_min, h_max);
+        make_section_data(ctx, all_verts, length, h_min, h_max, height_range)
     }
 
     /// Rebuild a combined COPC `SectionData` from cached raw point data with a new colour mode.

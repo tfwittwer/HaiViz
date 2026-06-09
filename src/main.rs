@@ -7,7 +7,7 @@ use crate::glam::vec3;
 
 use macroquad::prelude::*;
 
-use crate::raw_miniquad::{CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, build_section_from_raw_stages, load_class_defs, make_section_data, scan_dir_for_copc};
+use crate::raw_miniquad::{CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, build_section_from_raw_stages, build_section_from_stages, load_class_defs, make_section_data, scan_dir_for_copc};
 use las::Point as LasPoint;
 
 const MOVE_SPEED: f32 = 0.5;
@@ -457,6 +457,42 @@ fn conf() -> Conf {
  }
 }
 
+/// Axis-aligned bounding box of all currently-loaded data, expressed in viewer
+/// space (world coordinates minus each source's viewer origin). Returns None when
+/// nothing is loaded. Used by "Zoom All" so it frames the actual data wherever it
+/// sits, instead of assuming it starts at the (possibly stale) viewer origin.
+fn loaded_aabb_viewer(
+    stages: &[Stage],
+    copc_stages: &[CopcStage],
+    tile_mgr: &Option<TileStageManager>,
+) -> Option<(Vec3, Vec3)> {
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    let mut any = false;
+    for s in stages {
+        for k in 0..3 {
+            lo[k] = lo[k].min((s.cloud.min[k] - s.viewer_origin[k]) as f32);
+            hi[k] = hi[k].max((s.cloud.max[k] - s.viewer_origin[k]) as f32);
+        }
+        any = true;
+    }
+    for c in copc_stages {
+        for k in 0..3 {
+            lo[k] = lo[k].min((c.global_min[k] - c.viewer_origin[k]) as f32);
+            hi[k] = hi[k].max((c.global_max[k] - c.viewer_origin[k]) as f32);
+        }
+        any = true;
+    }
+    if let Some(m) = tile_mgr {
+        for k in 0..3 {
+            lo[k] = lo[k].min((m.global_min[k] - m.global_min[k]) as f32);
+            hi[k] = hi[k].max((m.global_max[k] - m.global_min[k]) as f32);
+        }
+        any = true;
+    }
+    if any { Some((Vec3::from(lo), Vec3::from(hi))) } else { None }
+}
+
 #[macroquad::main(conf)]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -689,17 +725,37 @@ async fn main() {
     // and by the "Open file…" button; drained at the top of each frame.
     let mut pending_loads: Vec<String> = Vec::new();
 
+    // Windows-only: number of entries already taken from miniquad's drop list
+    // (the list only grows on Windows, so we track how many we've consumed).
+    #[cfg(target_os = "windows")]
+    let mut last_dropped_count: usize = 0;
+
     loop {
         //println!("{} {}",yaw,pitch);
         //println!("{}",app_mode.label());
         let delta = get_frame_time();
 
         // ---- Collect drag-and-dropped files into the load queue ----
-        // (DnD only works on X11/XWayland; on Wayland use the "Open file…" button.)
+        // On X11/XWayland/wasm miniquad fires files_dropped_event, so this works.
+        // On Wayland use the "Open file…" button.
         for df in get_dropped_files() {
             if let Some(path) = df.path {
                 pending_loads.push(path.to_string_lossy().to_string());
             }
+        }
+        // On Windows, miniquad 0.4 records dropped files (DragAcceptFiles is enabled)
+        // but never calls files_dropped_event nor clears its list, so get_dropped_files
+        // stays empty. Poll miniquad's global drop list directly and take only the
+        // entries appended since last frame.
+        #[cfg(target_os = "windows")]
+        {
+            let count = miniquad::window::dropped_file_count();
+            for i in last_dropped_count..count {
+                if let Some(path) = miniquad::window::dropped_file_path(i) {
+                    pending_loads.push(path.to_string_lossy().to_string());
+                }
+            }
+            last_dropped_count = count;
         }
 
         // ---- Drain the pending-load queue ----
@@ -773,6 +829,17 @@ async fn main() {
             if let Some((si, _)) = picked_point && si >= stages.len() {
                 picked_point = None;
             }
+        }
+
+        // If everything has been unloaded, forget the pinned coordinate frame and
+        // reset the placeholder extents. The next load then re-pins the viewer origin
+        // to the new data's location and re-fits the camera (the `was_empty` path),
+        // so loading clouds in a different place frames correctly.
+        if stages.is_empty() && copc_stages.is_empty() && tile_mgr.is_none() {
+            pinned_viewer_origin = None;
+            data_extent_x = 100.0;
+            data_extent_y = 100.0;
+            height_range = 100.0;
         }
 
         if is_key_pressed(KeyCode::Escape) {
@@ -1012,9 +1079,9 @@ async fn main() {
             if color_mode != prev_color_mode &&
                 let (Some(start), Some(end)) = (section_start, section_end) {
                     let gl = unsafe { get_internal_gl() };
-                    if let Some(stg) = stages.first() {
-                        section_data = Some(stg.extract_section(
-                            &mut *gl.quad_context, start, end, section_depth, color_mode,
+                    if !stages.is_empty() {
+                        section_data = Some(build_section_from_stages(
+                            &mut *gl.quad_context, &stages, start, end, section_depth, color_mode,
                         ));
                     } else if !copc_stages.is_empty() {
                         if let Some((ref per_stage_raw, length, h_min, h_max)) = copc_section_raw {
@@ -1419,11 +1486,15 @@ async fn main() {
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
 
-            if do_zoom_all {
+            if do_zoom_all
+                && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr)
+            {
                 let aspect = screen_width() / screen_height().max(1.0);
-                ortho_scale = (data_extent_y * 0.5).max(data_extent_x * 0.5 / aspect) * 1.05;
-                position = vec3(data_extent_x * 0.5, data_extent_y * 0.5, height_range * 0.5)
-                    - front * (data_extent_x.max(data_extent_y) * 2.0);
+                let center = (lo + hi) * 0.5;
+                let ext = hi - lo;
+                ortho_scale = (ext.y * 0.5).max(ext.x * 0.5 / aspect) * 1.05;
+                position = center - front * (ext.x.max(ext.y) * 2.0);
+                orbit_pivot = center;
             }
 
             // Helper closure: find nearest point across all stages, returning
@@ -1464,11 +1535,11 @@ async fn main() {
                         }
                     }
                     AppMode::SectionAdjustDepth => {
-                        // Section currently extracts only from the first stage.
+                        // Combine verts from all loaded stages into one SectionData.
                         if let (Some(start), Some(end)) = (section_start, section_end) {
                             let gl = unsafe { get_internal_gl() };
-                            let sec = stages[0].extract_section(
-                                &mut *gl.quad_context, start, end, section_depth, color_mode,
+                            let sec = build_section_from_stages(
+                                &mut *gl.quad_context, &stages, start, end, section_depth, color_mode,
                             );
                             section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
                             section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
@@ -1760,11 +1831,15 @@ async fn main() {
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
 
-            if do_zoom_all {
+            if do_zoom_all
+                && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr)
+            {
                 let aspect = screen_width() / screen_height().max(1.0);
-                ortho_scale = (data_extent_y * 0.5).max(data_extent_x * 0.5 / aspect) * 1.05;
-                position = vec3(data_extent_x * 0.5, data_extent_y * 0.5, height_range * 0.5)
-                    - front * (data_extent_x.max(data_extent_y) * 2.0);
+                let center = (lo + hi) * 0.5;
+                let ext = hi - lo;
+                ortho_scale = (ext.y * 0.5).max(ext.x * 0.5 / aspect) * 1.05;
+                position = center - front * (ext.x.max(ext.y) * 2.0);
+                orbit_pivot = center;
             }
 
             // Mouse clicks
@@ -2150,11 +2225,15 @@ async fn main() {
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
 
-            if do_zoom_all {
+            if do_zoom_all
+                && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr)
+            {
                 let aspect = screen_width() / screen_height().max(1.0);
-                ortho_scale = (data_extent_y * 0.5).max(data_extent_x * 0.5 / aspect) * 1.05;
-                position = vec3(data_extent_x * 0.5, data_extent_y * 0.5, height_range * 0.5)
-                    - front * (data_extent_x.max(data_extent_y) * 2.0);
+                let center = (lo + hi) * 0.5;
+                let ext = hi - lo;
+                ortho_scale = (ext.y * 0.5).max(ext.x * 0.5 / aspect) * 1.05;
+                position = center - front * (ext.x.max(ext.y) * 2.0);
+                orbit_pivot = center;
             }
             if do_zoom_selected &&
                 let Some(sel) = selected_tile {
@@ -2284,7 +2363,7 @@ async fn main() {
                                 pending_loads.push(p.to_string_lossy().to_string());
                             }
                         }
-                        ui.label("…or drag a .laz / .copc.laz file onto the window (X11 only).");
+                        ui.label("…or drag a .laz / .copc.laz file onto the window (Windows / X11).");
                     });
             });
             egui_macroquad::draw();
