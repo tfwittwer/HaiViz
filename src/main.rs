@@ -328,6 +328,56 @@ fn draw_section_corridor(
     );
 }
 
+/// Draw the editable height colour-bar endpoints. Shown only when colouring by
+/// height. Values are metres relative to the dataset minimum (0 = lowest point).
+/// Returns `true` if either endpoint was edited this frame.
+fn height_color_controls(
+    ui: &mut egui_macroquad::egui::Ui,
+    color_mode: ColorMode,
+    h_min: &mut f32,
+    h_max: &mut f32,
+) -> bool {
+    use egui_macroquad::egui;
+    if color_mode != ColorMode::Height {
+        return false;
+    }
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("Height color:");
+        changed |= ui
+            .add(egui::DragValue::new(h_min).speed(0.1).max_decimals(2).suffix(" m"))
+            .changed();
+        ui.label("to");
+        changed |= ui
+            .add(egui::DragValue::new(h_max).speed(0.1).max_decimals(2).suffix(" m"))
+            .changed();
+    });
+    changed
+}
+
+/// Push the height colour-bar endpoints onto every loaded data source so the
+/// next colour rebuild uses them.
+fn apply_height_color(
+    stages: &mut [Stage],
+    copc_stages: &mut [CopcStage],
+    tile_mgr: &mut Option<TileStageManager>,
+    h_min: f32,
+    h_max: f32,
+) {
+    for s in stages.iter_mut() {
+        s.color_h_min = h_min;
+        s.color_h_max = h_max;
+    }
+    for cs in copc_stages.iter_mut() {
+        cs.color_h_min = h_min;
+        cs.color_h_max = h_max;
+    }
+    if let Some(mgr) = tile_mgr.as_mut() {
+        mgr.color_h_min = h_min;
+        mgr.color_h_max = h_max;
+    }
+}
+
 /// Format classification label using custom class_defs or default debug format.
 /// Recovers class 12 (Overlap) from the `is_overlap` flag, since the `las` crate
 /// strips it from the classification field per LAS 1.4 semantics.
@@ -584,6 +634,12 @@ async fn main() {
         }
     }
 
+    // Editable height colour-bar endpoints, in metres relative to the dataset
+    // minimum. Default to the full Z span; the stages were constructed with the
+    // same defaults, so no rebuild is needed up front.
+    let mut height_color_min: f32 = 0.0;
+    let mut height_color_max: f32 = height_range;
+
     let mut tile_rgb_overrides: Vec<Option<[f32; 3]>> = if let Some(ref mgr) = tile_mgr {
         vec![None; mgr.tiles.len()]
     } else {
@@ -787,13 +843,25 @@ async fn main() {
                 o
             });
             pinned_viewer_origin = Some(origin);
+            // First load into an empty viewer: reset the colour bar to span the new
+            // data. Subsequent drops keep whatever endpoints the user has set.
+            if was_empty {
+                height_color_min = 0.0;
+                height_color_max = height_range;
+            }
             let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
             if is_copc {
-                let cs = CopcStage::new(ctx, &path_str, Some(origin), color_mode, class_defs.clone());
+                let mut cs = CopcStage::new(ctx, &path_str, Some(origin), color_mode, class_defs.clone());
+                cs.color_h_min = height_color_min;
+                cs.color_h_max = height_color_max;
+                cs.rebuild_colors(ctx, color_mode);
                 info!("Loaded COPC file: {}", path_str);
                 copc_stages.push(cs);
             } else {
-                let s = Stage::new(ctx, &path_str, Some(origin), color_mode, class_defs.clone());
+                let mut s = Stage::new(ctx, &path_str, Some(origin), color_mode, class_defs.clone());
+                s.color_h_min = height_color_min;
+                s.color_h_max = height_color_max;
+                s.rebuild_colors(ctx, color_mode);
                 info!("Loaded LAZ file: {}", path_str);
                 stages.push(s);
             }
@@ -977,6 +1045,7 @@ async fn main() {
             }
 
             let prev_color_mode = color_mode;
+            let mut height_color_changed = false;
             let mut egui_wants_sec_pointer = false;
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_sec_pointer = egui_ctx.is_pointer_over_area();
@@ -1000,6 +1069,7 @@ async fn main() {
                                     }
                                 });
                         });
+                        height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max);
                         ui.horizontal(|ui| {
                             ui.label("Background:");
                             let mut bg_egui = mq_to_egui(background);
@@ -1076,8 +1146,11 @@ async fn main() {
                 }
             }
 
-            if color_mode != prev_color_mode &&
+            if (color_mode != prev_color_mode || height_color_changed) &&
                 let (Some(start), Some(end)) = (section_start, section_end) {
+                    if height_color_changed {
+                        apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
+                    }
                     let gl = unsafe { get_internal_gl() };
                     if !stages.is_empty() {
                         section_data = Some(build_section_from_stages(
@@ -1289,6 +1362,7 @@ async fn main() {
 
             // egui UI
             let prev_color_mode = color_mode;
+            let mut height_color_changed = false;
             let overrides_before: Vec<Option<[f32; 3]>> =
                 stages.iter().map(|s| s.rgb_override).collect();
             let mut new_overrides = overrides_before.clone();
@@ -1359,6 +1433,7 @@ async fn main() {
                                     }
                                 });
                         });
+                        height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max);
                         ui.horizontal(|ui| {
                             ui.label("Background:");
                             let mut bg_egui = mq_to_egui(background);
@@ -1566,8 +1641,17 @@ async fn main() {
                 }
             }
 
-            if color_mode != prev_color_mode {
+            if color_mode != prev_color_mode || height_color_changed {
                 let gl = unsafe { get_internal_gl() };
+                if height_color_changed {
+                    apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
+                    for cs in copc_stages.iter_mut() {
+                        cs.rebuild_colors(&mut *gl.quad_context, color_mode);
+                    }
+                    if let Some(mgr) = tile_mgr.as_mut() {
+                        mgr.rebuild_colors(&mut *gl.quad_context, color_mode);
+                    }
+                }
                 for s in stages.iter_mut() {
                     s.rebuild_colors(&mut *gl.quad_context, color_mode);
                 }
@@ -1651,6 +1735,7 @@ async fn main() {
 
             // egui UI
             let prev_color_mode = color_mode;
+            let mut height_color_changed = false;
             let mut egui_wants_pointer = false;
             let mut do_zoom_all = false;
             egui_macroquad::ui(|egui_ctx| {
@@ -1707,6 +1792,7 @@ async fn main() {
                                     }
                                 });
                         });
+                        height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max);
                         ui.horizontal(|ui| {
                             ui.label("Background:");
                             let mut bg_egui = mq_to_egui(background);
@@ -1915,8 +2001,17 @@ async fn main() {
                 }
             }
 
-            if color_mode != prev_color_mode {
+            if color_mode != prev_color_mode || height_color_changed {
                 let gl = unsafe { get_internal_gl() };
+                if height_color_changed {
+                    apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
+                    for s in stages.iter_mut() {
+                        s.rebuild_colors(&mut *gl.quad_context, color_mode);
+                    }
+                    if let Some(mgr) = tile_mgr.as_mut() {
+                        mgr.rebuild_colors(&mut *gl.quad_context, color_mode);
+                    }
+                }
                 for cs in copc_stages.iter_mut() {
                     cs.rebuild_colors(&mut *gl.quad_context, color_mode);
                 }
@@ -2035,6 +2130,7 @@ async fn main() {
 
             // egui UI
             let prev_color_mode = color_mode;
+            let mut height_color_changed = false;
             let mut egui_wants_pointer = false;
             let mut request_load: Option<usize> = None;
             let mut request_unload: Option<usize> = None;
@@ -2108,6 +2204,7 @@ async fn main() {
                                     }
                                 });
                         });
+                        height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max);
                         ui.horizontal(|ui| {
                             ui.label("Background:");
                             let mut bg_egui = mq_to_egui(background);
@@ -2322,11 +2419,22 @@ async fn main() {
                 
             }
 
-            if color_mode != prev_color_mode &&
-                let Some(ref mut mgr) = tile_mgr {
-                    let gl = unsafe { get_internal_gl() };
+            if color_mode != prev_color_mode || height_color_changed {
+                let gl = unsafe { get_internal_gl() };
+                if height_color_changed {
+                    for s in stages.iter_mut() {
+                        s.color_h_min = height_color_min;
+                        s.color_h_max = height_color_max;
+                        s.rebuild_colors(&mut *gl.quad_context, color_mode);
+                    }
+                }
+                if let Some(ref mut mgr) = tile_mgr {
+                    if height_color_changed {
+                        mgr.color_h_min = height_color_min;
+                        mgr.color_h_max = height_color_max;
+                    }
                     mgr.rebuild_colors(&mut *gl.quad_context, color_mode);
-
+                }
             }
             if let Some(idx) = tile_override_changed &&
                 let Some(ref mut mgr) = tile_mgr {
