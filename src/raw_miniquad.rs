@@ -45,6 +45,53 @@
         }
     }
 
+    /// Write class definitions to classes.txt in the current directory,
+    /// in the same format `load_class_defs` reads: id;r;g;b;label.
+    pub fn save_class_defs(defs: &ClassDefs) -> std::io::Result<()> {
+        let mut ids: Vec<u8> = defs.keys().copied().collect();
+        ids.sort();
+        let mut out = String::from("# id;r;g;b;label\n");
+        for id in ids {
+            let (label, c) = &defs[&id];
+            out.push_str(&format!(
+                "{};{};{};{};{}\n",
+                id,
+                (c[0] * 255.0).round() as u8,
+                (c[1] * 255.0).round() as u8,
+                (c[2] * 255.0).round() as u8,
+                label,
+            ));
+        }
+        std::fs::write("classes.txt", out)
+    }
+
+    /// Default ASPRS label for a class id, used to seed the class editor for
+    /// ids that have no classes.txt entry.
+    pub fn default_class_label(id: u8) -> String {
+        match id {
+            0 => "Never Classified".to_string(),
+            1 => "Unclassified".to_string(),
+            2 => "Ground".to_string(),
+            3 => "Low Vegetation".to_string(),
+            4 => "Medium Vegetation".to_string(),
+            5 => "High Vegetation".to_string(),
+            6 => "Building".to_string(),
+            7 => "Low Point".to_string(),
+            8 => "Model Key Point".to_string(),
+            9 => "Water".to_string(),
+            10 => "Rail".to_string(),
+            11 => "Road Surface".to_string(),
+            12 => "Overlap Points".to_string(),
+            13 => "Wire Guard".to_string(),
+            14 => "Wire Conductor".to_string(),
+            15 => "Transmission Tower".to_string(),
+            16 => "Wire Structure Connector".to_string(),
+            17 => "Bridge Deck".to_string(),
+            18 => "High Noise".to_string(),
+            _ => format!("Class {}", id),
+        }
+    }
+
     /// Point cloud backed by las::Point for full attribute access.
     pub struct VizPointcloud {
         pub points: Vec<Point>,
@@ -54,6 +101,8 @@
         pub intensity_max: u16,
         pub time_min: f64,
         pub time_max: f64,
+        /// Highest classification id present (class 12 recovered from `is_overlap`).
+        pub max_class: u8,
     }
 
     impl VizPointcloud {
@@ -70,6 +119,7 @@
             let mut intensity_max = u16::MIN;
             let mut time_min = f64::MAX;
             let mut time_max = f64::MIN;
+            let mut max_class: u8 = 0;
 
             for point in &points {
                 min[0] = min[0].min(point.x);
@@ -85,6 +135,9 @@
                     time_min = time_min.min(time);
                     time_max = time_max.max(time);
                 }
+
+                let class_id: u8 = if point.is_overlap { 12 } else { point.classification.into() };
+                max_class = max_class.max(class_id);
             }
 
             // Detect 8-bit colors stored in 16-bit fields (common in older LAS files)
@@ -107,7 +160,7 @@
             info!("{} points loaded from {}", points.len(), filename);
             info!("Intensity range: {}..{}", intensity_min, intensity_max);
             info!("Time range: {}..{}", time_min, time_max);
-            VizPointcloud { points, min, max, intensity_min, intensity_max, time_min, time_max}
+            VizPointcloud { points, min, max, intensity_min, intensity_max, time_min, time_max, max_class }
         }
     }
 
@@ -228,7 +281,7 @@
         }
     }
 
-    fn classification_color(class: u8) -> [f32; 3] {
+    pub fn classification_color(class: u8) -> [f32; 3] {
         match class {
             0 => [0.5, 0.5, 0.5],
             1 => [0.6, 0.6, 0.6],
@@ -739,6 +792,11 @@
             (self.global_max[2] - self.global_min[2]) as f32
         }
 
+        /// Highest classification id present across the currently loaded tiles.
+        pub fn max_class(&self) -> u8 {
+            self.loaded.iter().flatten().map(|lt| lt.cloud.max_class).max().unwrap_or(0)
+        }
+
         /// Tile boundary corners in viewer coordinates (at z=0)
         pub fn tile_corners(&self, idx: usize) -> [(f32, f32); 4] {
             let t = &self.tiles[idx];
@@ -1230,6 +1288,8 @@
         pub time_max: f64,
         pub class_defs: Option<ClassDefs>,
         pub rgb_override: Option<[f32; 3]>,
+        /// Highest classification id seen across all ingested nodes.
+        pub max_class: u8,
         /// Height colour-bar bounds, relative to `global_min[2]`. See `Stage::color_h_min`.
         pub color_h_min: f32,
         pub color_h_max: f32,
@@ -1464,6 +1524,7 @@
                 time_max: f64::MIN,
                 class_defs,
                 rgb_override: None,
+                max_class: 0,
                 color_h_min: 0.0,
                 color_h_max: (global_max[2] - global_min[2]) as f32,
                 in_flight: HashSet::new(),
@@ -1532,6 +1593,9 @@
                 let time = p.gps_time.unwrap_or(0.);
                 self.time_min = self.time_min.min(time);
                 self.time_max = self.time_max.max(time);
+
+                let class_id: u8 = if p.is_overlap { 12 } else { p.classification.into() };
+                self.max_class = self.max_class.max(class_id);
             }
 
             let positions: Vec<[f32; 3]> = pts.iter().map(|p| [

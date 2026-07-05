@@ -7,7 +7,7 @@ use crate::glam::vec3;
 
 use macroquad::prelude::*;
 
-use crate::raw_miniquad::{CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, build_section_from_raw_stages, build_section_from_stages, load_class_defs, make_section_data, scan_dir_for_copc};
+use crate::raw_miniquad::{ClassDefs, CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, build_section_from_raw_stages, build_section_from_stages, classification_color, default_class_label, load_class_defs, make_section_data, save_class_defs, scan_dir_for_copc};
 use las::Point as LasPoint;
 
 const MOVE_SPEED: f32 = 0.5;
@@ -452,6 +452,91 @@ fn polylines_window(
         });
 }
 
+/// Built-in editor for classification labels & colours (classes.txt).
+/// Lists every class id up to the maximum present in the loaded data, plus any
+/// ids already defined beyond that; missing entries are seeded from the default
+/// palette/labels when the window is first opened. Returns `true` when a colour
+/// was edited or the file was reloaded, i.e. when point colours need a rebuild.
+/// Label-only edits update the defs in place and need no rebuild.
+fn classes_window(
+    egui_ctx: &egui_macroquad::egui::Context,
+    class_defs: &mut Option<ClassDefs>,
+    max_class: u8,
+    save_status: &mut Option<String>,
+) -> bool {
+    use egui_macroquad::egui;
+    let mut colors_changed = false;
+    egui::Window::new("Classes")
+        .default_pos([10.0, 400.0])
+        .default_open(false)
+        .show(egui_ctx, |ui| {
+            let mut do_reload = false;
+            {
+                let defs = class_defs.get_or_insert_with(ClassDefs::new);
+                let mut ids: Vec<u8> = (0..=max_class).collect();
+                let mut extra: Vec<u8> = defs.keys().copied().filter(|id| *id > max_class).collect();
+                extra.sort();
+                ids.extend(extra);
+                egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                    for id in ids {
+                        let entry = defs.entry(id).or_insert_with(|| {
+                            (default_class_label(id), classification_color(id))
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{:3}", id));
+                            let mut c32 = rgb_arr_to_egui(entry.1);
+                            if ui.color_edit_button_srgba(&mut c32).changed() {
+                                entry.1 = egui_to_rgb_arr(c32);
+                                colors_changed = true;
+                            }
+                            ui.add(egui::TextEdit::singleline(&mut entry.0).desired_width(160.0));
+                        });
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save classes.txt").clicked() {
+                        *save_status = Some(match save_class_defs(defs) {
+                            Ok(()) => format!("Saved {} classes to classes.txt", defs.len()),
+                            Err(e) => format!("Save failed: {}", e),
+                        });
+                    }
+                    if ui.button("Reload").clicked() {
+                        do_reload = true;
+                    }
+                });
+            }
+            if do_reload {
+                *class_defs = load_class_defs();
+                *save_status = None;
+                colors_changed = true;
+            }
+            if let Some(msg) = save_status {
+                ui.label(msg.as_str());
+            }
+        });
+    colors_changed
+}
+
+/// Push updated class definitions onto every loaded data source so subsequent
+/// colour rebuilds and section extractions use them.
+fn apply_class_defs(
+    stages: &mut [Stage],
+    copc_stages: &mut [CopcStage],
+    tile_mgr: &mut Option<TileStageManager>,
+    class_defs: &Option<ClassDefs>,
+) {
+    for s in stages.iter_mut() {
+        s.class_defs = class_defs.clone();
+    }
+    for cs in copc_stages.iter_mut() {
+        cs.class_defs = class_defs.clone();
+    }
+    if let Some(mgr) = tile_mgr.as_mut() {
+        mgr.class_defs = class_defs.clone();
+    }
+}
+
 fn mq_to_egui(c: Color) -> egui_macroquad::egui::Color32 {
     egui_macroquad::egui::Color32::from_rgba_unmultiplied(
         (c.r * 255.0) as u8, (c.g * 255.0) as u8,
@@ -561,10 +646,12 @@ async fn main() {
     }).unwrap_or(false);
     if is_copc { info!("Detected COPC format"); }
 
-    let class_defs = load_class_defs();
+    let mut class_defs = load_class_defs();
     if let Some(ref cd) = class_defs {
         info!("Custom classes: {:?}", cd.keys().collect::<Vec<_>>());
     }
+    // Status line shown in the Classes editor after a save attempt.
+    let mut classes_save_status: Option<String> = None;
 
     let mut color_mode = ColorMode::Height;
     let mut background: Color = BLACK;
@@ -910,6 +997,13 @@ async fn main() {
             height_range = 100.0;
         }
 
+        // Highest classification id present in the loaded data; the class editor
+        // shows one row per id up to this value.
+        let max_class: u8 = stages.iter().map(|s| s.cloud.max_class)
+            .chain(copc_stages.iter().map(|cs| cs.max_class))
+            .chain(tile_mgr.iter().map(|m| m.max_class()))
+            .max().unwrap_or(0);
+
         if is_key_pressed(KeyCode::Escape) {
             if app_mode != AppMode::View3D {
                 app_mode = AppMode::View3D;
@@ -1047,8 +1141,10 @@ async fn main() {
             let prev_color_mode = color_mode;
             let mut height_color_changed = false;
             let mut egui_wants_sec_pointer = false;
+            let mut class_colors_changed = false;
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_sec_pointer = egui_ctx.is_pointer_over_area();
+                class_colors_changed = classes_window(egui_ctx, &mut class_defs, max_class, &mut classes_save_status);
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
@@ -1146,7 +1242,19 @@ async fn main() {
                 }
             }
 
-            if (color_mode != prev_color_mode || height_color_changed) &&
+            if class_colors_changed {
+                apply_class_defs(&mut stages, &mut copc_stages, &mut tile_mgr, &class_defs);
+                // Recolour the 3D sources too, so the view is up to date when
+                // the user returns from the section to the 3D view.
+                if color_mode == ColorMode::Classification {
+                    let gl = unsafe { get_internal_gl() };
+                    for s in stages.iter_mut() { s.rebuild_colors(&mut *gl.quad_context, color_mode); }
+                    for cs in copc_stages.iter_mut() { cs.rebuild_colors(&mut *gl.quad_context, color_mode); }
+                    if let Some(mgr) = tile_mgr.as_mut() { mgr.rebuild_colors(&mut *gl.quad_context, color_mode); }
+                }
+            }
+            let class_rebuild = class_colors_changed && color_mode == ColorMode::Classification;
+            if (color_mode != prev_color_mode || height_color_changed || class_rebuild) &&
                 let (Some(start), Some(end)) = (section_start, section_end) {
                     if height_color_changed {
                         apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
@@ -1368,8 +1476,10 @@ async fn main() {
             let mut new_overrides = overrides_before.clone();
             let mut egui_wants_pointer = false;
             let mut do_zoom_all = false;
+            let mut class_colors_changed = false;
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_pointer = egui_ctx.is_pointer_over_area();
+                class_colors_changed = classes_window(egui_ctx, &mut class_defs, max_class, &mut classes_save_status);
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
@@ -1641,10 +1751,16 @@ async fn main() {
                 }
             }
 
-            if color_mode != prev_color_mode || height_color_changed {
+            if class_colors_changed {
+                apply_class_defs(&mut stages, &mut copc_stages, &mut tile_mgr, &class_defs);
+            }
+            let class_rebuild = class_colors_changed && color_mode == ColorMode::Classification;
+            if color_mode != prev_color_mode || height_color_changed || class_rebuild {
                 let gl = unsafe { get_internal_gl() };
                 if height_color_changed {
                     apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
+                }
+                if height_color_changed || class_rebuild {
                     for cs in copc_stages.iter_mut() {
                         cs.rebuild_colors(&mut *gl.quad_context, color_mode);
                     }
@@ -1738,8 +1854,10 @@ async fn main() {
             let mut height_color_changed = false;
             let mut egui_wants_pointer = false;
             let mut do_zoom_all = false;
+            let mut class_colors_changed = false;
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_pointer = egui_ctx.is_pointer_over_area();
+                class_colors_changed = classes_window(egui_ctx, &mut class_defs, max_class, &mut classes_save_status);
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
@@ -2001,10 +2119,16 @@ async fn main() {
                 }
             }
 
-            if color_mode != prev_color_mode || height_color_changed {
+            if class_colors_changed {
+                apply_class_defs(&mut stages, &mut copc_stages, &mut tile_mgr, &class_defs);
+            }
+            let class_rebuild = class_colors_changed && color_mode == ColorMode::Classification;
+            if color_mode != prev_color_mode || height_color_changed || class_rebuild {
                 let gl = unsafe { get_internal_gl() };
                 if height_color_changed {
                     apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
+                }
+                if height_color_changed || class_rebuild {
                     for s in stages.iter_mut() {
                         s.rebuild_colors(&mut *gl.quad_context, color_mode);
                     }
@@ -2137,8 +2261,10 @@ async fn main() {
             let mut do_zoom_all = false;
             let mut do_zoom_selected = false;
             let mut tile_override_changed: Option<usize> = None;
+            let mut class_colors_changed = false;
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_pointer = egui_ctx.is_pointer_over_area();
+                class_colors_changed = classes_window(egui_ctx, &mut class_defs, max_class, &mut classes_save_status);
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
@@ -2419,12 +2545,18 @@ async fn main() {
                 
             }
 
-            if color_mode != prev_color_mode || height_color_changed {
+            if class_colors_changed {
+                apply_class_defs(&mut stages, &mut copc_stages, &mut tile_mgr, &class_defs);
+            }
+            let class_rebuild = class_colors_changed && color_mode == ColorMode::Classification;
+            if color_mode != prev_color_mode || height_color_changed || class_rebuild {
                 let gl = unsafe { get_internal_gl() };
-                if height_color_changed {
+                if height_color_changed || class_rebuild {
                     for s in stages.iter_mut() {
-                        s.color_h_min = height_color_min;
-                        s.color_h_max = height_color_max;
+                        if height_color_changed {
+                            s.color_h_min = height_color_min;
+                            s.color_h_max = height_color_max;
+                        }
                         s.rebuild_colors(&mut *gl.quad_context, color_mode);
                     }
                 }
