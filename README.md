@@ -12,9 +12,13 @@ lets you edit classification labels and colours live.
 
 ## Building
 
+Assuming that the Rust toolchain is installed:
+
 ```sh
 cargo build --release
 ```
+
+Or just download the latest binaries from the [Releases](https://github.com/tfwittwer/HaiViz/releases) page.
 
 ## Usage
 
