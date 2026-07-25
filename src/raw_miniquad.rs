@@ -110,8 +110,11 @@
             let mut reader = Reader::from_path(filename).unwrap();
             let n = reader.header().number_of_points() as usize;
 
-            let mut points = Vec::with_capacity(n);
-            reader.read_all_points_into(&mut points).unwrap();
+            let point_data = reader.read_all().unwrap();
+            let mut points: Vec<Point> = Vec::with_capacity(n);
+            for point in point_data.points() {
+                points.push(point.unwrap());
+            }
 
             let mut min = [f64::MAX; 3];
             let mut max = [f64::MIN; 3];
