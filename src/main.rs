@@ -233,6 +233,7 @@ enum AppMode {
     MeasureSecond,
     SectionMeasureFirst,
     SectionMeasureSecond,
+    SectionPointPick,
 }
 
 /*impl AppMode {
@@ -393,6 +394,74 @@ fn class_label(point: &las::Point, class_defs: &Option<crate::raw_miniquad::Clas
     } else {
         format!("{} ({:?})", id, point.classification)
     }
+}
+
+/// Find the LAS point nearest to a section-view click, searching whichever
+/// sources contributed points to the current section. `wx`/`wy` are the click
+/// position in section space (metres along the line, height). Returns the
+/// point plus its section-space position.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn pick_section_point(
+    stages: &[Stage],
+    copc_section_raw: &Option<(Vec<Vec<(LasPoint, f32, f32)>>, f32, f32, f32)>,
+    tile_mgr: &Option<TileStageManager>,
+    start: (f32, f32),
+    end: (f32, f32),
+    depth: f32,
+    wx: f32,
+    wy: f32,
+) -> Option<(LasPoint, glam::Vec2)> {
+    let dx = end.0 - start.0;
+    let dy = end.1 - start.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= 0.0 {
+        return None;
+    }
+    let dir = (dx / len, dy / len);
+    let normal = (-dir.1, dir.0);
+
+    let mut best: Option<(LasPoint, glam::Vec2)> = None;
+    let mut best_dist = f32::MAX;
+    let mut consider = |p: &LasPoint, along: f32, z: f32| {
+        let d = (along - wx).powi(2) + (z - wy).powi(2);
+        if d < best_dist {
+            best_dist = d;
+            best = Some((p.clone(), glam::Vec2::new(along, z)));
+        }
+    };
+
+    for s in stages {
+        for (i, pos) in s.positions.iter().enumerate() {
+            let rel_x = pos[0] - start.0;
+            let rel_y = pos[1] - start.1;
+            let along = rel_x * dir.0 + rel_y * dir.1;
+            let perp = rel_x * normal.0 + rel_y * normal.1;
+            if along >= 0.0 && along <= len && perp.abs() <= depth {
+                consider(&s.cloud.points[i], along, pos[2]);
+            }
+        }
+    }
+    if let Some((per_stage_raw, _, _, _)) = copc_section_raw {
+        for raw in per_stage_raw {
+            for (p, along, z) in raw {
+                consider(p, *along, *z);
+            }
+        }
+    }
+    if let Some(mgr) = tile_mgr {
+        for loaded in mgr.loaded.iter().flatten() {
+            for (i, pos) in loaded.positions.iter().enumerate() {
+                let rel_x = pos[0] - start.0;
+                let rel_y = pos[1] - start.1;
+                let along = rel_x * dir.0 + rel_y * dir.1;
+                let perp = rel_x * normal.0 + rel_y * normal.1;
+                if along >= 0.0 && along <= len && perp.abs() <= depth {
+                    consider(&loaded.cloud.points[i], along, pos[2]);
+                }
+            }
+        }
+    }
+    best
 }
 
 fn polylines_window(
@@ -619,8 +688,10 @@ fn loaded_aabb_viewer(
         any = true;
     }
     if let Some(m) = tile_mgr {
+        // Tile positions are stored relative to `global_min`, so that is the
+        // viewer origin and the lower bound in viewer space is 0.
         for k in 0..3 {
-            lo[k] = lo[k].min((m.global_min[k] - m.global_min[k]) as f32);
+            lo[k] = lo[k].min(0.0);
             hi[k] = hi[k].max((m.global_max[k] - m.global_min[k]) as f32);
         }
         any = true;
@@ -808,6 +879,9 @@ async fn main() {
     let mut section_zoom: f32 = 50.0;
     let mut sec_measure_a: Option<glam::Vec2> = None;
     let mut sec_measure_b: Option<glam::Vec2> = None;
+    // Picked point in the section view: the LAS point plus its (along, height)
+    // position in section space, used to mark it on screen.
+    let mut sec_picked_point: Option<(LasPoint, glam::Vec2)> = None;
 
     // Point pick state
     // (stage_idx, point_idx) — picked point in the multi-Stage list.
@@ -1005,7 +1079,9 @@ async fn main() {
             .max().unwrap_or(0);
 
         if is_key_pressed(KeyCode::Escape) {
-            if app_mode != AppMode::View3D {
+            if app_mode == AppMode::SectionPointPick {
+                app_mode = AppMode::SectionView;
+            } else if app_mode != AppMode::View3D {
                 app_mode = AppMode::View3D;
                 section_data = None;
             } else {
@@ -1014,7 +1090,7 @@ async fn main() {
         }
 
         // ---- Section 2D view ----
-        if matches!(app_mode, AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond) {
+        if matches!(app_mode, AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick) {
             // Navigation
             if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) {
                 section_pan.y += MOVE_SPEED * section_zoom * 0.02;
@@ -1129,8 +1205,16 @@ async fn main() {
                         1.5, WHITE,
                     );
                 }
-                // Crosshair at mouse when in measure mode
-                if matches!(app_mode, AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond) {
+                // Picked point marker
+                if let Some((_, spos)) = &sec_picked_point {
+                    let sx = world_to_screen_x(spos.x);
+                    let sy = world_to_screen_y(spos.y);
+                    draw_circle_lines(sx, sy, 6.0, 1.5, SKYBLUE);
+                    draw_line(sx - marker_sz, sy, sx + marker_sz, sy, 1.0, SKYBLUE);
+                    draw_line(sx, sy - marker_sz, sx, sy + marker_sz, 1.0, SKYBLUE);
+                }
+                // Crosshair at mouse when in measure or pick mode
+                if matches!(app_mode, AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick) {
                     let (mx, my) = mouse_position();
                     let ch = 12.0;
                     draw_line(mx - ch, my, mx + ch, my, 1.0, Color::new(1.0, 1.0, 1.0, 0.7));
@@ -1153,6 +1237,7 @@ async fn main() {
                             section_data = None;
                             sec_measure_a = None;
                             sec_measure_b = None;
+                            sec_picked_point = None;
                         }
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -1180,6 +1265,19 @@ async fn main() {
                             ));
                         }
                         ui.separator();
+                        let pick_label = if app_mode == AppMode::SectionPointPick {
+                            "Click a point... (Esc to cancel)"
+                        } else {
+                            "Point Info"
+                        };
+                        if ui.button(pick_label).clicked() {
+                            if app_mode == AppMode::SectionPointPick {
+                                app_mode = AppMode::SectionView;
+                            } else {
+                                app_mode = AppMode::SectionPointPick;
+                                sec_picked_point = None;
+                            }
+                        }
                         let measuring = matches!(app_mode, AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond);
                         if measuring {
                             if ui.button("Stop measuring").clicked() {
@@ -1215,6 +1313,21 @@ async fn main() {
                                 ui.label("  Slope:     vertical");
                             }
                         }
+                        if let Some((ref p, _)) = sec_picked_point {
+                            ui.separator();
+                            ui.label("Point Info:");
+                            ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
+                            ui.label(format!("  Intensity: {}", p.intensity));
+                            ui.label(format!("  Classification: {}", class_label(p, &class_defs)));
+                            ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
+                            if let Some(ref color) = p.color {
+                                ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
+                            }
+                            if let Some(time) = p.gps_time {
+                                ui.label(format!("  GPS time: {:.6}", time));
+                            }
+                            ui.label(format!("  Point Source Id: {}", p.point_source_id));
+                        }
                     });
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
             });
@@ -1237,6 +1350,14 @@ async fn main() {
                     }
                     AppMode::SectionMeasureSecond => {
                         sec_measure_b = Some(pos);
+                    }
+                    AppMode::SectionPointPick => {
+                        if let (Some(start), Some(end)) = (section_start, section_end) {
+                            sec_picked_point = pick_section_point(
+                                &stages, &copc_section_raw, &tile_mgr,
+                                start, end, section_depth, wx, wy,
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -1488,7 +1609,7 @@ async fn main() {
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
-                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond => "Back to 3D",
+                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick => "Back to 3D",
                         };
                         if ui.button(section_label).clicked() {
                             match app_mode {
@@ -1729,6 +1850,7 @@ async fn main() {
                             section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
                             section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
                             section_data = Some(sec);
+                            sec_picked_point = None;
                             app_mode = AppMode::SectionView;
                         }
                     }
@@ -1866,7 +1988,7 @@ async fn main() {
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
-                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond => "Back to 3D",
+                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick => "Back to 3D",
                         };
                         if ui.button(section_label).clicked() {
                             match app_mode {
@@ -2093,6 +2215,7 @@ async fn main() {
                             section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
                             section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
                             section_data = Some(sec);
+                            sec_picked_point = None;
                             app_mode = AppMode::SectionView;
                         }
                     }
@@ -2274,7 +2397,7 @@ async fn main() {
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
-                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond => "Back to 3D",
+                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick => "Back to 3D",
                         };
                         if ui.button(section_label).clicked() {
                             match app_mode {
@@ -2499,6 +2622,7 @@ async fn main() {
                             section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
                             section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
                             section_data = Some(sec);
+                            sec_picked_point = None;
                             app_mode = AppMode::SectionView;
                         }
                     }
