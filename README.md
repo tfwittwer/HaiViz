@@ -10,4 +10,4 @@ cargo run --release
 
 ## License
 
-TODO: add a license before publishing.
+Licensed under the [MIT License](LICENSE).
