@@ -3,8 +3,9 @@
 A point-cloud viewer for LAS / LAZ data, built with
 [macroquad](https://github.com/not-fl3/macroquad) and
 [egui](https://github.com/emilk/egui). It renders large clouds with an
-orthographic camera, extracts vertical cross sections, overlays polylines, and
-lets you edit classification labels and colours live.
+orthographic camera, extracts vertical cross sections, overlays polylines, lets
+you reclassify points by hand, and exports the result with chosen classes
+filtered out.
 
 ![haiviz screenshot](docs/haiviz.png)
 
@@ -102,16 +103,51 @@ The 3D view uses an orthographic camera shared across all modes:
 | Right-drag | Pan |
 | Mouse wheel | Zoom (orthographic scale) |
 | `Tab` | Toggle mouse-look (cursor grab) |
+| `C` | Start a cross section (press again to cancel) |
+| `G` | Start the ground lasso (press again to cancel) |
+| `T` `F` `B` `L` `R` | Snap to top / front / back / left / right view |
 | `Esc` | Cancel the current pick / measure / section action |
 | **Zoom All** button | Frame all loaded data |
+
+View shortcuts follow the usual CAD convention, where a view is named for where
+the camera sits rather than the direction it looks: `F` looks north from the
+south, `R` looks west from the east. They match the faces of the view cube in
+the top-right corner. Shortcuts are suppressed while a text field has focus, so
+typing a class label does not move the camera.
 
 ## Colouring
 
 The **Color** dropdown switches how points are shaded:
 Height, Intensity, Classification, RGB, PointSourceId, or Time. In **Height**
-mode you can set the min/max range used for the colour ramp. The
-**Background** colour and **point size** are adjustable, and an EDL
-(eye-dome-lighting) **Strength** slider adds depth shading.
+mode you can set the min/max range used for the colour ramp, in absolute
+elevation. The **Background** colour and **point size** are adjustable, and an
+EDL (eye-dome-lighting) **Strength** slider adds depth shading.
+
+The section view keeps its own colour mode. Switching to Classification to
+check your work on a slice does not repaint the 3D view, and the 3D dropdown
+goes on reporting the mode the 3D view is actually drawn in. Once you pick a
+mode there it sticks: the next cross section opens in it too, so a cut →
+classify → back → cut again loop does not mean reselecting it every time.
+Until you first choose one, a section opens in whatever the 3D view is using.
+
+## Height filter
+
+Multi-level clouds — a building over a basement, a deck over the ground below —
+are hard to work on when everything is drawn at once. Tick **Height filter** and
+set **Top** and **Bot** to restrict the view to one band. Values are absolute
+elevations, the same numbers Point Info reports.
+
+The band applies everywhere, not just to the display:
+
+- points outside it are not drawn,
+- they are excluded from cross sections,
+- they cannot be picked by **Measure**, **Point Info**, or the classification
+  lasso, so you cannot accidentally act on geometry you cannot see,
+- the height colour ramp re-ranges to the band, so the whole gradient is spent
+  on the part you are looking at instead of on levels that are hidden.
+
+**Full range** resets it to the whole dataset. The filter is a view setting — it
+does not affect what an export writes. Use the **Omit classes** list for that.
 
 ## Cross sections
 
@@ -151,6 +187,126 @@ Each loaded file is listed with its polylines, where you can:
 Polylines are drawn both in the 3D view and, where they intersect the corridor,
 in cross-section view.
 
+## Manual classification
+
+Two tools, both lasso-driven and both recorded the same way.
+
+**In the section view**, you lasso points directly in a slice — precise, and the
+right tool for picking out something specific. **In plan view**, you outline an
+area and everything standing above the local ground inside it is reclassified —
+much faster for clearing vegetation or clutter over a surface.
+
+### Section lasso
+
+Points are reclassified by lassoing them in the **section view**, where you are
+looking straight at a slice of the cloud.
+
+1. Cut a cross section (see above) and land in the section view.
+2. Click **Lasso classify**, or press `O`.
+3. Pick the class to assign under **To:**. Tick **Only from:** to restrict the
+   edit to points that currently carry one particular class — useful for
+   pulling one class out of a mixed patch without disturbing the rest.
+4. Click around the points you want. **Backspace** removes the last vertex,
+   **Enter** or **Apply** commits, **Esc** cancels.
+
+### Ground lasso (plan view)
+
+The second classification tool works from above, and is aimed at clearing
+everything standing on a surface — vegetation over a track bed, clutter on a
+roof, furniture on a floor.
+
+1. Press `G`, or click **Ground lasso** in the 3D panel. The view snaps to
+   top-down, because the footprint is unprojected onto a horizontal plane and
+   would come out sheared if drawn from an oblique angle.
+2. Click around the area you want.
+3. Set **To:** and **Height above ground**, then press `Enter` or **Apply**.
+   `Backspace` removes the last point, `Esc` cancels.
+
+haiviz fits a ground plane inside the footprint and assigns your class to every
+point standing more than the offset above it. The fit uses the *lowest* point in
+each grid cell rather than everything in the footprint — an area picked for
+classification is mostly the stuff standing on the ground, so an ordinary fit
+would be dragged up into the canopy. Two rejection passes then discard cells
+sitting far off the plane, in both directions: vegetation the grid never saw
+under, and noise below the surface, which matters precisely because the fit
+takes minima.
+
+The **height filter** bounds the tool. Only points inside the band are fitted or
+classified, and the band in force is recorded into the operation, so a building
+over a basement can be worked one level at a time. With no filter set, the
+cloud's own extent is recorded.
+
+After applying, the status line reports the fit's RMS residual and slope — worth
+a glance. A large RMS on ground you expect to be flat means the plane did not
+find a real surface, and **Undo last op** puts it back.
+
+The plane is fitted from the points currently loaded. That is deliberate: a
+plane is a low-order fit and the ground is dense, so the streamed sample defines
+it perfectly well, and force-loading a whole plan-view footprint would pull in
+far more data than the fit needs. If the view is zoomed a long way out, zoom in
+before lassoing so the fit has real detail to work with — the tool refuses
+outright when it cannot find enough.
+
+### Full-resolution corridors
+
+On a COPC file, **Lasso classify** first force-loads every octree node the
+corridor touches, at every level, then re-cuts the slice from it — a progress
+banner shows how far along it is, and Esc abandons it. This matters: the
+streamed view is a thinned sample, so a lasso drawn over it would only catch
+the fraction of points that happened to be resident, silently leaving the dense
+remainder unclassified. Expect the slice to get visibly denser at this point.
+
+Ordinary cross sections do **not** force-load. 
+
+A corridor is capped at 60 million points. Past that the lasso is refused
+rather than loaded; shorten the section line or reduce the depth.
+
+### How edits are stored
+
+An edit is saved as a *region operation* — for the section lasso, the polygon
+and the section line it was drawn on; for the ground lasso, the footprint plus
+the fitted plane and offset — not as a list of point ids. The ground plane is
+frozen into the operation when it is made, so it stays a pure geometric test
+rather than something re-derived from whatever happens to be loaded later. Ops
+are
+recorded in a sidecar file next to the source, `<cloud>.copc.laz.haiviz-class.txt`,
+and are written out immediately after each lasso.
+
+Ops are applied wherever points are seen: to each COPC node as it streams in,
+and to every node again at export. So a node that first loads an hour after the
+lasso was drawn gets exactly the same treatment as one that was on screen at
+the time, and the exported file agrees with the display by construction.
+
+Because ops are geometric and stored in absolute world coordinates, a sidecar
+stays valid if the source is later recompressed or re-tiled.
+
+**Undo last op** removes the most recent op and re-derives the affected clouds
+from disk — an op records what it assigns, not what it overwrote, so there is
+no shortcut back. For COPC that means the corridor streams in again.
+
+Classification editing is available in single-file and COPC modes. Tile mode
+does not support it.
+
+## Export
+
+**Export…** writes the loaded cloud back out with all manual classification
+applied, and with any classes you choose omitted entirely — this is the
+noise-filtering half of the workflow. Tick the classes to drop in the
+**Omit classes** list, then export.
+
+The export walks the whole source file rather than the resident subset, so it
+does not matter what was loaded when you were working.
+
+Output is always plain LAS/LAZ, never COPC. The `las` crate reads the COPC
+octree but cannot write one, and a COPC chunk cannot be patched in place:
+changing a classification changes the compressed chunk's length, which shifts
+every subsequent chunk offset and invalidates the hierarchy. To get a COPC file
+back, run the exported LAZ through
+[copc-converter](https://github.com/360-geo/copc-converter).
+
+Large files take a while; the export runs in the background with a progress bar
+and the viewer stays usable.
+
 ## Class editing
 
 Open the **Classes** window to edit classification labels and colours live.
@@ -158,8 +314,11 @@ It lists every classification id present in the data (plus any extras defined in
 your file), and for each id you can edit its **colour** and **label**. Changes
 apply immediately when colouring by **Classification**.
 
-Definitions are stored in a `classes.txt` file in the working directory, using
-the format:
+Definitions are stored in a `classes.txt` file in the **current working
+directory** — the directory haiviz was launched from, not the one holding the
+point cloud. Definitions therefore persist across sessions only if you relaunch
+from the same place; started elsewhere, haiviz falls back to the built-in
+defaults and **Save classes.txt** writes a fresh file there. The format is:
 
 ```
 # id;r;g;b;label
@@ -183,6 +342,9 @@ If no `classes.txt` is present, built-in default labels and colours are used.
 | Right-drag | Pan |
 | Mouse wheel | Zoom |
 | `Tab` | Toggle mouse-look (cursor grab) |
+| `C` | Start / cancel a cross section |
+| `G` | Start / cancel the ground lasso |
+| `T` `F` `B` `L` `R` | Top / front / back / left / right view |
 | `Esc` | Cancel current pick / measure / section action |
 
 **Building a cross section** (start from the **Cross Section** button)
@@ -199,9 +361,29 @@ If no `classes.txt` is present, built-in default labels and colours are used.
 | Input | Action |
 |-------|--------|
 | Mouse wheel | Zoom the slice |
+| `O` | Start the classification lasso |
 | **Measure** → click ×2 | Distance + slope between two points |
 | **Point Info** → click | Inspect a point's attributes |
 | **Back to 3D** | Leave the section view |
+
+**Ground lasso** (3D view, `G`)
+
+| Input | Action |
+|-------|--------|
+| Left-click | Add a footprint vertex |
+| `Backspace` | Remove the last vertex |
+| `Enter` | Close the footprint, fit the ground and apply |
+| `Esc` | Clear the footprint, then leave the tool |
+
+**Section lasso** (start from **Lasso classify** in the section view)
+
+| Input | Action |
+|-------|--------|
+| `O` | Start the lasso tool |
+| Left-click | Add a lasso vertex |
+| `Backspace` | Remove the last vertex |
+| `Enter` | Close the lasso and apply |
+| `Esc` | Clear the lasso, then leave lasso mode |
 
 **Tile mode**
 

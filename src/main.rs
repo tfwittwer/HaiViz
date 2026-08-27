@@ -13,8 +13,16 @@ use las::Point as LasPoint;
 const MOVE_SPEED: f32 = 0.5;
 const LOOK_SPEED: f32 = 0.5;
 
+/// Upper bound on the points a force-loaded section corridor may hold.
+/// Pinning bypasses the LOD point budget by design, so it needs its own guard:
+/// a long corridor through a dense cloud can otherwise pull the whole file into
+/// memory at once.
+const CORRIDOR_POINT_LIMIT: i64 = 60_000_000;
+
 mod raw_miniquad;
 mod polylines;
+mod classify;
+mod export;
 
 mod view_cube {
     use macroquad::prelude::*;
@@ -81,7 +89,21 @@ mod view_cube {
         true
     }
 
-    pub fn draw_and_interact(front: Vec3, right: Vec3, up: Vec3, interactive: bool) -> Option<(f32, f32)> {
+    /// Snap targets for the keyboard view shortcuts, as `(yaw, pitch)`.
+    ///
+    /// These reuse the cube's own face snaps so the keys and the cube always
+    /// agree. Naming follows the usual CAD convention, where the view is named
+    /// for where the camera sits, not for the direction it looks:
+    /// Front looks north from the south, Right looks west from the east.
+    pub const VIEW_TOP: (f32, f32) = (PI / 2.0, -PI / 2.0);
+    pub const VIEW_FRONT: (f32, f32) = (PI / 2.0, 0.0);
+    pub const VIEW_BACK: (f32, f32) = (-PI / 2.0, 0.0);
+    pub const VIEW_LEFT: (f32, f32) = (0.0, 0.0);
+    pub const VIEW_RIGHT: (f32, f32) = (PI, 0.0);
+
+    /// `keys` gates the keyboard shortcuts separately from `interactive`, so a
+    /// letter typed into a class label does not fling the camera around.
+    pub fn draw_and_interact(front: Vec3, right: Vec3, up: Vec3, interactive: bool, keys: bool) -> Option<(f32, f32)> {
         let cx = screen_width() - MARGIN - SIZE;
         let cy = MARGIN + SIZE;
         let scale = SIZE * 0.45;
@@ -166,8 +188,18 @@ mod view_cube {
             }
         }
 
-        if interactive && is_key_pressed(KeyCode::T) {
-            return Some((std::f32::consts::FRAC_PI_2, -std::f32::consts::FRAC_PI_2));
+        if interactive && keys {
+            for (key, view) in [
+                (KeyCode::T, VIEW_TOP),
+                (KeyCode::F, VIEW_FRONT),
+                (KeyCode::B, VIEW_BACK),
+                (KeyCode::L, VIEW_LEFT),
+                (KeyCode::R, VIEW_RIGHT),
+            ] {
+                if is_key_pressed(key) {
+                    return Some(view);
+                }
+            }
         }
 
 
@@ -234,6 +266,14 @@ enum AppMode {
     SectionMeasureFirst,
     SectionMeasureSecond,
     SectionPointPick,
+    /// Waiting for the force-loaded section corridor to finish streaming.
+    /// Only COPC reaches this state; other modes have all points resident.
+    SectionCorridorLoad,
+    /// Drawing a lasso in the section view to reclassify the points inside it.
+    SectionLasso,
+    /// Drawing a plan-view lasso to reclassify whatever stands above the local
+    /// ground inside it.
+    GroundLasso,
 }
 
 /*impl AppMode {
@@ -332,11 +372,17 @@ fn draw_section_corridor(
 /// Draw the editable height colour-bar endpoints. Shown only when colouring by
 /// height. Values are metres relative to the dataset minimum (0 = lowest point).
 /// Returns `true` if either endpoint was edited this frame.
+/// Endpoints of the height colour ramp.
+///
+/// `h_min`/`h_max` are viewer-space (metres above the dataset minimum), which
+/// is what `color_for_point` compares against, but they are shown as absolute
+/// elevations so they read the same as Point Info and the height filter.
 fn height_color_controls(
     ui: &mut egui_macroquad::egui::Ui,
     color_mode: ColorMode,
     h_min: &mut f32,
     h_max: &mut f32,
+    z_offset: f64,
 ) -> bool {
     use egui_macroquad::egui;
     if color_mode != ColorMode::Height {
@@ -345,15 +391,163 @@ fn height_color_controls(
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.label("Height color:");
-        changed |= ui
-            .add(egui::DragValue::new(h_min).speed(0.1).max_decimals(2).suffix(" m"))
-            .changed();
+        let mut abs_min = *h_min as f64 + z_offset;
+        let mut abs_max = *h_max as f64 + z_offset;
+        if ui.add(egui::DragValue::new(&mut abs_min).speed(0.1).max_decimals(2).suffix(" m")).changed() {
+            *h_min = (abs_min - z_offset) as f32;
+            changed = true;
+        }
         ui.label("to");
-        changed |= ui
-            .add(egui::DragValue::new(h_max).speed(0.1).max_decimals(2).suffix(" m"))
-            .changed();
+        if ui.add(egui::DragValue::new(&mut abs_max).speed(0.1).max_decimals(2).suffix(" m")).changed() {
+            *h_max = (abs_max - z_offset) as f32;
+            changed = true;
+        }
     });
     changed
+}
+
+/// Measure markers and the cross-section corridor preview, in 3D.
+///
+/// Must be called *after* the point cloud has been composited, not before.
+/// With EDL on, the cloud renders to an offscreen texture and is then blitted
+/// back with a full-screen quad; anything drawn beforehand survives only where
+/// the quad discards, which is exactly where there are no points. Drawn first,
+/// these overlays vanish over the cloud — precisely where they are needed.
+#[allow(clippy::too_many_arguments)]
+fn draw_3d_overlays(
+    app_mode: AppMode,
+    measure_a: Option<Vec3>,
+    measure_b: Option<Vec3>,
+    section_start: Option<(f32, f32)>,
+    section_end: Option<(f32, f32)>,
+    cursor_world: Option<(f32, f32)>,
+    section_depth: f32,
+    mid_z: f32,
+    height_range: f32,
+    ortho_scale: f32,
+    ground_lasso: &[glam::Vec2],
+    ground_color: Color,
+) {
+    if !ground_lasso.is_empty() {
+        let pts: Vec<Vec3> = ground_lasso.iter().map(|v| vec3(v.x, v.y, mid_z)).collect();
+        for w in pts.windows(2) {
+            draw_line_3d(w[0], w[1], ground_color);
+        }
+        if let Some(&last) = pts.last() {
+            if app_mode == AppMode::GroundLasso
+                && let Some((wx, wy)) = cursor_world {
+                    draw_line_3d(last, vec3(wx, wy, mid_z), ground_color);
+            }
+            if pts.len() >= 2 {
+                let faint = Color::new(ground_color.r, ground_color.g, ground_color.b, 0.4);
+                let end = if app_mode == AppMode::GroundLasso {
+                    cursor_world.map(|(x, y)| vec3(x, y, mid_z)).unwrap_or(last)
+                } else {
+                    last
+                };
+                draw_line_3d(end, pts[0], faint);
+            }
+        }
+        // A short vertical tick at each vertex, so the footprint stays legible
+        // once the view is tilted off top-down.
+        let tick = height_range * 0.03;
+        for p in &pts {
+            draw_line_3d(*p, vec3(p.x, p.y, p.z + tick), ground_color);
+        }
+    }
+
+    let cross_size = ortho_scale * 0.015;
+    if let Some(a) = measure_a {
+        draw_line_3d(vec3(a.x - cross_size, a.y, a.z), vec3(a.x + cross_size, a.y, a.z), YELLOW);
+        draw_line_3d(vec3(a.x, a.y - cross_size, a.z), vec3(a.x, a.y + cross_size, a.z), YELLOW);
+        draw_line_3d(vec3(a.x, a.y, a.z - cross_size), vec3(a.x, a.y, a.z + cross_size), YELLOW);
+    }
+    if let Some(b) = measure_b {
+        draw_line_3d(vec3(b.x - cross_size, b.y, b.z), vec3(b.x + cross_size, b.y, b.z), ORANGE);
+        draw_line_3d(vec3(b.x, b.y - cross_size, b.z), vec3(b.x, b.y + cross_size, b.z), ORANGE);
+        draw_line_3d(vec3(b.x, b.y, b.z - cross_size), vec3(b.x, b.y, b.z + cross_size), ORANGE);
+    }
+    if let (Some(a), Some(b)) = (measure_a, measure_b) {
+        draw_line_3d(a, b, WHITE);
+    }
+
+    match app_mode {
+        AppMode::SectionPickEnd => {
+            if let (Some(start), Some((wx, wy))) = (section_start, cursor_world) {
+                draw_line_3d(vec3(start.0, start.1, mid_z), vec3(wx, wy, mid_z), YELLOW);
+            }
+        }
+        AppMode::SectionAdjustDepth => {
+            if let (Some(start), Some(end)) = (section_start, section_end) {
+                draw_section_corridor(start, end, section_depth, height_range);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Height-band filter: pick the lowest and highest Z that is drawn, to cut
+/// irrelevant levels out of a multi-storey cloud.
+///
+/// Presented in absolute elevation — the same numbers Point Info reports —
+/// while `z_lo`/`z_hi` stay in viewer space, which is what the shader and the
+/// section extraction work in.
+fn z_clip_controls(
+    ui: &mut egui_macroquad::egui::Ui,
+    enabled: &mut bool,
+    z_lo: &mut f32,
+    z_hi: &mut f32,
+    z_offset: f64,
+    height_range: f32,
+) -> bool {
+    use egui_macroquad::egui;
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        changed |= ui.checkbox(enabled, "Height filter").changed();
+        if *enabled && ui.button("Full range").clicked() {
+            *z_lo = 0.0;
+            *z_hi = height_range;
+            changed = true;
+        }
+    });
+    if !*enabled {
+        return changed;
+    }
+    let lo_bound = z_offset;
+    let hi_bound = z_offset + height_range as f64;
+    let mut abs_lo = *z_lo as f64 + z_offset;
+    let mut abs_hi = *z_hi as f64 + z_offset;
+    ui.horizontal(|ui| {
+        ui.label("  Top:");
+        if ui.add(egui::Slider::new(&mut abs_hi, lo_bound..=hi_bound).max_decimals(2).suffix(" m")).changed() {
+            *z_hi = (abs_hi - z_offset) as f32;
+            // Dragging one end past the other would blank the view; push
+            // rather than swap, so the drag stays predictable.
+            *z_lo = z_lo.min(*z_hi);
+            changed = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("  Bot:");
+        if ui.add(egui::Slider::new(&mut abs_lo, lo_bound..=hi_bound).max_decimals(2).suffix(" m")).changed() {
+            *z_lo = (abs_lo - z_offset) as f32;
+            *z_hi = z_hi.max(*z_lo);
+            changed = true;
+        }
+    });
+    changed
+}
+
+/// Push the height band onto every loaded data source.
+fn apply_z_clip(
+    stages: &mut [Stage],
+    copc_stages: &mut [CopcStage],
+    tile_mgr: &mut Option<TileStageManager>,
+    z_clip: crate::raw_miniquad::ZClip,
+) {
+    for s in stages.iter_mut() { s.z_clip = z_clip; }
+    for cs in copc_stages.iter_mut() { cs.z_clip = z_clip; }
+    if let Some(mgr) = tile_mgr.as_mut() { mgr.z_clip = z_clip; }
 }
 
 /// Push the height colour-bar endpoints onto every loaded data source so the
@@ -396,6 +590,23 @@ fn class_label(point: &las::Point, class_defs: &Option<crate::raw_miniquad::Clas
     }
 }
 
+/// Display colour for a classification id, honouring any custom definition
+/// from `classes.txt` so the lasso is drawn in the colour the reclassified
+/// points will take.
+fn class_color(id: u8, class_defs: &Option<ClassDefs>) -> [f32; 3] {
+    if let Some(defs) = class_defs
+        && let Some((_, c)) = defs.get(&id) {
+            return *c;
+    }
+    classification_color(id)
+}
+
+/// `class_color` as a macroquad colour, for the 3D overlays.
+fn class_color_mq(id: u8, class_defs: &Option<ClassDefs>) -> Color {
+    let c = class_color(id, class_defs);
+    Color::new(c[0], c[1], c[2], 1.0)
+}
+
 /// Find the LAS point nearest to a section-view click, searching whichever
 /// sources contributed points to the current section. `wx`/`wy` are the click
 /// position in section space (metres along the line, height). Returns the
@@ -408,6 +619,7 @@ fn pick_section_point(
     start: (f32, f32),
     end: (f32, f32),
     depth: f32,
+    z_clip: crate::raw_miniquad::ZClip,
     wx: f32,
     wy: f32,
 ) -> Option<(LasPoint, glam::Vec2)> {
@@ -423,6 +635,7 @@ fn pick_section_point(
     let mut best: Option<(LasPoint, glam::Vec2)> = None;
     let mut best_dist = f32::MAX;
     let mut consider = |p: &LasPoint, along: f32, z: f32| {
+        if !z_clip.contains(z) { return; }
         let d = (along - wx).powi(2) + (z - wy).powi(2);
         if d < best_dist {
             best_dist = d;
@@ -473,7 +686,13 @@ fn polylines_window(
     background: Color,
 ) {
     egui_macroquad::egui::Window::new("Polylines")
-        .default_pos([10.0, 300.0])
+        .default_pos([10.0, 600.0])
+        // `default_pos` is clamped so the window fits on screen, and on the
+        // first frame egui assumes a window is its default size (340x420),
+        // even one that opens collapsed. That reserves ~400px of height and
+        // silently pins any y past `screen_height - 400` to that ceiling —
+        // which is how two windows given different positions end up stacked.
+        .constrain(false)
         .default_open(false)
         .show(egui_ctx, |ui| {
             let luma = background.r * 0.299 + background.g * 0.587 + background.b * 0.114;
@@ -536,7 +755,9 @@ fn classes_window(
     use egui_macroquad::egui;
     let mut colors_changed = false;
     egui::Window::new("Classes")
-        .default_pos([10.0, 400.0])
+        .default_pos([10.0, 500.0])
+        // See the note in `polylines_window`.
+        .constrain(false)
         .default_open(false)
         .show(egui_ctx, |ui| {
             let mut do_reload = false;
@@ -589,6 +810,211 @@ fn classes_window(
 
 /// Push updated class definitions onto every loaded data source so subsequent
 /// colour rebuilds and section extractions use them.
+/// Combo box over the classification ids present in the data, plus the LAS
+/// standard ids, with a numeric fallback for anything outside that range.
+fn class_picker(
+    ui: &mut egui_macroquad::egui::Ui,
+    id: &str,
+    value: &mut u8,
+    max_class: u8,
+    class_defs: &Option<ClassDefs>,
+) {
+    let label_for = |c: u8| -> String {
+        if let Some(defs) = class_defs
+            && let Some((label, _)) = defs.get(&c) {
+                return format!("{c} — {label}");
+        }
+        format!("{c} — {}", default_class_label(c))
+    };
+    egui_macroquad::egui::ComboBox::from_id_salt(id)
+        .selected_text(label_for(*value))
+        .width(170.0)
+        .show_ui(ui, |ui| {
+            for c in 0..=max_class.max(18) {
+                ui.selectable_value(value, c, label_for(c));
+            }
+        });
+    ui.add(egui_macroquad::egui::DragValue::new(value).range(0..=255));
+}
+
+/// Controls for the plan-view ground tool, shared by the three 3D panels.
+/// Returns true if the operator asked to start a new footprint.
+#[allow(clippy::too_many_arguments)]
+fn ground_tool_controls(
+    ui: &mut egui_macroquad::egui::Ui,
+    app_mode: &mut AppMode,
+    lasso_len: usize,
+    target: &mut u8,
+    from: &mut Option<u8>,
+    offset: &mut f32,
+    max_class: u8,
+    class_defs: &Option<ClassDefs>,
+    status: &Option<String>,
+    apply: &mut bool,
+    cancel: &mut bool,
+) -> bool {
+    use egui_macroquad::egui;
+    let mut start = false;
+    ui.separator();
+    ui.label("Classify above ground:");
+    ui.horizontal(|ui| {
+        ui.label("To:");
+        class_picker(ui, "ground_to", target, max_class, class_defs);
+    });
+    ui.horizontal(|ui| {
+        let mut restrict = from.is_some();
+        if ui.checkbox(&mut restrict, "Only from:").changed() {
+            *from = if restrict { Some(0) } else { None };
+        }
+        if let Some(f) = from.as_mut() {
+            class_picker(ui, "ground_from", f, max_class, class_defs);
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Height above ground:");
+        ui.add(egui::DragValue::new(offset).speed(0.05).range(0.0..=50.0)
+            .max_decimals(2).suffix(" m"));
+    });
+    if *app_mode == AppMode::GroundLasso {
+        ui.label(format!("Click to outline an area ({lasso_len} points so far)"));
+        ui.horizontal(|ui| {
+            if ui.add_enabled(lasso_len >= 3, egui::Button::new("Apply")).clicked() {
+                *apply = true;
+            }
+            if ui.button("Cancel").clicked() {
+                *cancel = true;
+            }
+        });
+        ui.label("Enter applies, Backspace removes a point, Esc cancels.");
+    } else if ui.button("Ground lasso (G)").clicked() {
+        start = true;
+    }
+    if let Some(msg) = status {
+        ui.label(msg.as_str());
+    }
+    start
+}
+
+/// Export panel: pick which classes to drop, then write one source out.
+/// Returns the index into `sources` the user asked to export, if any.
+#[allow(clippy::too_many_arguments)]
+fn export_window(
+    egui_ctx: &egui_macroquad::egui::Context,
+    open: &mut bool,
+    filter: &mut crate::classify::ExportFilter,
+    job: &mut Option<crate::export::ExportJob>,
+    status: &mut Option<String>,
+    sources: &[(String, bool)],
+    max_class: u8,
+    class_defs: &Option<ClassDefs>,
+) -> Option<usize> {
+    if !*open { return None; }
+    let mut requested = None;
+    let mut keep_open = true;
+    egui_macroquad::egui::Window::new("Export")
+        .open(&mut keep_open)
+        .default_pos([420.0, 10.0])
+        .show(egui_ctx, |ui| {
+            ui.label("Writes LAS/LAZ with all manual classification applied.");
+            ui.label("COPC input exports as plain LAZ — re-run copc-converter to");
+            ui.label("rebuild the octree.");
+            ui.separator();
+
+            ui.label("Omit classes (noise filtering):");
+            egui_macroquad::egui::ScrollArea::vertical()
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    for c in 0..=max_class.max(18) {
+                        let label = if let Some(defs) = class_defs
+                            && let Some((l, _)) = defs.get(&c) {
+                                format!("{c} — {l}")
+                        } else {
+                            format!("{c} — {}", default_class_label(c))
+                        };
+                        let mut dropped = filter.drop_classes.contains(&c);
+                        if ui.checkbox(&mut dropped, label).changed() {
+                            if dropped { filter.drop_classes.insert(c); }
+                            else { filter.drop_classes.remove(&c); }
+                        }
+                    }
+                });
+            if !filter.drop_classes.is_empty() {
+                let mut ids: Vec<u8> = filter.drop_classes.iter().copied().collect();
+                ids.sort();
+                let names: Vec<String> = ids.iter().map(|c| c.to_string()).collect();
+                ui.label(format!("Dropping: {}", names.join(", ")));
+                if ui.button("Clear").clicked() { filter.drop_classes.clear(); }
+            }
+
+            ui.separator();
+            if let Some(j) = job.as_ref()
+                && j.finished.is_none() {
+                    ui.label(format!("Exporting {}…", j.label));
+                    ui.add(egui_macroquad::egui::ProgressBar::new(j.fraction()).show_percentage());
+                    ui.label(format!("{} written, {} dropped", j.written, j.dropped));
+                    return;
+            }
+            for (i, (path, is_copc)) in sources.iter().enumerate() {
+                let name = std::path::Path::new(path)
+                    .file_name().and_then(|s| s.to_str()).unwrap_or(path);
+                ui.horizontal(|ui| {
+                    if ui.button("Export…").clicked() { requested = Some(i); }
+                    ui.label(if *is_copc { format!("{name} (COPC)") } else { name.to_string() });
+                });
+            }
+            if sources.is_empty() {
+                ui.label("Nothing loaded that can be exported.");
+            }
+            if let Some(msg) = status.as_ref() {
+                ui.separator();
+                ui.label(msg.as_str());
+            }
+        });
+    if !keep_open { *open = false; }
+    requested
+}
+
+/// Kick off an export of `sources[idx]`, taking that source's op list with it
+/// so the written file matches what the viewer shows.
+fn start_export(
+    idx: usize,
+    stages: &[Stage],
+    copc_stages: &[CopcStage],
+    filter: &crate::classify::ExportFilter,
+    job: &mut Option<crate::export::ExportJob>,
+    status: &mut Option<String>,
+) {
+    if job.as_ref().is_some_and(|j| j.finished.is_none()) {
+        *status = Some("An export is already running.".to_string());
+        return;
+    }
+    let (path, edits, is_copc) = if idx < stages.len() {
+        (stages[idx].filepath.clone(), stages[idx].edits.clone(), false)
+    } else if let Some(cs) = copc_stages.get(idx - stages.len()) {
+        (cs.filepath.clone(), cs.edits.clone(), true)
+    } else {
+        return;
+    };
+    let out = crate::classify::default_export_path(&path);
+    let out = rfd::FileDialog::new()
+        .set_title("Export point cloud")
+        .set_file_name(out.file_name().and_then(|s| s.to_str()).unwrap_or("export.laz"))
+        .add_filter("LAZ", &["laz"])
+        .add_filter("LAS", &["las"])
+        .save_file();
+    let Some(out) = out else { return };
+    *status = None;
+    *job = Some(crate::export::spawn(path, out, edits, filter.clone(), is_copc));
+}
+
+/// Files that can be exported, in the order the export panel lists them:
+/// manually loaded stages first, then COPC stages.
+fn export_source_list(stages: &[Stage], copc_stages: &[CopcStage]) -> Vec<(String, bool)> {
+    stages.iter().map(|s| (s.filepath.clone(), false))
+        .chain(copc_stages.iter().map(|cs| (cs.filepath.clone(), true)))
+        .collect()
+}
+
 fn apply_class_defs(
     stages: &mut [Stage],
     copc_stages: &mut [CopcStage],
@@ -797,6 +1223,11 @@ async fn main() {
     // same defaults, so no rebuild is needed up front.
     let mut height_color_min: f32 = 0.0;
     let mut height_color_max: f32 = height_range;
+    // Height band, in viewer space. Kept separately from `z_clip` so toggling
+    // the filter off and on again restores the band the operator set up.
+    let mut z_clip_enabled = false;
+    let mut z_clip_lo: f32 = 0.0;
+    let mut z_clip_hi: f32 = height_range;
 
     let mut tile_rgb_overrides: Vec<Option<[f32; 3]>> = if let Some(ref mgr) = tile_mgr {
         vec![None; mgr.tiles.len()]
@@ -863,6 +1294,10 @@ async fn main() {
     show_mouse(!grabbed);
     let mut pivot_locked = false;
     let mut egui_wants_pointer_prev = false;
+    // Whether egui had keyboard focus last frame — a class label being edited,
+    // say. Without this, typing a name would trigger the single-letter view and
+    // cross-section shortcuts.
+    let mut egui_wants_keyboard_prev = false;
 
     let aspect = screen_width() / screen_height().max(1.0);
     let mut ortho_scale: f32 = (data_extent_y * 0.5).max(data_extent_x * 0.5 / aspect) * 1.05;
@@ -875,6 +1310,15 @@ async fn main() {
     // Cache of raw COPC section points (one Vec per stage) used to recolour on mode change.
     #[allow(clippy::type_complexity)]
     let mut copc_section_raw: Option<(Vec<Vec<(LasPoint, f32, f32)>>, f32, f32, f32)> = None;
+    // The section view has its own colour mode. Changing it there must not
+    // silently repaint the 3D view, and equally the 3D combo box must go on
+    // reporting the mode the 3D view is actually drawn in.
+    let mut section_color_mode = color_mode;
+    // Set once the operator picks a mode in the section view. Until then a new
+    // section opens in whatever the 3D view is using; afterwards it keeps the
+    // section's own choice, so a workflow of cut → colour by classification →
+    // back → cut again does not have to reselect it every time.
+    let mut section_color_mode_pinned = false;
     let mut section_pan = glam::Vec2::ZERO;
     let mut section_zoom: f32 = 50.0;
     let mut sec_measure_a: Option<glam::Vec2> = None;
@@ -882,6 +1326,30 @@ async fn main() {
     // Picked point in the section view: the LAS point plus its (along, height)
     // position in section space, used to mark it on screen.
     let mut sec_picked_point: Option<(LasPoint, glam::Vec2)> = None;
+
+    // ---- Manual classification state ----
+    // Lasso vertices in section space: (metres along the line, viewer-space Z).
+    let mut lasso: Vec<glam::Vec2> = Vec::new();
+    let mut classify_target: u8 = 7;
+    let mut classify_from: Option<u8> = None;
+    let mut classify_status: Option<String> = None;
+    // Plan-view ground tool: lasso footprint in viewer-space XY, and how far
+    // above the fitted ground a point must stand to be selected.
+    let mut ground_lasso: Vec<glam::Vec2> = Vec::new();
+    let mut ground_offset: f32 = 0.20;
+    let mut ground_status: Option<String> = None;
+    // Classes omitted from an export — the noise-filtering half of the workflow.
+    let mut export_filter = crate::classify::ExportFilter::default();
+    let mut export_job: Option<crate::export::ExportJob> = None;
+    let mut export_status: Option<String> = None;
+    let mut show_export_window = false;
+    // Set once a corridor has been pinned, so leaving the section releases it.
+    let mut corridor_pinned = false;
+    let mut corridor_status: Option<String> = None;
+    // Where to land once the corridor has streamed in: the lasso tool if the
+    // operator asked for it, or plain section view after an undo.
+    let mut corridor_load_to_lasso = false;
+    let mut corridor_total_points: i64 = 0;
 
     // Point pick state
     // (stage_idx, point_idx) — picked point in the multi-Stage list.
@@ -1009,6 +1477,9 @@ async fn main() {
             if was_empty {
                 height_color_min = 0.0;
                 height_color_max = height_range;
+                z_clip_lo = 0.0;
+                z_clip_hi = height_range;
+                z_clip_enabled = false;
             }
             let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
             if is_copc {
@@ -1071,6 +1542,15 @@ async fn main() {
             height_range = 100.0;
         }
 
+        // Height band in force this frame. Pushed unconditionally so a file
+        // loaded mid-session picks it up without any special casing.
+        let z_clip = if z_clip_enabled {
+            crate::raw_miniquad::ZClip { min: z_clip_lo, max: z_clip_hi }
+        } else {
+            crate::raw_miniquad::ZClip::OPEN
+        };
+        apply_z_clip(&mut stages, &mut copc_stages, &mut tile_mgr, z_clip);
+
         // Highest classification id present in the loaded data; the class editor
         // shows one row per id up to this value.
         let max_class: u8 = stages.iter().map(|s| s.cloud.max_class)
@@ -1078,10 +1558,53 @@ async fn main() {
             .chain(tile_mgr.iter().map(|m| m.max_class()))
             .max().unwrap_or(0);
 
+        // ---- Export progress ----
+        if let Some(job) = export_job.as_mut() {
+            job.poll();
+            if let Some(result) = job.finished.take() {
+                export_status = Some(match result {
+                    Ok((path, written, dropped)) => format!(
+                        "Wrote {} — {} points, {} dropped",
+                        path.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
+                        written, dropped,
+                    ),
+                    Err(e) => format!("Export failed: {e}"),
+                });
+                export_job = None;
+            }
+        }
+
         if is_key_pressed(KeyCode::Escape) {
-            if app_mode == AppMode::SectionPointPick {
+            if app_mode == AppMode::SectionCorridorLoad {
+                // Abandon the force-load and go back to browsing the slice that
+                // is already on screen.
+                for cs in copc_stages.iter_mut() { cs.clear_pins(); }
+                corridor_pinned = false;
+                corridor_status = None;
+                app_mode = AppMode::SectionView;
+            } else if app_mode == AppMode::GroundLasso {
+                if ground_lasso.is_empty() {
+                    app_mode = AppMode::View3D;
+                } else {
+                    ground_lasso.clear();
+                }
+            } else if app_mode == AppMode::SectionLasso {
+                if lasso.is_empty() {
+                    app_mode = AppMode::SectionView;
+                } else {
+                    lasso.clear();
+                }
+            } else if app_mode == AppMode::SectionPointPick {
                 app_mode = AppMode::SectionView;
             } else if app_mode != AppMode::View3D {
+                // Any exit from the section releases the corridor pins, so the
+                // LOD is free to evict those nodes again.
+                if corridor_pinned {
+                    for cs in copc_stages.iter_mut() { cs.clear_pins(); }
+                    corridor_pinned = false;
+                }
+                corridor_status = None;
+                lasso.clear();
                 app_mode = AppMode::View3D;
                 section_data = None;
             } else {
@@ -1090,7 +1613,7 @@ async fn main() {
         }
 
         // ---- Section 2D view ----
-        if matches!(app_mode, AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick) {
+        if matches!(app_mode, AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso | AppMode::SectionCorridorLoad) {
             // Navigation
             if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) {
                 section_pan.y += MOVE_SPEED * section_zoom * 0.02;
@@ -1119,6 +1642,53 @@ async fn main() {
                 let factor = if mwy > 0.0 { 0.9 } else { 1.1 };
                 section_zoom *= factor;
                 section_zoom = section_zoom.clamp(0.1, 10000.0);
+            }
+
+            // ---- Streaming the full-resolution corridor ----
+            if app_mode == AppMode::SectionCorridorLoad {
+                let mut gl = unsafe { get_internal_gl() };
+                gl.flush();
+                for cs in copc_stages.iter_mut() {
+                    cs.service_pins(&mut *gl.quad_context, section_color_mode);
+                }
+                let pending: usize = copc_stages.iter().map(|cs| cs.pins_pending()).sum();
+                let total: usize = copc_stages.iter().map(|cs| cs.pinned_count()).sum();
+                if pending == 0 {
+                    if let (Some(start), Some(end)) = (section_start, section_end) {
+                        let mut all_verts = Vec::new();
+                        let mut per_stage_raw: Vec<Vec<(LasPoint, f32, f32)>> = Vec::new();
+                        let (mut h_min, mut h_max) = (f32::MAX, f32::MIN);
+                        let mut length = 0.0_f32;
+                        let height_range = copc_stages[0].height_range();
+                        for cs in &copc_stages {
+                            let (verts, raw, len, hmin, hmax) =
+                                cs.extract_section_verts(start, end, section_depth, section_color_mode);
+                            all_verts.extend(verts);
+                            per_stage_raw.push(raw);
+                            h_min = h_min.min(hmin); h_max = h_max.max(hmax);
+                            length = length.max(len);
+                        }
+                        let h_min = if h_min == f32::MAX { 0.0 } else { h_min };
+                        let h_max = if h_max == f32::MIN { 0.0 } else { h_max };
+                        info!("COPC Section re-cut at full resolution: {} points", all_verts.len());
+                        copc_section_raw = Some((per_stage_raw, length, h_min, h_max));
+                        section_data = Some(make_section_data(
+                            &mut *gl.quad_context, all_verts, length, h_min, h_max, height_range));
+                        sec_picked_point = None;
+                    }
+                    corridor_status = None;
+                    app_mode = if corridor_load_to_lasso {
+                        AppMode::SectionLasso
+                    } else {
+                        AppMode::SectionView
+                    };
+                } else {
+                    let done = total.saturating_sub(pending);
+                    corridor_status = Some(format!(
+                        "Loading corridor at full resolution: {done}/{total} nodes, {:.1}M points",
+                        corridor_total_points as f64 / 1e6,
+                    ));
+                }
             }
 
             clear_background(background);
@@ -1213,8 +1783,38 @@ async fn main() {
                     draw_line(sx - marker_sz, sy, sx + marker_sz, sy, 1.0, SKYBLUE);
                     draw_line(sx, sy - marker_sz, sx, sy + marker_sz, 1.0, SKYBLUE);
                 }
+                // ---- Classification lasso ----
+                if app_mode == AppMode::SectionLasso || !lasso.is_empty() {
+                    let lasso_col = class_color(classify_target, &class_defs);
+                    let col = Color::new(lasso_col[0], lasso_col[1], lasso_col[2], 1.0);
+                    let pts: Vec<(f32, f32)> = lasso.iter()
+                        .map(|v| (world_to_screen_x(v.x), world_to_screen_y(v.y)))
+                        .collect();
+                    for w in pts.windows(2) {
+                        draw_line(w[0].0, w[0].1, w[1].0, w[1].1, 2.0, col);
+                    }
+                    // Rubber-band from the last vertex to the cursor, and a
+                    // dashed closing edge, so the polygon that will actually be
+                    // applied is visible before committing to it.
+                    if let Some(&last) = pts.last() {
+                        let (mx, my) = mouse_position();
+                        if app_mode == AppMode::SectionLasso {
+                            draw_line(last.0, last.1, mx, my, 1.5, col);
+                        }
+                        if pts.len() >= 2 {
+                            let first = pts[0];
+                            let end = if app_mode == AppMode::SectionLasso { (mx, my) } else { last };
+                            draw_line(end.0, end.1, first.0, first.1, 1.0,
+                                Color::new(col.r, col.g, col.b, 0.4));
+                        }
+                    }
+                    for (sx, sy) in &pts {
+                        draw_circle_lines(*sx, *sy, 4.0, 1.5, col);
+                    }
+                }
+
                 // Crosshair at mouse when in measure or pick mode
-                if matches!(app_mode, AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick) {
+                if matches!(app_mode, AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso) {
                     let (mx, my) = mouse_position();
                     let ch = 12.0;
                     draw_line(mx - ch, my, mx + ch, my, 1.0, Color::new(1.0, 1.0, 1.0, 0.7));
@@ -1222,12 +1822,48 @@ async fn main() {
                 }
             }
 
-            let prev_color_mode = color_mode;
+            // Corridor force-load banner. This is the one moment where the
+            // viewer deliberately ignores the LOD point budget, and the
+            // operator is waiting on it, so say what is happening.
+            if let Some(msg) = &corridor_status {
+                let font_size = 20.0;
+                let dims = measure_text(msg, None, font_size as u16, 1.0);
+                let (bx, by) = ((screen_width() - dims.width) * 0.5, screen_height() * 0.5);
+                draw_rectangle(bx - 14.0, by - dims.height - 10.0,
+                    dims.width + 28.0, dims.height + 22.0, Color::new(0.0, 0.0, 0.0, 0.72));
+                draw_text(msg, bx, by, font_size, YELLOW);
+                let hint = "Esc to cancel";
+                let hd = measure_text(hint, None, 16, 1.0);
+                draw_text(hint, (screen_width() - hd.width) * 0.5, by + 22.0, 16.0, GRAY);
+            }
+
+            let prev_color_mode = section_color_mode;
             let mut height_color_changed = false;
+            let mut z_clip_changed = false;
             let mut egui_wants_sec_pointer = false;
+            let mut egui_wants_sec_keyboard = false;
             let mut class_colors_changed = false;
+            // Deferred so the work happens outside the egui closure, which
+            // already borrows most of the app state.
+            let mut do_apply_lasso = false;
+            let mut start_lasso = false;
+            let mut do_undo_op = false;
+            let mut do_save_edits = false;
+            let mut leave_corridor = false;
+            let mut export_request: Option<usize> = None;
+            // Tile mode streams whole tiles through a manager that owns its own
+            // point storage; wiring edits through it is a separate job, so the
+            // classify controls are hidden rather than silently doing nothing.
+            let classify_supported = !stages.is_empty() || !copc_stages.is_empty();
+            let edits_count: usize = stages.iter().map(|s| s.edits.ops.len())
+                .chain(copc_stages.iter().map(|cs| cs.edits.ops.len()))
+                .max().unwrap_or(0);
+            let edits_dirty = stages.iter().any(|s| s.edits.dirty)
+                || copc_stages.iter().any(|cs| cs.edits.dirty);
+            let export_sources = export_source_list(&stages, &copc_stages);
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_sec_pointer = egui_ctx.is_pointer_over_area();
+                egui_wants_sec_keyboard = egui_ctx.wants_keyboard_input();
                 class_colors_changed = classes_window(egui_ctx, &mut class_defs, max_class, &mut classes_save_status);
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
@@ -1238,19 +1874,25 @@ async fn main() {
                             sec_measure_a = None;
                             sec_measure_b = None;
                             sec_picked_point = None;
+                            lasso.clear();
+                            leave_corridor = true;
                         }
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.label("Color:");
                             egui_macroquad::egui::ComboBox::from_id_salt("color_mode")
-                                .selected_text(color_mode.label())
+                                .selected_text(section_color_mode.label())
                                 .show_ui(ui, |ui| {
                                     for mode in &ColorMode::ALL {
-                                        ui.selectable_value(&mut color_mode, *mode, mode.label());
+                                        ui.selectable_value(&mut section_color_mode, *mode, mode.label());
                                     }
                                 });
                         });
-                        height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max);
+                        height_color_changed = height_color_controls(ui, section_color_mode, &mut height_color_min, &mut height_color_max, data_offset[2]);
+                        z_clip_changed = z_clip_controls(
+                            ui, &mut z_clip_enabled, &mut z_clip_lo, &mut z_clip_hi,
+                            data_offset[2], height_range,
+                        );
                         ui.horizontal(|ui| {
                             ui.label("Background:");
                             let mut bg_egui = mq_to_egui(background);
@@ -1328,10 +1970,317 @@ async fn main() {
                             }
                             ui.label(format!("  Point Source Id: {}", p.point_source_id));
                         }
+
+                        // ---- Manual classification ----
+                        ui.separator();
+                        if classify_supported {
+                            ui.label("Classify:");
+                            ui.horizontal(|ui| {
+                                ui.label("To:");
+                                class_picker(ui, "classify_to", &mut classify_target, max_class, &class_defs);
+                            });
+                            ui.horizontal(|ui| {
+                                let mut restrict = classify_from.is_some();
+                                if ui.checkbox(&mut restrict, "Only from:").changed() {
+                                    classify_from = if restrict { Some(0) } else { None };
+                                }
+                                if let Some(ref mut from) = classify_from {
+                                    class_picker(ui, "classify_from", from, max_class, &class_defs);
+                                }
+                            });
+                            if app_mode == AppMode::SectionLasso {
+                                ui.label(format!("Click to add points ({} so far)", lasso.len()));
+                                ui.horizontal(|ui| {
+                                    if ui.add_enabled(lasso.len() >= 3,
+                                        egui_macroquad::egui::Button::new("Apply")).clicked() {
+                                        do_apply_lasso = true;
+                                    }
+                                    if ui.add_enabled(!lasso.is_empty(),
+                                        egui_macroquad::egui::Button::new("Undo point")).clicked() {
+                                        lasso.pop();
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        lasso.clear();
+                                        app_mode = AppMode::SectionView;
+                                    }
+                                });
+                                ui.label("Enter applies, Backspace removes a point, Esc cancels.");
+                            } else if app_mode == AppMode::SectionCorridorLoad {
+                                ui.label("Loading full-resolution corridor…");
+                            } else if ui.button("Lasso classify (O)").clicked() {
+                                lasso.clear();
+                                start_lasso = true;
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(edits_count > 0,
+                                    egui_macroquad::egui::Button::new("Undo last op")).clicked() {
+                                    do_undo_op = true;
+                                }
+                                if ui.add_enabled(edits_dirty,
+                                    egui_macroquad::egui::Button::new("Save edits")).clicked() {
+                                    do_save_edits = true;
+                                }
+                            });
+                            ui.label(format!(
+                                "{} op{}{}",
+                                edits_count,
+                                if edits_count == 1 { "" } else { "s" },
+                                if edits_dirty { " (unsaved)" } else { "" },
+                            ));
+                            if let Some(msg) = &classify_status {
+                                ui.label(msg.as_str());
+                            }
+                        } else {
+                            ui.label("Classification editing is not available in tile mode.");
+                        }
                     });
+                export_request = export_window(
+                    egui_ctx, &mut show_export_window, &mut export_filter,
+                    &mut export_job, &mut export_status, &export_sources,
+                    max_class, &class_defs,
+                );
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
             });
+
+            // A narrowed band should drive the height ramp too: colouring
+            // against the full dataset range wastes most of the gradient on
+            // levels that are no longer drawn. Route it through the existing
+            // height-colour path rather than adding a parallel one.
+            if z_clip_changed {
+                if z_clip_enabled {
+                    height_color_min = z_clip_lo;
+                    height_color_max = z_clip_hi;
+                } else {
+                    height_color_min = 0.0;
+                    height_color_max = height_range;
+                }
+                height_color_changed = true;
+            }
             egui_macroquad::draw();
+
+            // ---- Lasso keyboard shortcuts ----
+            if !egui_wants_sec_keyboard {
+                if app_mode == AppMode::SectionLasso {
+                    if is_key_pressed(KeyCode::Backspace) { lasso.pop(); }
+                    if is_key_pressed(KeyCode::Enter) && lasso.len() >= 3 { do_apply_lasso = true; }
+                } else if classify_supported
+                    && app_mode != AppMode::SectionCorridorLoad
+                    && is_key_pressed(KeyCode::O)
+                {
+                    // Same entry point as the button, so `O` also triggers the
+                    // corridor force-load on a COPC cloud rather than dropping
+                    // straight into a lasso over the thinned LOD sample.
+                    lasso.clear();
+                    start_lasso = true;
+                }
+            }
+
+            // ---- Starting the lasso pulls in the full-resolution corridor ----
+            // A section cut for browsing shows the resident LOD, which is a
+            // thinned sample. Classifying against that would mark the sampled
+            // points and silently leave the dense remainder alone, so the
+            // corridor is force-loaded here — once per section, not on every
+            // cut — and the slice re-cut from it before any lasso is drawn.
+            if start_lasso {
+                if copc_stages.is_empty() || corridor_pinned {
+                    app_mode = AppMode::SectionLasso;
+                } else if let (Some(start), Some(end)) = (section_start, section_end) {
+                    let mut nodes = 0usize;
+                    let mut pts: i64 = 0;
+                    for cs in copc_stages.iter_mut() {
+                        let (n, p) = cs.pin_corridor(start, end, section_depth);
+                        nodes += n;
+                        pts += p;
+                    }
+                    if pts > CORRIDOR_POINT_LIMIT {
+                        for cs in copc_stages.iter_mut() { cs.clear_pins(); }
+                        classify_status = Some(format!(
+                            "Corridor holds {:.1}M points (limit {:.0}M) — shorten the \
+                             section line or reduce the depth before classifying.",
+                            pts as f64 / 1e6, CORRIDOR_POINT_LIMIT as f64 / 1e6,
+                        ));
+                    } else {
+                        info!(
+                            "Section corridor: {} nodes, {} points across {} file(s)",
+                            nodes, pts, copc_stages.len(),
+                        );
+                        corridor_total_points = pts;
+                        corridor_pinned = true;
+                        corridor_load_to_lasso = true;
+                        classify_status = None;
+                        app_mode = AppMode::SectionCorridorLoad;
+                    }
+                }
+            }
+
+            // ---- Apply a classification op ----
+            if do_apply_lasso && lasso.len() >= 3
+                && let (Some(start), Some(end)) = (section_start, section_end) {
+                    // The op is stored in absolute world coordinates so it stays
+                    // meaningful independently of the viewer origin, and of which
+                    // nodes happened to be resident when it was drawn.
+                    let op = crate::classify::ClassOp::corridor(
+                        0,
+                        (start.0 as f64 + data_offset[0], start.1 as f64 + data_offset[1]),
+                        (end.0 as f64 + data_offset[0], end.1 as f64 + data_offset[1]),
+                        section_depth as f64,
+                        lasso.iter().map(|v| (v.x as f64, v.y as f64 + data_offset[2])).collect(),
+                        classify_target,
+                        classify_from,
+                    );
+
+                    let mut changed = 0usize;
+                    let mut touched = 0usize;
+                    {
+                        let mut gl = unsafe { get_internal_gl() };
+                        gl.flush();
+                        for st in stages.iter_mut() {
+                            if !op.intersects_aabb(&st.cloud.min, &st.cloud.max) { continue; }
+                            let from = st.edits.ops.len();
+                            st.edits.push(op.clone());
+                            changed += st.apply_edits(&mut *gl.quad_context, color_mode, from);
+                            touched += 1;
+                        }
+                        for cs in copc_stages.iter_mut() {
+                            if !op.intersects_aabb(&cs.global_min, &cs.global_max) { continue; }
+                            let from = cs.edits.ops.len();
+                            cs.edits.push(op.clone());
+                            changed += cs.apply_edits_to_loaded(&mut *gl.quad_context, color_mode, from);
+                            touched += 1;
+                        }
+                    }
+
+                    // The section keeps its own copies of the COPC points, for
+                    // recolouring and Point Info; they have to move too or the
+                    // slice would disagree with the 3D view.
+                    if let Some((ref mut per_stage_raw, _, _, _)) = copc_section_raw {
+                        for raw in per_stage_raw.iter_mut() {
+                            for (p, _, _) in raw.iter_mut() {
+                                op.apply_point(p);
+                            }
+                        }
+                    }
+
+                    {
+                        let mut gl = unsafe { get_internal_gl() };
+                        gl.flush();
+                        if !stages.is_empty() {
+                            section_data = Some(build_section_from_stages(
+                                &mut *gl.quad_context, &stages, start, end, section_depth, section_color_mode,
+                            ));
+                        } else if let Some((ref per_stage_raw, length, h_min, h_max)) = copc_section_raw {
+                            section_data = Some(build_section_from_raw_stages(
+                                &mut *gl.quad_context, &copc_stages, per_stage_raw,
+                                length, h_min, h_max, section_color_mode,
+                            ));
+                        }
+                    }
+
+                    // Persist immediately. The sidecar is a few hundred bytes and
+                    // an unsaved session's worth of manual classification is not
+                    // something to leave riding on a clean shutdown.
+                    let mut save_err = None;
+                    for st in stages.iter_mut().filter(|s| s.edits.dirty) {
+                        let path = st.filepath.clone();
+                        if let Err(e) = st.edits.save(&path) { save_err = Some(e.to_string()); }
+                    }
+                    for cs in copc_stages.iter_mut().filter(|c| c.edits.dirty) {
+                        let path = cs.filepath.clone();
+                        if let Err(e) = cs.edits.save(&path) { save_err = Some(e.to_string()); }
+                    }
+
+                    classify_status = Some(match (save_err, touched) {
+                        (Some(e), _) => format!("{changed} points reclassified — SAVE FAILED: {e}"),
+                        (None, 0) => "Lasso did not overlap any loaded file".to_string(),
+                        (None, _) => format!("{changed} points → class {classify_target}"),
+                    });
+                    lasso.clear();
+                    app_mode = AppMode::SectionView;
+            }
+
+            // ---- Undo the last op ----
+            // An op does not record the classes it overwrote, so undoing means
+            // re-deriving from the source: resident points are re-read, and
+            // streamed COPC nodes are dropped so they arrive again with the
+            // shortened op list applied.
+            if do_undo_op {
+                // An op is only recorded against the files it overlaps, so
+                // "the last op" is the highest sequence number anywhere, and it
+                // is removed from exactly the files that carry it.
+                let last_seq = stages.iter().filter_map(|s| s.edits.ops.last().map(|o| o.seq))
+                    .chain(copc_stages.iter().filter_map(|c| c.edits.ops.last().map(|o| o.seq)))
+                    .max();
+                let mut stages_touched = false;
+                let mut copc_touched = false;
+                if let Some(seq) = last_seq {
+                    let mut gl = unsafe { get_internal_gl() };
+                    gl.flush();
+                    for st in stages.iter_mut() {
+                        if st.edits.ops.last().map(|o| o.seq) != Some(seq) { continue; }
+                        st.edits.undo();
+                        st.reload_points(&mut *gl.quad_context, color_mode);
+                        let path = st.filepath.clone();
+                        let _ = st.edits.save(&path);
+                        stages_touched = true;
+                    }
+                    for cs in copc_stages.iter_mut() {
+                        if cs.edits.ops.last().map(|o| o.seq) != Some(seq) { continue; }
+                        cs.edits.undo();
+                        cs.invalidate_loaded(&mut *gl.quad_context);
+                        let path = cs.filepath.clone();
+                        let _ = cs.edits.save(&path);
+                        copc_touched = true;
+                    }
+                }
+
+                classify_status = Some(if last_seq.is_some() {
+                    "Last op undone".to_string()
+                } else {
+                    "Nothing to undo".to_string()
+                });
+
+                if stages_touched && let (Some(a), Some(b)) = (section_start, section_end) {
+                    let mut gl = unsafe { get_internal_gl() };
+                    gl.flush();
+                    section_data = Some(build_section_from_stages(
+                        &mut *gl.quad_context, &stages, a, b, section_depth, section_color_mode,
+                    ));
+                } else if copc_touched {
+                    // The corridor has to stream in again before the slice can
+                    // be rebuilt; go back through the loading state.
+                    copc_section_raw = None;
+                    corridor_load_to_lasso = false;
+                    app_mode = AppMode::SectionCorridorLoad;
+                }
+            }
+
+            if do_save_edits {
+                let mut err = None;
+                for st in stages.iter_mut() {
+                    let path = st.filepath.clone();
+                    if let Err(e) = st.edits.save(&path) { err = Some(e.to_string()); }
+                }
+                for cs in copc_stages.iter_mut() {
+                    let path = cs.filepath.clone();
+                    if let Err(e) = cs.edits.save(&path) { err = Some(e.to_string()); }
+                }
+                classify_status = Some(match err {
+                    Some(e) => format!("Save failed: {e}"),
+                    None => "Edits saved".to_string(),
+                });
+            }
+
+            if leave_corridor {
+                for cs in copc_stages.iter_mut() { cs.clear_pins(); }
+                corridor_pinned = false;
+            }
+
+            if let Some(idx) = export_request {
+                start_export(
+                    idx, &stages, &copc_stages, &export_filter,
+                    &mut export_job, &mut export_status,
+                );
+            }
 
             // ---- Section measure click handling ----
             if !egui_wants_sec_pointer && is_mouse_button_pressed(MouseButton::Left) {
@@ -1343,6 +2292,9 @@ async fn main() {
                 let wy = (1.0 - my / screen_height()) * 2.0 * half_h + (section_pan.y - half_h);
                 let pos = glam::Vec2::new(wx, wy);
                 match app_mode {
+                    AppMode::SectionLasso => {
+                        lasso.push(pos);
+                    }
                     AppMode::SectionMeasureFirst => {
                         sec_measure_a = Some(pos);
                         sec_measure_b = None;
@@ -1355,7 +2307,7 @@ async fn main() {
                         if let (Some(start), Some(end)) = (section_start, section_end) {
                             sec_picked_point = pick_section_point(
                                 &stages, &copc_section_raw, &tile_mgr,
-                                start, end, section_depth, wx, wy,
+                                start, end, section_depth, z_clip, wx, wy,
                             );
                         }
                     }
@@ -1374,8 +2326,34 @@ async fn main() {
                     if let Some(mgr) = tile_mgr.as_mut() { mgr.rebuild_colors(&mut *gl.quad_context, color_mode); }
                 }
             }
-            let class_rebuild = class_colors_changed && color_mode == ColorMode::Classification;
-            if (color_mode != prev_color_mode || height_color_changed || class_rebuild) &&
+            // The COPC section keeps a cache of the points it cut, filtered by
+            // the band that was in force at the time. Widening the band cannot
+            // be served from that cache, so re-cut from the pinned corridor —
+            // which is still resident, so this stays a memory operation.
+            if z_clip_changed && !copc_stages.is_empty()
+                && let (Some(start), Some(end)) = (section_start, section_end) {
+                    let mut per_stage_raw: Vec<Vec<(LasPoint, f32, f32)>> = Vec::new();
+                    let (mut h_min, mut h_max) = (f32::MAX, f32::MIN);
+                    let mut length = 0.0_f32;
+                    for cs in &copc_stages {
+                        let (_verts, raw, len, hmin, hmax) =
+                            cs.extract_section_verts(start, end, section_depth, section_color_mode);
+                        per_stage_raw.push(raw);
+                        h_min = h_min.min(hmin); h_max = h_max.max(hmax);
+                        length = length.max(len);
+                    }
+                    let h_min = if h_min == f32::MAX { 0.0 } else { h_min };
+                    let h_max = if h_max == f32::MIN { 0.0 } else { h_max };
+                    copc_section_raw = Some((per_stage_raw, length, h_min, h_max));
+                    sec_picked_point = None;
+            }
+
+            if section_color_mode != prev_color_mode {
+                section_color_mode_pinned = true;
+            }
+
+            let class_rebuild = class_colors_changed && section_color_mode == ColorMode::Classification;
+            if (section_color_mode != prev_color_mode || height_color_changed || class_rebuild) &&
                 let (Some(start), Some(end)) = (section_start, section_end) {
                     if height_color_changed {
                         apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
@@ -1383,18 +2361,18 @@ async fn main() {
                     let gl = unsafe { get_internal_gl() };
                     if !stages.is_empty() {
                         section_data = Some(build_section_from_stages(
-                            &mut *gl.quad_context, &stages, start, end, section_depth, color_mode,
+                            &mut *gl.quad_context, &stages, start, end, section_depth, section_color_mode,
                         ));
                     } else if !copc_stages.is_empty() {
                         if let Some((ref per_stage_raw, length, h_min, h_max)) = copc_section_raw {
                             section_data = Some(build_section_from_raw_stages(
                                 &mut *gl.quad_context, &copc_stages, per_stage_raw,
-                                length, h_min, h_max, color_mode,
+                                length, h_min, h_max, section_color_mode,
                             ));
                         }
                     } else if let Some(ref mgr) = tile_mgr {
                         section_data = Some(mgr.extract_section(
-                            &mut *gl.quad_context, start, end, section_depth, color_mode,
+                            &mut *gl.quad_context, start, end, section_depth, section_color_mode,
                         ));
                     }
             }
@@ -1404,6 +2382,43 @@ async fn main() {
         }
 
         // ---- 3D view modes (shared navigation) ----
+        let mut start_ground_lasso = false;
+        let mut apply_ground_lasso = false;
+        let mut cancel_ground_lasso = false;
+        // `C` mirrors the Cross Section button, including its toggle-to-cancel
+        // behaviour, so the two stay interchangeable.
+        if is_key_pressed(KeyCode::C) && !egui_wants_keyboard_prev {
+            match app_mode {
+                AppMode::View3D | AppMode::PointPick => {
+                    app_mode = AppMode::SectionPickStart;
+                    section_start = None;
+                    section_end = None;
+                    picked_point = None;
+                    picked_tile_point = None;
+                    picked_copc_point = None;
+                }
+                AppMode::SectionPickStart | AppMode::SectionPickEnd | AppMode::SectionAdjustDepth => {
+                    app_mode = AppMode::View3D;
+                    section_start = None;
+                    section_end = None;
+                }
+                _ => {}
+            }
+        }
+
+        // ---- Plan-view ground tool ----
+        // Handled once here rather than in each render block's click `match`,
+        // since it behaves identically in single-file, COPC and tile modes.
+        if is_key_pressed(KeyCode::G) && !egui_wants_keyboard_prev {
+            match app_mode {
+                AppMode::View3D | AppMode::PointPick => start_ground_lasso = true,
+                AppMode::GroundLasso => {
+                    ground_lasso.clear();
+                    app_mode = AppMode::View3D;
+                }
+                _ => {}
+            }
+        }
         if is_key_pressed(KeyCode::Tab) {
             grabbed = !grabbed;
             set_cursor_grab(grabbed);
@@ -1442,22 +2457,25 @@ async fn main() {
 
         let mid_z = height_range * 0.5;
 
-        // Orbit pivot: screen-center ray intersected with mid_z plane
-        /*let orbit_pivot = if front.z.abs() > 0.01 {
-            //println!("orbit {} {}",position + front * ((mid_z - position.z) / front.z),mid_z);
-            position + front * ((mid_z - position.z) / front.z)
-        } else {
-            //println!("data_center {}",data_center);
-            data_center
-        };*/
+        // Orbit pivot: screen-centre ray intersected with the mid_z plane.
         if !pivot_locked {
-            orbit_pivot = position + front * ((mid_z - position.z) / front.z);
-            //println!("not locked");
+            if front.z.abs() > 0.01 {
+                orbit_pivot = position + front * ((mid_z - position.z) / front.z);
+            } else {
+                // Looking horizontally, the screen-centre ray never meets the
+                // mid-height plane. Dividing by `front.z` here yields an
+                // infinity, and `front.z * inf` is NaN — which lands straight
+                // in the camera's `target` and blanks the view. Keep the pivot
+                // the same distance ahead of the camera instead, so it stays
+                // centred and still follows panning.
+                let dist = (orbit_pivot - position).dot(front).abs().max(1.0);
+                orbit_pivot = position + front * dist;
+            }
         }
         
         let mode_uses_click = matches!(app_mode,
             AppMode::SectionPickStart | AppMode::SectionPickEnd |
-            AppMode::SectionAdjustDepth |
+            AppMode::SectionAdjustDepth | AppMode::GroundLasso |
             AppMode::PointPick | AppMode::MeasureFirst | AppMode::MeasureSecond
         );
         pivot_locked = false;
@@ -1490,9 +2508,12 @@ async fn main() {
         }
 
         if is_mouse_button_down(MouseButton::Right) && !egui_wants_pointer_prev {
+            // 1:1 with the cursor — the point under the pointer stays under it.
+            // Any multiplier here makes the cloud outrun the mouse and shoot
+            // off screen on a short drag.
             let units_per_pixel = ortho_scale * 2.0 / screen_height();
-            position -= right * mouse_delta.x * units_per_pixel * 10.0;
-            position += up * mouse_delta.y * units_per_pixel * 10.0;
+            position -= right * mouse_delta.x * units_per_pixel;
+            position += up * mouse_delta.y * units_per_pixel;
         }
 
         clear_background(background);
@@ -1514,43 +2535,24 @@ async fn main() {
         let (mx, my) = macroquad::input::mouse_position();
         let cursor_world = screen_to_world_xy(mx, my, &view_proj, mid_z);
 
-        // ---- Measure overlays ----
-        let cross_size = ortho_scale * 0.015;
-        if let Some(a) = measure_a {
-            draw_line_3d(vec3(a.x - cross_size, a.y, a.z), vec3(a.x + cross_size, a.y, a.z), YELLOW);
-            draw_line_3d(vec3(a.x, a.y - cross_size, a.z), vec3(a.x, a.y + cross_size, a.z), YELLOW);
-            draw_line_3d(vec3(a.x, a.y, a.z - cross_size), vec3(a.x, a.y, a.z + cross_size), YELLOW);
+        if app_mode == AppMode::GroundLasso {
+            if !egui_wants_pointer_prev && is_mouse_button_pressed(MouseButton::Left)
+                && let Some((wx, wy)) = cursor_world {
+                    ground_lasso.push(glam::Vec2::new(wx, wy));
+            }
+            if !egui_wants_keyboard_prev {
+                if is_key_pressed(KeyCode::Backspace) { ground_lasso.pop(); }
+                if is_key_pressed(KeyCode::Enter) && ground_lasso.len() >= 3 {
+                    apply_ground_lasso = true;
+                }
+            }
         }
-        if let Some(b) = measure_b {
-            draw_line_3d(vec3(b.x - cross_size, b.y, b.z), vec3(b.x + cross_size, b.y, b.z), ORANGE);
-            draw_line_3d(vec3(b.x, b.y - cross_size, b.z), vec3(b.x, b.y + cross_size, b.z), ORANGE);
-            draw_line_3d(vec3(b.x, b.y, b.z - cross_size), vec3(b.x, b.y, b.z + cross_size), ORANGE);
-        }
-        if let (Some(a), Some(b)) = (measure_a, measure_b) {
-            draw_line_3d(a, b, WHITE);
-        }
+
+        // Measure markers and the section preview are drawn per-render-block,
+        // after the cloud has been composited. See `draw_3d_overlays`.
 
         // ---- Single-file (multi-Stage) mode rendering ----
         if !stages.is_empty() {
-            // Section preview
-            match app_mode {
-                AppMode::SectionPickEnd => {
-                    if let (Some(start), Some((wx, wy))) = (section_start, cursor_world) {
-                        draw_line_3d(
-                            vec3(start.0, start.1, mid_z),
-                            vec3(wx, wy, mid_z),
-                            YELLOW,
-                        );
-                    }
-                }
-                AppMode::SectionAdjustDepth => {
-                    if let (Some(start), Some(end)) = (section_start, section_end) {
-                        draw_section_corridor(start, end, section_depth, height_range);
-                    }
-                }
-                _ => {}
-            }
-
             // Render points across all stages (with optional EDL post-process)
             let drawn = {
                 let mut gl = unsafe { get_internal_gl() };
@@ -1576,11 +2578,17 @@ async fn main() {
                 drawn
             };
 
+            draw_3d_overlays(
+                app_mode, measure_a, measure_b, section_start, section_end,
+                cursor_world, section_depth, mid_z, height_range, ortho_scale,
+                &ground_lasso, class_color_mq(classify_target, &class_defs),
+            );
+
             set_default_camera();
 
             // View cube
             let vc_interactive = app_mode == AppMode::View3D || app_mode == AppMode::PointPick;
-            if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive) {
+            if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive, !egui_wants_keyboard_prev) {
                 let old_front = front;
                 yaw = new_yaw;
                 pitch = new_pitch;
@@ -1592,24 +2600,31 @@ async fn main() {
             // egui UI
             let prev_color_mode = color_mode;
             let mut height_color_changed = false;
+            let mut z_clip_changed = false;
             let overrides_before: Vec<Option<[f32; 3]>> =
                 stages.iter().map(|s| s.rgb_override).collect();
             let mut new_overrides = overrides_before.clone();
             let mut egui_wants_pointer = false;
+            let mut egui_wants_keyboard = false;
             let mut do_zoom_all = false;
             let mut class_colors_changed = false;
+            let mut export_request: Option<usize> = None;
+            let export_sources = export_source_list(&stages, &copc_stages);
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_pointer = egui_ctx.is_pointer_over_area();
+                egui_wants_keyboard = egui_ctx.wants_keyboard_input();
                 class_colors_changed = classes_window(egui_ctx, &mut class_defs, max_class, &mut classes_save_status);
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
                         let section_label = match app_mode {
-                            AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst | AppMode::MeasureSecond => "Cross Section",
+                            AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
+                                | AppMode::MeasureSecond | AppMode::GroundLasso => "Cross Section",
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
-                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick => "Back to 3D",
+                            AppMode::SectionCorridorLoad => "Loading corridor...",
+                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso => "Back to 3D",
                         };
                         if ui.button(section_label).clicked() {
                             match app_mode {
@@ -1664,7 +2679,11 @@ async fn main() {
                                     }
                                 });
                         });
-                        height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max);
+                        height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max, data_offset[2]);
+                        z_clip_changed = z_clip_controls(
+                            ui, &mut z_clip_enabled, &mut z_clip_lo, &mut z_clip_hi,
+                            data_offset[2], height_range,
+                        );
                         ui.horizontal(|ui| {
                             ui.label("Background:");
                             let mut bg_egui = mq_to_egui(background);
@@ -1673,6 +2692,7 @@ async fn main() {
                             }
                         });
                         ui.horizontal(|ui| {
+                            if ui.button("Export…").clicked() { show_export_window = !show_export_window; }
                             if ui.button("Zoom All").clicked() { do_zoom_all = true; }
                             ui.label("Pt size:");
                             if ui.button("-").clicked() { point_size = (point_size - 1.0).max(1.0); }
@@ -1687,6 +2707,12 @@ async fn main() {
                                 ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
                             }
                         });
+                        if ground_tool_controls(
+                            ui, &mut app_mode, ground_lasso.len(),
+                            &mut classify_target, &mut classify_from, &mut ground_offset,
+                            max_class, &class_defs, &ground_status,
+                            &mut apply_ground_lasso, &mut cancel_ground_lasso,
+                        ) { start_ground_lasso = true; }
                         if color_mode == ColorMode::Rgb {
                             for (i, ov) in new_overrides.iter_mut().enumerate() {
                                 let label = if stages.len() > 1 {
@@ -1787,10 +2813,38 @@ async fn main() {
                             ui.label(format!("  Point Source Id: {}", p.point_source_id));
                         }
                     });
+                export_request = export_window(
+                    egui_ctx, &mut show_export_window, &mut export_filter,
+                    &mut export_job, &mut export_status, &export_sources,
+                    max_class, &class_defs,
+                );
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
             });
+
+            // A narrowed band should drive the height ramp too: colouring
+            // against the full dataset range wastes most of the gradient on
+            // levels that are no longer drawn. Route it through the existing
+            // height-colour path rather than adding a parallel one.
+            if z_clip_changed {
+                if z_clip_enabled {
+                    height_color_min = z_clip_lo;
+                    height_color_max = z_clip_hi;
+                } else {
+                    height_color_min = 0.0;
+                    height_color_max = height_range;
+                }
+                height_color_changed = true;
+            }
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
+            egui_wants_keyboard_prev = egui_wants_keyboard;
+
+            if let Some(idx) = export_request {
+                start_export(
+                    idx, &stages, &copc_stages, &export_filter,
+                    &mut export_job, &mut export_status,
+                );
+            }
 
             if do_zoom_all
                 && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr)
@@ -1851,6 +2905,7 @@ async fn main() {
                             section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
                             section_data = Some(sec);
                             sec_picked_point = None;
+                            if !section_color_mode_pinned { section_color_mode = color_mode; }
                             app_mode = AppMode::SectionView;
                         }
                     }
@@ -1915,25 +2970,9 @@ async fn main() {
                     loaded_so_far += cs.total_loaded_points();
                 }
             }
+
             let copc_overrides_before: Vec<Option<[f32; 3]>> = copc_stages.iter().map(|cs| cs.rgb_override).collect();
             let mut new_copc_overrides = copc_overrides_before.clone();
-
-            // Section corridor preview in 3D.
-            match app_mode {
-                AppMode::SectionPickEnd => {
-                    if let (Some(start), Some((wx, wy))) = (section_start, cursor_world) {
-                        draw_line_3d(vec3(start.0, start.1, mid_z), vec3(wx, wy, mid_z), YELLOW);
-                    }
-                }
-                AppMode::SectionAdjustDepth => {
-                    if let (Some(start), Some(end)) = (section_start, section_end) {
-                        //println!("here!");
-                        //set_camera(&camera);
-                        draw_section_corridor(start, end, section_depth, height_range);
-                    }
-                }
-                _ => {}
-            }
 
             // Render visible chunks (with optional EDL).
             let drawn = {
@@ -1958,11 +2997,17 @@ async fn main() {
                 drawn
             };
 
+            draw_3d_overlays(
+                app_mode, measure_a, measure_b, section_start, section_end,
+                cursor_world, section_depth, mid_z, height_range, ortho_scale,
+                &ground_lasso, class_color_mq(classify_target, &class_defs),
+            );
+
             set_default_camera();
 
             // View cube
             let vc_interactive = app_mode == AppMode::View3D || app_mode == AppMode::PointPick;
-            if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive) {
+            if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive, !egui_wants_keyboard_prev) {
                 let old_front = front;
                 yaw = new_yaw;
                 pitch = new_pitch;
@@ -1974,21 +3019,29 @@ async fn main() {
             // egui UI
             let prev_color_mode = color_mode;
             let mut height_color_changed = false;
+            let mut z_clip_changed = false;
             let mut egui_wants_pointer = false;
+            let mut egui_wants_keyboard = false;
             let mut do_zoom_all = false;
             let mut class_colors_changed = false;
+            let mut leave_corridor = false;
+            let mut export_request: Option<usize> = None;
+            let export_sources = export_source_list(&stages, &copc_stages);
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_pointer = egui_ctx.is_pointer_over_area();
+                egui_wants_keyboard = egui_ctx.wants_keyboard_input();
                 class_colors_changed = classes_window(egui_ctx, &mut class_defs, max_class, &mut classes_save_status);
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
                         let section_label = match app_mode {
-                            AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst | AppMode::MeasureSecond => "Cross Section",
+                            AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
+                                | AppMode::MeasureSecond | AppMode::GroundLasso => "Cross Section",
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
-                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick => "Back to 3D",
+                            AppMode::SectionCorridorLoad => "Loading corridor...",
+                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso => "Back to 3D",
                         };
                         if ui.button(section_label).clicked() {
                             match app_mode {
@@ -1998,7 +3051,12 @@ async fn main() {
                                     section_end = None;
                                     picked_point = None;
                                 }
-                                _ => { app_mode = AppMode::View3D; section_data = None; }
+                                _ => {
+                                    app_mode = AppMode::View3D;
+                                    section_data = None;
+                                    leave_corridor = true;
+                                    corridor_status = None;
+                                }
                             }
                         }
                         let pick_label = if app_mode == AppMode::PointPick {
@@ -2032,7 +3090,11 @@ async fn main() {
                                     }
                                 });
                         });
-                        height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max);
+                        height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max, data_offset[2]);
+                        z_clip_changed = z_clip_controls(
+                            ui, &mut z_clip_enabled, &mut z_clip_lo, &mut z_clip_hi,
+                            data_offset[2], height_range,
+                        );
                         ui.horizontal(|ui| {
                             ui.label("Background:");
                             let mut bg_egui = mq_to_egui(background);
@@ -2041,6 +3103,7 @@ async fn main() {
                             }
                         });
                         ui.horizontal(|ui| {
+                            if ui.button("Export…").clicked() { show_export_window = !show_export_window; }
                             if ui.button("Zoom All").clicked() { do_zoom_all = true; }
                             ui.label("Pt size:");
                             if ui.button("-").clicked() { point_size = (point_size - 1.0).max(1.0); }
@@ -2055,6 +3118,12 @@ async fn main() {
                                 ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
                             }
                         });
+                        if ground_tool_controls(
+                            ui, &mut app_mode, ground_lasso.len(),
+                            &mut classify_target, &mut classify_from, &mut ground_offset,
+                            max_class, &class_defs, &ground_status,
+                            &mut apply_ground_lasso, &mut cancel_ground_lasso,
+                        ) { start_ground_lasso = true; }
                         if color_mode == ColorMode::Rgb {
                             for (i, ov) in new_copc_overrides.iter_mut().enumerate() {
                                 let label = if copc_stages.len() > 1 {
@@ -2152,10 +3221,43 @@ async fn main() {
                             ui.label(format!("  Point Source Id: {}", p.point_source_id));
                         }
                     });
+                export_request = export_window(
+                    egui_ctx, &mut show_export_window, &mut export_filter,
+                    &mut export_job, &mut export_status, &export_sources,
+                    max_class, &class_defs,
+                );
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
             });
+
+            // A narrowed band should drive the height ramp too: colouring
+            // against the full dataset range wastes most of the gradient on
+            // levels that are no longer drawn. Route it through the existing
+            // height-colour path rather than adding a parallel one.
+            if z_clip_changed {
+                if z_clip_enabled {
+                    height_color_min = z_clip_lo;
+                    height_color_max = z_clip_hi;
+                } else {
+                    height_color_min = 0.0;
+                    height_color_max = height_range;
+                }
+                height_color_changed = true;
+            }
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
+            egui_wants_keyboard_prev = egui_wants_keyboard;
+
+            if leave_corridor {
+                for cs in copc_stages.iter_mut() { cs.clear_pins(); }
+                corridor_pinned = false;
+            }
+
+            if let Some(idx) = export_request {
+                start_export(
+                    idx, &stages, &copc_stages, &export_filter,
+                    &mut export_job, &mut export_status,
+                );
+            }
 
             if do_zoom_all
                 && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr)
@@ -2192,16 +3294,20 @@ async fn main() {
                         }
                     }
                     AppMode::SectionAdjustDepth => {
+                        // Cut from the resident LOD, as before. Full-resolution
+                        // force-loading is deferred until the classification
+                        // tool is actually started: browsing sections is the
+                        // common case and has to stay instant.
                         if let (Some(start), Some(end)) = (section_start, section_end) {
                             let gl = unsafe { get_internal_gl() };
-                            // Combine verts from all COPC stages into one SectionData.
                             let mut all_verts = Vec::new();
                             let mut per_stage_raw: Vec<Vec<(LasPoint, f32, f32)>> = Vec::new();
                             let (mut h_min, mut h_max) = (f32::MAX, f32::MIN);
                             let mut length = 0.0_f32;
                             let height_range = copc_stages[0].height_range();
                             for cs in &copc_stages {
-                                let (verts, raw, len, hmin, hmax) = cs.extract_section_verts(start, end, section_depth, color_mode);
+                                let (verts, raw, len, hmin, hmax) =
+                                    cs.extract_section_verts(start, end, section_depth, color_mode);
                                 all_verts.extend(verts);
                                 per_stage_raw.push(raw);
                                 h_min = h_min.min(hmin); h_max = h_max.max(hmax);
@@ -2211,11 +3317,16 @@ async fn main() {
                             let h_max = if h_max == f32::MIN { 0.0 } else { h_max };
                             info!("COPC Section: {:.1}m long, {} points", length, all_verts.len());
                             copc_section_raw = Some((per_stage_raw, length, h_min, h_max));
-                            let sec = make_section_data(&mut *gl.quad_context, all_verts, length, h_min, h_max, height_range);
-                            section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
-                            section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
+                            let sec = make_section_data(
+                                &mut *gl.quad_context, all_verts, length, h_min, h_max, height_range);
+                            section_pan = glam::Vec2::new(
+                                sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
+                            section_zoom = (sec.length / 2.0)
+                                .max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
                             section_data = Some(sec);
                             sec_picked_point = None;
+                            corridor_status = None;
+                            if !section_color_mode_pinned { section_color_mode = color_mode; }
                             app_mode = AppMode::SectionView;
                         }
                     }
@@ -2276,30 +3387,34 @@ async fn main() {
 
         // ---- Tile mode rendering ----
         if copc_stages.is_empty() && let Some(ref mgr) = tile_mgr {
-            //println!("tile mode");
-            // Section preview (in 3D)
-            match app_mode {
-                AppMode::SectionPickEnd => {
-                    if let (Some(start), Some((wx, wy))) = (section_start, cursor_world) {
-                        draw_line_3d(
-                            vec3(start.0, start.1, mid_z),
-                            vec3(wx, wy, mid_z),
-                            YELLOW,
-                        );
-                    }
-                }
-                AppMode::SectionAdjustDepth => {
-                    if let (Some(start), Some(end)) = (section_start, section_end) {
-                        //println!("here!");
-                        //set_camera(&camera);
-                        draw_section_corridor(start, end, section_depth, height_range);
-                    }
-                }
-                _ => {}
-            }
-
-            // Draw tile boundaries at z=0
             set_camera(&camera);
+
+            // Render loaded tile points (with optional EDL post-process)
+            let (drawn, total) = {
+                let mut gl = unsafe { get_internal_gl() };
+                gl.flush();
+                edl_renderer.resize_if_needed(
+                    &mut *gl.quad_context,
+                    screen_width() as u32,
+                    screen_height() as u32,
+                );
+                if edl_enabled {
+                    edl_renderer.begin(&mut *gl.quad_context);
+                } else {
+                    gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
+                }
+                let result = mgr.draw_visible(&mut *gl.quad_context, &view_proj, point_size);
+                if edl_enabled {
+                    edl_renderer.apply(&mut *gl.quad_context, edl_strength);
+                } else {
+                    gl.quad_context.end_render_pass();
+                }
+                result
+            };
+
+            // Tile footprints, after the composite for the same reason as the
+            // overlays: a footprint over loaded points would otherwise be
+            // erased by the EDL blit.
             for i in 0..mgr.tiles.len() {
                 let corners = mgr.tile_corners(i);
                 let is_loaded = mgr.loaded[i].is_some();
@@ -2325,28 +3440,11 @@ async fn main() {
                 }
             }
 
-            // Render loaded tile points (with optional EDL post-process)
-            let (drawn, total) = {
-                let mut gl = unsafe { get_internal_gl() };
-                gl.flush();
-                edl_renderer.resize_if_needed(
-                    &mut *gl.quad_context,
-                    screen_width() as u32,
-                    screen_height() as u32,
-                );
-                if edl_enabled {
-                    edl_renderer.begin(&mut *gl.quad_context);
-                } else {
-                    gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
-                }
-                let result = mgr.draw_visible(&mut *gl.quad_context, &view_proj, point_size);
-                if edl_enabled {
-                    edl_renderer.apply(&mut *gl.quad_context, edl_strength);
-                } else {
-                    gl.quad_context.end_render_pass();
-                }
-                result
-            };
+            draw_3d_overlays(
+                app_mode, measure_a, measure_b, section_start, section_end,
+                cursor_world, section_depth, mid_z, height_range, ortho_scale,
+                &ground_lasso, class_color_mq(classify_target, &class_defs),
+            );
 
             set_default_camera();
 
@@ -2366,7 +3464,7 @@ async fn main() {
 
             // View cube
             let vc_interactive = app_mode == AppMode::View3D || app_mode == AppMode::PointPick;
-            if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive) {
+            if let Some((new_yaw, new_pitch)) = view_cube::draw_and_interact(front, right, up, vc_interactive, !egui_wants_keyboard_prev) {
                 let old_front = front;
                 yaw = new_yaw;
                 pitch = new_pitch;
@@ -2378,26 +3476,33 @@ async fn main() {
             // egui UI
             let prev_color_mode = color_mode;
             let mut height_color_changed = false;
+            let mut z_clip_changed = false;
             let mut egui_wants_pointer = false;
+            let mut egui_wants_keyboard = false;
             let mut request_load: Option<usize> = None;
             let mut request_unload: Option<usize> = None;
             let mut do_zoom_all = false;
             let mut do_zoom_selected = false;
             let mut tile_override_changed: Option<usize> = None;
             let mut class_colors_changed = false;
+            let mut export_request: Option<usize> = None;
+            let export_sources = export_source_list(&stages, &copc_stages);
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_pointer = egui_ctx.is_pointer_over_area();
+                egui_wants_keyboard = egui_ctx.wants_keyboard_input();
                 class_colors_changed = classes_window(egui_ctx, &mut class_defs, max_class, &mut classes_save_status);
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
                         // Cross Section button
                         let section_label = match app_mode {
-                            AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst | AppMode::MeasureSecond => "Cross Section",
+                            AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
+                                | AppMode::MeasureSecond | AppMode::GroundLasso => "Cross Section",
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
-                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick => "Back to 3D",
+                            AppMode::SectionCorridorLoad => "Loading corridor...",
+                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso => "Back to 3D",
                         };
                         if ui.button(section_label).clicked() {
                             match app_mode {
@@ -2453,7 +3558,11 @@ async fn main() {
                                     }
                                 });
                         });
-                        height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max);
+                        height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max, data_offset[2]);
+                        z_clip_changed = z_clip_controls(
+                            ui, &mut z_clip_enabled, &mut z_clip_lo, &mut z_clip_hi,
+                            data_offset[2], height_range,
+                        );
                         ui.horizontal(|ui| {
                             ui.label("Background:");
                             let mut bg_egui = mq_to_egui(background);
@@ -2481,6 +3590,12 @@ async fn main() {
                                 ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
                             }
                         });
+                        if ground_tool_controls(
+                            ui, &mut app_mode, ground_lasso.len(),
+                            &mut classify_target, &mut classify_from, &mut ground_offset,
+                            max_class, &class_defs, &ground_status,
+                            &mut apply_ground_lasso, &mut cancel_ground_lasso,
+                        ) { start_ground_lasso = true; }
                         ui.label(format!(
                             "{}/{} points | {} chunks | {}/{} tiles | FPS: {:.0}",
                             drawn, total, mgr.total_chunks(),
@@ -2566,10 +3681,38 @@ async fn main() {
                             
                         }
                     });
+                export_request = export_window(
+                    egui_ctx, &mut show_export_window, &mut export_filter,
+                    &mut export_job, &mut export_status, &export_sources,
+                    max_class, &class_defs,
+                );
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
             });
+
+            // A narrowed band should drive the height ramp too: colouring
+            // against the full dataset range wastes most of the gradient on
+            // levels that are no longer drawn. Route it through the existing
+            // height-colour path rather than adding a parallel one.
+            if z_clip_changed {
+                if z_clip_enabled {
+                    height_color_min = z_clip_lo;
+                    height_color_max = z_clip_hi;
+                } else {
+                    height_color_min = 0.0;
+                    height_color_max = height_range;
+                }
+                height_color_changed = true;
+            }
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
+            egui_wants_keyboard_prev = egui_wants_keyboard;
+
+            if let Some(idx) = export_request {
+                start_export(
+                    idx, &stages, &copc_stages, &export_filter,
+                    &mut export_job, &mut export_status,
+                );
+            }
 
             if do_zoom_all
                 && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr)
@@ -2623,6 +3766,7 @@ async fn main() {
                             section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
                             section_data = Some(sec);
                             sec_picked_point = None;
+                            if !section_color_mode_pinned { section_color_mode = color_mode; }
                             app_mode = AppMode::SectionView;
                         }
                     }
@@ -2731,6 +3875,136 @@ async fn main() {
                     });
             });
             egui_macroquad::draw();
+        }
+
+        // ---- Plan-view ground tool: start / cancel / apply ----
+        if start_ground_lasso {
+            ground_lasso.clear();
+            ground_status = None;
+            // Snap to top-down. The footprint is unprojected onto a horizontal
+            // plane, so it only equals what was drawn when looking straight
+            // down; from an oblique view the polygon would come out sheared.
+            // Reposition the camera the same way a view-cube click does, so
+            // the pivot stays framed rather than the view swinging off it.
+            let old_front = front;
+            (yaw, pitch) = view_cube::VIEW_TOP;
+            front = vec3(yaw.cos() * pitch.cos(), yaw.sin() * pitch.cos(), pitch.sin()).normalize();
+            (right, up) = recompute_right_up(yaw, pitch, front);
+            position = orbit_pivot + front * (position - orbit_pivot).dot(old_front);
+            app_mode = AppMode::GroundLasso;
+        }
+        if cancel_ground_lasso {
+            ground_lasso.clear();
+            app_mode = AppMode::View3D;
+        }
+
+        if apply_ground_lasso && ground_lasso.len() >= 3 {
+            // Footprint and band in absolute world coordinates, so the op means
+            // the same thing at export as it does on screen.
+            let polygon: Vec<(f64, f64)> = ground_lasso.iter()
+                .map(|v| (v.x as f64 + data_offset[0], v.y as f64 + data_offset[1]))
+                .collect();
+            let (z_lo, z_hi) = if z_clip_enabled {
+                (z_clip_lo as f64 + data_offset[2], z_clip_hi as f64 + data_offset[2])
+            } else {
+                // No band set: record the data's own extent rather than an
+                // unbounded range, so the op stays a closed description.
+                let mut lo = f64::MAX;
+                let mut hi = f64::MIN;
+                for st in &stages { lo = lo.min(st.cloud.min[2]); hi = hi.max(st.cloud.max[2]); }
+                for cs in &copc_stages { lo = lo.min(cs.global_min[2]); hi = hi.max(cs.global_max[2]); }
+                if let Some(mgr) = tile_mgr.as_ref() { lo = lo.min(mgr.global_min[2]); hi = hi.max(mgr.global_max[2]); }
+                if lo > hi { (f64::MIN, f64::MAX) } else { (lo, hi) }
+            };
+
+            let (mut bx0, mut by0) = (f64::MAX, f64::MAX);
+            let (mut bx1, mut by1) = (f64::MIN, f64::MIN);
+            for &(x, y) in &polygon {
+                bx0 = bx0.min(x); bx1 = bx1.max(x);
+                by0 = by0.min(y); by1 = by1.max(y);
+            }
+
+            let mut samples: Vec<(f64, f64, f64)> = Vec::new();
+            for st in &stages { st.collect_points_in_bbox((bx0, by0), (bx1, by1), z_lo, z_hi, &mut samples); }
+            for cs in &copc_stages { cs.collect_points_in_bbox((bx0, by0), (bx1, by1), z_lo, z_hi, &mut samples); }
+            if let Some(mgr) = tile_mgr.as_ref() { mgr.collect_points_in_bbox((bx0, by0), (bx1, by1), z_lo, z_hi, &mut samples); }
+
+            match crate::classify::fit_ground_plane(&samples, &polygon, z_lo, z_hi) {
+                None => {
+                    ground_status = Some(format!(
+                        "Not enough ground in view to fit a plane ({} points found). \
+                         Zoom in so more detail is loaded, or outline a larger area.",
+                        samples.len(),
+                    ));
+                }
+                Some(fit) => {
+                    let op = crate::classify::ClassOp::new(
+                        0,
+                        crate::classify::ClassRegion::AboveGround {
+                            polygon: polygon.clone(),
+                            origin: fit.origin,
+                            plane: fit.plane,
+                            offset: ground_offset as f64,
+                            z_min: z_lo,
+                            z_max: z_hi,
+                        },
+                        classify_target,
+                        classify_from,
+                    );
+
+                    let mut changed = 0usize;
+                    let mut touched = 0usize;
+                    {
+                        let mut gl = unsafe { get_internal_gl() };
+                        gl.flush();
+                        for st in stages.iter_mut() {
+                            if !op.intersects_aabb(&st.cloud.min, &st.cloud.max) { continue; }
+                            let from = st.edits.ops.len();
+                            st.edits.push(op.clone());
+                            changed += st.apply_edits(&mut *gl.quad_context, color_mode, from);
+                            touched += 1;
+                        }
+                        for cs in copc_stages.iter_mut() {
+                            if !op.intersects_aabb(&cs.global_min, &cs.global_max) { continue; }
+                            let from = cs.edits.ops.len();
+                            cs.edits.push(op.clone());
+                            changed += cs.apply_edits_to_loaded(&mut *gl.quad_context, color_mode, from);
+                            touched += 1;
+                        }
+                    }
+
+                    let mut save_err = None;
+                    for st in stages.iter_mut().filter(|s| s.edits.dirty) {
+                        let path = st.filepath.clone();
+                        if let Err(e) = st.edits.save(&path) { save_err = Some(e.to_string()); }
+                    }
+                    for cs in copc_stages.iter_mut().filter(|c| c.edits.dirty) {
+                        let path = cs.filepath.clone();
+                        if let Err(e) = cs.edits.save(&path) { save_err = Some(e.to_string()); }
+                    }
+
+                    let centre = (
+                        (bx0 + bx1) * 0.5,
+                        (by0 + by1) * 0.5,
+                    );
+                    info!(
+                        "Ground fit: {} cells from {} points, {:.2}m at footprint centre, \
+                         slope {:.2}°, rms {:.3}m; {} points reclassified",
+                        fit.cells_used, fit.points_considered,
+                        fit.height_at(centre.0, centre.1), fit.slope_degrees(), fit.rms, changed,
+                    );
+                    ground_status = Some(match (save_err, touched) {
+                        (Some(e), _) => format!("{changed} points reclassified — SAVE FAILED: {e}"),
+                        (None, 0) => "Footprint did not overlap any loaded file".to_string(),
+                        (None, _) => format!(
+                            "{changed} points → class {classify_target}  (ground rms {:.2} m, slope {:.1}°)",
+                            fit.rms, fit.slope_degrees(),
+                        ),
+                    });
+                    ground_lasso.clear();
+                    app_mode = AppMode::View3D;
+                }
+            }
         }
 
         next_frame().await

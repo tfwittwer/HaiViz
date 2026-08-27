@@ -11,11 +11,37 @@
     use miniquad::*;
 
     use crate::ColorMode;
+    use crate::classify::ClassEdits;
 
     const CHUNK_SIZE: f32 = 50.0;
 
     /// Custom class definitions: id -> (label, [r,g,b])
     pub type ClassDefs = HashMap<u8, (String, [f32; 3])>;
+
+    /// Height band to draw, in viewer space (metres above the shared viewer
+    /// origin) — the same space as `Stage::positions[..][2]`. Points outside it
+    /// are culled in the vertex shader and skipped by section extraction and
+    /// picking, so a clipped point is not merely invisible: it cannot be
+    /// measured, inspected or lassoed either.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct ZClip {
+        pub min: f32,
+        pub max: f32,
+    }
+
+    impl ZClip {
+        /// Draws everything. Finite rather than infinite so it survives the
+        /// trip through a `float` uniform on any GL ES implementation.
+        pub const OPEN: ZClip = ZClip { min: -1.0e9, max: 1.0e9 };
+
+        pub fn contains(&self, z: f32) -> bool {
+            z >= self.min && z <= self.max
+        }
+    }
+
+    impl Default for ZClip {
+        fn default() -> Self { ZClip::OPEN }
+    }
 
     /// Load class definitions from classes.txt in the current directory.
     /// Format: id;r;g;b;label  (one per line, # for comments)
@@ -106,6 +132,15 @@
     }
 
     impl VizPointcloud {
+        /// Refresh `max_class` after points have been reclassified, so the
+        /// Classes editor lists any id the operator has just introduced.
+        pub fn recompute_max_class(&mut self) {
+            self.max_class = self.points.iter()
+                .map(|p| if p.is_overlap { 12 } else { p.classification.into() })
+                .max()
+                .unwrap_or(0);
+        }
+
         pub fn load(filename: &str) -> VizPointcloud {
             let mut reader = Reader::from_path(filename).unwrap();
             let n = reader.header().number_of_points() as usize;
@@ -211,6 +246,12 @@
         /// full `height_range()`; editable from the UI.
         pub color_h_min: f32,
         pub color_h_max: f32,
+        /// Height band to draw; see [`ZClip`].
+        pub z_clip: ZClip,
+        /// Manual classification ops. Unlike the COPC case all points are
+        /// resident, so ops are applied directly and only kept for persistence
+        /// and undo.
+        pub edits: ClassEdits,
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -492,7 +533,7 @@
             info!("{} points in {} chunks ({}m cells), height range: {:.1}m",
                 total_points, chunks.len(), CHUNK_SIZE, height_range);
 
-            Stage {
+            let mut stage = Stage {
                 pipeline,
                 filepath: filename.to_string(),
                 chunks,
@@ -504,7 +545,64 @@
                 rgb_override: None,
                 color_h_min: 0.0,
                 color_h_max: height_range,
+                z_clip: ZClip::OPEN,
+                edits: ClassEdits::default(),
+            };
+            // Replay any sidecar written in an earlier session before the
+            // cloud is first shown, so the view opens on the edited state.
+            stage.edits = ClassEdits::load(filename);
+            if !stage.edits.is_empty() {
+                let n = stage.edits.apply_all(&mut stage.cloud.points);
+                stage.cloud.recompute_max_class();
+                info!("{}: replayed {} ops, {} points reclassified", filename, stage.edits.ops.len(), n);
+                stage.rebuild_colors(ctx, color_mode);
             }
+            stage
+        }
+
+        /// Append every resident point inside the XY box and Z band, in
+        /// absolute world coordinates. Used to gather evidence for a ground
+        /// plane fit; the caller does the polygon test.
+        pub fn collect_points_in_bbox(
+            &self,
+            min: (f64, f64),
+            max: (f64, f64),
+            z_min: f64,
+            z_max: f64,
+            out: &mut Vec<(f64, f64, f64)>,
+        ) {
+            for p in &self.cloud.points {
+                if p.x >= min.0 && p.x <= max.0 && p.y >= min.1 && p.y <= max.1
+                    && p.z >= z_min && p.z <= z_max {
+                    out.push((p.x, p.y, p.z));
+                }
+            }
+        }
+
+        /// Re-read the points from disk and replay the current op list over
+        /// them. This is how an undo is honoured: an op records what it
+        /// assigns, not what it overwrote, so the only way back is to start
+        /// from the file again. Point order is deterministic, so `positions`
+        /// and the GPU chunks stay valid — only colours need refreshing.
+        pub fn reload_points(&mut self, ctx: &mut dyn RenderingBackend, color_mode: ColorMode) {
+            let fresh = VizPointcloud::load(&self.filepath);
+            self.cloud.points = fresh.points;
+            self.edits.apply_all(&mut self.cloud.points);
+            self.cloud.recompute_max_class();
+            self.rebuild_colors(ctx, color_mode);
+        }
+
+        /// Re-run the op list over all resident points and refresh the colours.
+        /// Returns the number of points changed.
+        pub fn apply_edits(&mut self, ctx: &mut dyn RenderingBackend, color_mode: ColorMode, from_idx: usize) -> usize {
+            let bmin = self.cloud.min;
+            let bmax = self.cloud.max;
+            let changed = self.edits.apply_from(from_idx, &mut self.cloud.points, &bmin, &bmax);
+            self.cloud.recompute_max_class();
+            if changed > 0 {
+                self.rebuild_colors(ctx, color_mode);
+            }
+            changed
         }
 
         /// Free all GPU buffers held by this stage. Consumes the stage.
@@ -530,6 +628,10 @@
             let mut best_dist = f32::MAX;
 
             for (i, pos) in self.positions.iter().enumerate() {
+                // A clipped point is not merely hidden — it must not be
+                // pickable either, or Measure and Point Info would silently
+                // snap to geometry the operator cannot see.
+                if !self.z_clip.contains(pos[2]) { continue; }
                 let p = *view_proj * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
                 let px = p.x / p.w;
                 let py = p.y / p.w;
@@ -601,7 +703,8 @@
                 let along = rel_x * dir.0 + rel_y * dir.1;
                 let perp = rel_x * normal.0 + rel_y * normal.1;
 
-                if along >= 0.0 && along <= len && perp.abs() <= depth {
+                if along >= 0.0 && along <= len && perp.abs() <= depth
+                    && self.z_clip.contains(pos[2]) {
                     let p = &self.cloud.points[i];
                     h_min = h_min.min(pos[2]);
                     h_max = h_max.max(pos[2]);
@@ -619,7 +722,8 @@
             ctx.apply_pipeline(&self.pipeline);
             ctx.apply_bindings(&section.bindings);
             ctx.apply_uniforms(miniquad::UniformsSource::table(
-                &shader::Uniforms { mvp: *mvp, point_size, height_range: section.height_range },
+                &shader::Uniforms { mvp: *mvp, point_size, height_range: section.height_range,
+                    z_clip_min: ZClip::OPEN.min, z_clip_max: ZClip::OPEN.max },
             ));
             ctx.draw(0, section.num_points, 1);
         }
@@ -636,7 +740,8 @@
                 }
                 ctx.apply_bindings(&chunk.bindings);
                 ctx.apply_uniforms(miniquad::UniformsSource::table(
-                    &shader::Uniforms { mvp: *view_proj, point_size, height_range },
+                    &shader::Uniforms { mvp: *view_proj, point_size, height_range,
+                        z_clip_min: self.z_clip.min, z_clip_max: self.z_clip.max },
                 ));
                 ctx.draw(0, chunk.num_points, 1);
                 drawn += chunk.num_points;
@@ -672,6 +777,8 @@
         /// Height colour-bar bounds, relative to `global_min[2]`. See `Stage::color_h_min`.
         pub color_h_min: f32,
         pub color_h_max: f32,
+        /// Height band to draw; see [`ZClip`].
+        pub z_clip: ZClip,
     }
 
     fn read_index(dir_path: &str) -> Vec<TileInfo> {
@@ -790,6 +897,7 @@
                 class_defs,
                 color_h_min: 0.0,
                 color_h_max: (global_max[2] - global_min[2]) as f32,
+                z_clip: ZClip::OPEN,
             }
         }
 
@@ -893,7 +1001,8 @@
                     }
                     ctx.apply_bindings(&chunk.bindings);
                     ctx.apply_uniforms(miniquad::UniformsSource::table(
-                        &shader::Uniforms { mvp: *view_proj, point_size, height_range },
+                        &shader::Uniforms { mvp: *view_proj, point_size, height_range,
+                        z_clip_min: self.z_clip.min, z_clip_max: self.z_clip.max },
                     ));
                     ctx.draw(0, chunk.num_points, 1);
                     drawn += chunk.num_points;
@@ -957,6 +1066,7 @@
             for (tile_idx, loaded) in self.loaded.iter().enumerate() {
                 if let Some(lt) = loaded {
                     for (i, pos) in lt.positions.iter().enumerate() {
+                        if !self.z_clip.contains(pos[2]) { continue; }
                         let p = *view_proj * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
                         let px = p.x / p.w;
                         let py = p.y / p.w;
@@ -969,6 +1079,27 @@
                 }
             }
             best
+        }
+
+        /// Append every resident point inside the XY box and Z band, in
+        /// absolute world coordinates. Used to gather evidence for a ground
+        /// plane fit; the caller does the polygon test.
+        pub fn collect_points_in_bbox(
+            &self,
+            min: (f64, f64),
+            max: (f64, f64),
+            z_min: f64,
+            z_max: f64,
+            out: &mut Vec<(f64, f64, f64)>,
+        ) {
+            for loaded in self.loaded.iter().flatten() {
+                for p in &loaded.cloud.points {
+                    if p.x >= min.0 && p.x <= max.0 && p.y >= min.1 && p.y <= max.1
+                        && p.z >= z_min && p.z <= z_max {
+                        out.push((p.x, p.y, p.z));
+                    }
+                }
+            }
         }
 
         pub fn loaded_count(&self) -> usize {
@@ -1008,7 +1139,8 @@
                     let along = rel_x * dir.0 + rel_y * dir.1;
                     let perp = rel_x * normal.0 + rel_y * normal.1;
 
-                    if along >= 0.0 && along <= len && perp.abs() <= depth {
+                    if along >= 0.0 && along <= len && perp.abs() <= depth
+                        && self.z_clip.contains(pos[2]) {
                         let p = &loaded.cloud.points[i];
                         h_min = h_min.min(pos[2]);
                         h_max = h_max.max(pos[2]);
@@ -1054,7 +1186,8 @@
             ctx.apply_pipeline(&self.pipeline);
             ctx.apply_bindings(&section.bindings);
             ctx.apply_uniforms(miniquad::UniformsSource::table(
-                &shader::Uniforms { mvp: *mvp, point_size, height_range: section.height_range },
+                &shader::Uniforms { mvp: *mvp, point_size, height_range: section.height_range,
+                    z_clip_min: ZClip::OPEN.min, z_clip_max: ZClip::OPEN.max },
             ));
             ctx.draw(0, section.num_points, 1);
         }
@@ -1264,6 +1397,10 @@
         byte_size: i32,
         point_count: i32,
         generation: u64,
+        /// Pinned loads are exempt from generation filtering — they are
+        /// requested for a section corridor, not for the current view, so a
+        /// camera nudge must not discard them.
+        pinned: bool,
     }
 
     /// Result returned by the background loader thread.
@@ -1271,6 +1408,7 @@
         key: VoxelKey,
         points: Vec<Point>,
         generation: u64,
+        pinned: bool,
     }
 
     pub struct CopcStage {
@@ -1298,8 +1436,17 @@
         /// Height colour-bar bounds, relative to `global_min[2]`. See `Stage::color_h_min`.
         pub color_h_min: f32,
         pub color_h_max: f32,
+        /// Height band to draw; see [`ZClip`].
+        pub z_clip: ZClip,
         /// Nodes dispatched to the loader thread but not yet ingested.
         in_flight: HashSet<VoxelKey>,
+        /// Nodes force-loaded for the active section corridor. These are held
+        /// regardless of LOD, frustum and point budget, so that what the
+        /// operator classifies is the full-resolution data rather than
+        /// whatever sample the LOD happened to pick.
+        pinned: HashSet<VoxelKey>,
+        /// Manual classification ops, applied to every node as it is ingested.
+        pub edits: ClassEdits,
         /// Send requests to the background loader thread.
         load_tx: std::sync::mpsc::Sender<CopcLoadReq>,
         /// Receive completed results from the background loader thread.
@@ -1313,11 +1460,11 @@
     }
 
     /// Flat snapshot of one COPC hierarchy entry: a leaf pointing at a data chunk.
-    struct RawCopcEntry {
-        key: VoxelKey,
-        offset: u64,
-        byte_size: i32,
-        point_count: i32,
+    pub struct RawCopcEntry {
+        pub key: VoxelKey,
+        pub offset: u64,
+        pub byte_size: i32,
+        pub point_count: i32,
     }
 
     /// Walk the COPC hierarchy EVLR recursively and return every leaf entry
@@ -1326,7 +1473,7 @@
     /// pages (e.g. copc-converter, which boundaries every 3 octree levels) appear
     /// to contain only a handful of coarse-LOD nodes. We bypass it by parsing the
     /// raw EVLR bytes ourselves and following page pointers to any depth.
-    fn read_full_hierarchy(reader: &CopcEntryReader<BufReader<File>>) -> Vec<RawCopcEntry> {
+    pub fn read_full_hierarchy(reader: &CopcEntryReader<BufReader<File>>) -> Vec<RawCopcEntry> {
         let header = reader.header();
         let Some(info_vlr) = header.vlrs().iter().find(|v| v.is_copc_info()) else {
             return Vec::new();
@@ -1374,7 +1521,7 @@
     }
 
     /// Compute (xmin,ymin,zmin,xmax,ymax,zmax) for a VoxelKey given COPC octree params.
-    fn voxel_bounds(key: &VoxelKey, cx: f64, cy: f64, cz: f64, halfsize: f64) -> (f64, f64, f64, f64, f64, f64) {
+    pub fn voxel_bounds(key: &VoxelKey, cx: f64, cy: f64, cz: f64, halfsize: f64) -> (f64, f64, f64, f64, f64, f64) {
         let root_min_x = cx - halfsize;
         let root_min_y = cy - halfsize;
         let root_min_z = cz - halfsize;
@@ -1383,6 +1530,50 @@
         let ymin = root_min_y + span * key.y as f64;
         let zmin = root_min_z + span * key.z as f64;
         (xmin, ymin, zmin, xmin + span, ymin + span, zmin + span)
+    }
+
+    /// 2D separating-axis test between the section corridor (an oriented box:
+    /// the segment `a`..`b` widened by `depth` on each side) and an axis-aligned
+    /// rectangle. Used to decide which octree nodes a corridor can touch.
+    ///
+    /// Exact rather than conservative — a bounding-box approximation of a
+    /// diagonal corridor pulls in far more nodes than it needs to, and force-
+    /// loading is already the expensive path.
+    pub fn corridor_meets_aabb_2d(
+        a: (f64, f64),
+        b: (f64, f64),
+        depth: f64,
+        rect_min: (f64, f64),
+        rect_max: (f64, f64),
+    ) -> bool {
+        let dx = b.0 - a.0;
+        let dy = b.1 - a.1;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= 0.0 { return false; }
+        let dir = (dx / len, dy / len);
+        let normal = (-dir.1, dir.0);
+
+        let obb_center = ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+        let obb_half = (len * 0.5, depth);
+        let rect_center = ((rect_min.0 + rect_max.0) * 0.5, (rect_min.1 + rect_max.1) * 0.5);
+        let rect_half = ((rect_max.0 - rect_min.0) * 0.5, (rect_max.1 - rect_min.1) * 0.5);
+
+        let d = (rect_center.0 - obb_center.0, rect_center.1 - obb_center.1);
+
+        // Corridor axes: project the rectangle's extent onto dir and normal.
+        for (axis, half) in [(dir, obb_half.0), (normal, obb_half.1)] {
+            let dist = (d.0 * axis.0 + d.1 * axis.1).abs();
+            let r = rect_half.0 * axis.0.abs() + rect_half.1 * axis.1.abs();
+            if dist > half + r { return false; }
+        }
+        // World axes: project the corridor's extent onto x and y.
+        for (axis, half) in [((1.0, 0.0), rect_half.0), ((0.0, 1.0), rect_half.1)] {
+            let dist: f64 = (d.0 * axis.0 + d.1 * axis.1).abs();
+            let r = obb_half.0 * (dir.0 * axis.0 + dir.1 * axis.1).abs()
+                  + obb_half.1 * (normal.0 * axis.0 + normal.1 * axis.1).abs();
+            if dist > half + r { return false; }
+        }
+        true
     }
 
     /// Number of background threads decompressing COPC nodes in parallel.
@@ -1432,7 +1623,7 @@
                         };
                         let mut points = Vec::new();
                         match reader.read_entry_points(&las_entry, &mut points) {
-                            Ok(_) => { let _ = tx.send(CopcLoadResult { key: req.key, points, generation: req.generation }); }
+                            Ok(_) => { let _ = tx.send(CopcLoadResult { key: req.key, points, generation: req.generation, pinned: req.pinned }); }
                             Err(e) => error!("COPC loader error for {:?}: {}", req.key, e),
                         }
                     }
@@ -1532,7 +1723,10 @@
                 max_class: 0,
                 color_h_min: 0.0,
                 color_h_max: (global_max[2] - global_min[2]) as f32,
+                z_clip: ZClip::OPEN,
                 in_flight: HashSet::new(),
+                pinned: HashSet::new(),
+                edits: ClassEdits::load(filepath),
                 load_tx,
                 result_rx,
                 last_view_change: std::time::Instant::now(),
@@ -1557,6 +1751,10 @@
 
         /// Send a load request to the background thread (no-op if already dispatched).
         fn dispatch_load(&mut self, key: VoxelKey) {
+            self.dispatch_load_inner(key, false)
+        }
+
+        fn dispatch_load_inner(&mut self, key: VoxelKey, pinned: bool) {
             if self.in_flight.contains(&key) { return; }
             if let Some(entry) = self.entries.iter().find(|e| e.key == key) {
                 let _ = self.load_tx.send(CopcLoadReq {
@@ -1565,9 +1763,163 @@
                     byte_size: entry.byte_size,
                     point_count: entry.point_count,
                     generation: self.generation,
+                    pinned,
                 });
                 self.in_flight.insert(key);
             }
+        }
+
+        /// Force-load every node whose octree cube meets the section corridor,
+        /// at every level. COPC puts each point in exactly one node, so a
+        /// corridor's full-resolution content is spread across all levels that
+        /// overlap it — pinning only the deepest level would miss the points
+        /// held by coarser ancestors.
+        ///
+        /// `start`/`end` are viewer-space XY, matching `section_start` /
+        /// `section_end`. Returns `(node_count, point_count)`.
+        pub fn pin_corridor(&mut self, start: (f32, f32), end: (f32, f32), depth: f32) -> (usize, i64) {
+            let ax = start.0 as f64 + self.viewer_origin[0];
+            let ay = start.1 as f64 + self.viewer_origin[1];
+            let bx = end.0 as f64 + self.viewer_origin[0];
+            let by = end.1 as f64 + self.viewer_origin[1];
+            let depth = depth as f64;
+
+            self.pinned.clear();
+            let mut points: i64 = 0;
+            for e in &self.entries {
+                if corridor_meets_aabb_2d(
+                    (ax, ay), (bx, by), depth,
+                    (e.xmin, e.ymin), (e.xmax, e.ymax),
+                ) {
+                    self.pinned.insert(e.key);
+                    points += e.point_count as i64;
+                }
+            }
+            info!(
+                "COPC {}: pinned {} nodes ({} points) for section corridor",
+                self.filepath, self.pinned.len(), points,
+            );
+            (self.pinned.len(), points)
+        }
+
+        /// Append every resident point inside the XY box and Z band, in
+        /// absolute world coordinates. Used to gather evidence for a ground
+        /// plane fit; the caller does the polygon test.
+        ///
+        /// Only resident nodes are searched. A ground plane is a low-order fit
+        /// and the surface is dense, so the LOD sample defines it perfectly
+        /// well — force-loading a whole plan-view footprint would be far more
+        /// data than the fit needs.
+        pub fn collect_points_in_bbox(
+            &self,
+            min: (f64, f64),
+            max: (f64, f64),
+            z_min: f64,
+            z_max: f64,
+            out: &mut Vec<(f64, f64, f64)>,
+        ) {
+            for node in self.loaded_nodes.values() {
+                for p in &node.points {
+                    if p.x >= min.0 && p.x <= max.0 && p.y >= min.1 && p.y <= max.1
+                        && p.z >= z_min && p.z <= z_max {
+                        out.push((p.x, p.y, p.z));
+                    }
+                }
+            }
+        }
+
+        /// Drain finished loads and keep the pinned set fed, without touching
+        /// LOD, the frustum, or the eviction pass.
+        ///
+        /// The section view never calls `update_view` — it has no 3D camera to
+        /// drive it — so this is what lets a corridor stream in while the slice
+        /// stays on screen, instead of bouncing the operator back to the 3D
+        /// view to watch a progress bar.
+        pub fn service_pins(&mut self, ctx: &mut dyn RenderingBackend, color_mode: ColorMode) {
+            while let Ok(result) = self.result_rx.try_recv() {
+                self.in_flight.remove(&result.key);
+                if !result.pinned && result.generation != self.generation { continue; }
+                if !self.loaded_nodes.contains_key(&result.key) {
+                    self.ingest_node(ctx, result.key, result.points, color_mode);
+                }
+            }
+            if self.pinned.is_empty() { return; }
+            let mut want: Vec<VoxelKey> = self.pinned.iter()
+                .filter(|k| !self.loaded_nodes.contains_key(k) && !self.in_flight.contains(k))
+                .copied()
+                .collect();
+            want.sort_by_key(|k| k.l);
+            let room = (COPC_LOADER_THREADS * 2).saturating_sub(self.in_flight.len());
+            for key in want.into_iter().take(room) {
+                self.dispatch_load_inner(key, true);
+            }
+        }
+
+        /// Release the section corridor pins, letting normal LOD resume.
+        pub fn clear_pins(&mut self) {
+            self.pinned.clear();
+        }
+
+        /// Pinned nodes not yet resident. Zero means the corridor is fully loaded.
+        pub fn pins_pending(&self) -> usize {
+            self.pinned.iter().filter(|k| !self.loaded_nodes.contains_key(k)).count()
+        }
+
+        pub fn pinned_count(&self) -> usize {
+            self.pinned.len()
+        }
+
+        /// Drop every resident node so it is re-read from disk. Used after the
+        /// op list changes in a way that cannot be applied incrementally — an
+        /// undo, since an op does not record the classes it overwrote.
+        pub fn invalidate_loaded(&mut self, ctx: &mut dyn RenderingBackend) {
+            let keys: Vec<VoxelKey> = self.loaded_nodes.keys().copied().collect();
+            for key in keys {
+                if let Some(node) = self.loaded_nodes.remove(&key) {
+                    for chunk in node.chunks {
+                        ctx.delete_buffer(chunk.bindings.vertex_buffers[0]);
+                        ctx.delete_buffer(chunk.bindings.index_buffer);
+                    }
+                }
+            }
+            self.in_flight.clear();
+            self.generation = self.generation.wrapping_add(1);
+        }
+
+        /// Apply the current op list to the points already resident, and push
+        /// the resulting colours to the GPU. Cheap counterpart to
+        /// `invalidate_loaded` for the append-an-op case, where re-reading from
+        /// disk would be wasted work.
+        pub fn apply_edits_to_loaded(
+            &mut self,
+            ctx: &mut dyn RenderingBackend,
+            color_mode: ColorMode,
+            from_idx: usize,
+        ) -> usize {
+            let mut changed = 0;
+            let keys: Vec<VoxelKey> = self.loaded_nodes.keys().copied().collect();
+            for key in keys {
+                let Some(node) = self.loaded_nodes.get_mut(&key) else { continue };
+                let mut nmin = [f64::MAX; 3];
+                let mut nmax = [f64::MIN; 3];
+                for p in &node.points {
+                    for (i, v) in [p.x, p.y, p.z].iter().enumerate() {
+                        nmin[i] = nmin[i].min(*v);
+                        nmax[i] = nmax[i].max(*v);
+                    }
+                }
+                changed += self.edits.apply_from(from_idx, &mut node.points, &nmin, &nmax);
+            }
+            for node in self.loaded_nodes.values() {
+                for p in &node.points {
+                    let id: u8 = if p.is_overlap { 12 } else { p.classification.into() };
+                    self.max_class = self.max_class.max(id);
+                }
+            }
+            if changed > 0 {
+                self.rebuild_colors(ctx, color_mode);
+            }
+            changed
         }
 
         /// Convert loaded points into GPU chunks and store them.
@@ -1575,10 +1927,26 @@
             &mut self,
             ctx: &mut dyn RenderingBackend,
             key: VoxelKey,
-            pts: Vec<Point>,
+            mut pts: Vec<Point>,
             color_mode: ColorMode,
         ) {
             let (h_lo, h_hi) = (self.color_h_min, self.color_h_max);
+
+            // Manual classification is applied here, on the way in, rather than
+            // to whatever happened to be on screen when the operator drew it.
+            // A node arriving for the first time long after the edit was made
+            // gets exactly the same treatment as one that was already resident.
+            if !self.edits.is_empty() && !pts.is_empty() {
+                let mut nmin = [f64::MAX; 3];
+                let mut nmax = [f64::MIN; 3];
+                for p in &pts {
+                    for (i, v) in [p.x, p.y, p.z].iter().enumerate() {
+                        nmin[i] = nmin[i].min(*v);
+                        nmax[i] = nmax[i].max(*v);
+                    }
+                }
+                self.edits.apply_to_node(&mut pts, &nmin, &nmax);
+            }
 
             for p in &pts {
                 self.intensity_min = self.intensity_min.min(p.intensity);
@@ -1646,7 +2014,9 @@
                 self.prev_view_proj = *view_proj;
                 self.last_view_change = std::time::Instant::now();
                 self.generation = self.generation.wrapping_add(1);
-                self.in_flight.clear();
+                // Pinned loads survive a view change; only speculative LOD
+                // requests are abandoned.
+                self.in_flight.retain(|k| self.pinned.contains(k));
             }
             const SETTLE_MS: u64 = 300;
             let view_settled = self.last_view_change.elapsed()
@@ -1657,7 +2027,7 @@
             // GPU upload (ingest_node) is cheap — just vertex buffer creation.
             while let Ok(result) = self.result_rx.try_recv() {
                 self.in_flight.remove(&result.key);
-                if result.generation != self.generation { continue; }
+                if !result.pinned && result.generation != self.generation { continue; }
                 // Only ingest if not already loaded (might have been unloaded mid-flight).
                 if !self.loaded_nodes.contains_key(&result.key) {
                     //let n = result.points.len();
@@ -1694,6 +2064,10 @@
                 })
                 .map(|e| e.key)
                 .collect();
+            // Corridor pins are held on top of whatever the LOD wants, and are
+            // never evicted while the section is open.
+            let mut desired = desired;
+            desired.extend(self.pinned.iter().copied());
 
             // Unload nodes that are no longer desired and not in flight.
             let to_unload: Vec<VoxelKey> = self.loaded_nodes.keys()
@@ -1717,6 +2091,23 @@
             // Keep the pool fed: 2× the worker count means each thread always
             // has a follow-up node queued when it finishes its current one.
             let max_in_flight = COPC_LOADER_THREADS * 2;
+
+            // Pinned corridor nodes are dispatched ahead of everything else and
+            // ignore both the settle delay and the global point budget: the
+            // operator is waiting on exactly these, and a partial corridor is
+            // worse than a slow one.
+            if !self.pinned.is_empty() {
+                let mut want: Vec<VoxelKey> = self.pinned.iter()
+                    .filter(|k| !self.loaded_nodes.contains_key(k) && !self.in_flight.contains(k))
+                    .copied()
+                    .collect();
+                want.sort_by_key(|k| k.l);
+                let room = max_in_flight.saturating_sub(self.in_flight.len());
+                for key in want.into_iter().take(room) {
+                    self.dispatch_load_inner(key, true);
+                }
+            }
+
             let budget = max_in_flight.saturating_sub(self.in_flight.len());
             let points_remaining = GLOBAL_POINT_BUDGET - already_loaded - self.total_loaded_points();
             if view_settled && budget > 0 && points_remaining > 0 {
@@ -1773,7 +2164,8 @@
                     }
                     ctx.apply_bindings(&chunk.bindings);
                     ctx.apply_uniforms(miniquad::UniformsSource::table(
-                        &shader::Uniforms { mvp: *view_proj, point_size, height_range },
+                        &shader::Uniforms { mvp: *view_proj, point_size, height_range,
+                        z_clip_min: self.z_clip.min, z_clip_max: self.z_clip.max },
                     ));
                     ctx.draw(0, chunk.num_points, 1);
                     drawn += chunk.num_points;
@@ -1818,6 +2210,7 @@
             let mut best: Option<(&Point, glam::Vec3, f32)> = None;
             for node in self.loaded_nodes.values() {
                 for (i, pos) in node.positions.iter().enumerate() {
+                    if !self.z_clip.contains(pos[2]) { continue; }
                     let p = *view_proj * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
                     let px = p.x / p.w;
                     let py = p.y / p.w;
@@ -1899,7 +2292,8 @@
                     let rel_y = pos[1] - start.1;
                     let along = rel_x * dir.0 + rel_y * dir.1;
                     let perp = rel_x * normal.0 + rel_y * normal.1;
-                    if along >= 0.0 && along <= len && perp.abs() <= depth {
+                    if along >= 0.0 && along <= len && perp.abs() <= depth
+                        && self.z_clip.contains(pos[2]) {
                         h_min = h_min.min(pos[2]);
                         h_max = h_max.max(pos[2]);
                         raw.push((node.points[i].clone(), along, pos[2]));
@@ -1943,7 +2337,8 @@
             ctx.apply_pipeline(&self.pipeline);
             ctx.apply_bindings(&section.bindings);
             ctx.apply_uniforms(miniquad::UniformsSource::table(
-                &shader::Uniforms { mvp: *mvp, point_size, height_range: section.height_range },
+                &shader::Uniforms { mvp: *mvp, point_size, height_range: section.height_range,
+                    z_clip_min: ZClip::OPEN.min, z_clip_max: ZClip::OPEN.max },
             ));
             ctx.draw(0, section.num_points, 1);
         }
@@ -2063,11 +2458,24 @@
             uniform mat4 mvp;
             uniform float point_size;
             uniform float height_range;
+            // Height band to draw, in the same space as pos.z. Points outside
+            // it are pushed past the far plane so the rasteriser drops them —
+            // GLSL ES 100 has no vertex-stage discard, and culling here costs
+            // nothing per frame, where re-uploading filtered buffers would.
+            uniform float z_clip_min;
+            uniform float z_clip_max;
 
             varying lowp vec3 v_color;
             varying mediump float v_depth;
 
             void main() {
+                if (pos.z < z_clip_min || pos.z > z_clip_max) {
+                    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+                    gl_PointSize = 0.0;
+                    v_color = color;
+                    v_depth = 1.0;
+                    return;
+                }
                 gl_Position = mvp * vec4(pos, 1.0);
                 gl_PointSize = point_size;
                 v_color = color;
@@ -2094,6 +2502,8 @@
                         UniformDesc::new("mvp", UniformType::Mat4),
                         UniformDesc::new("point_size", UniformType::Float1),
                         UniformDesc::new("height_range", UniformType::Float1),
+                        UniformDesc::new("z_clip_min", UniformType::Float1),
+                        UniformDesc::new("z_clip_max", UniformType::Float1),
                     ],
                 },
             }
@@ -2104,6 +2514,8 @@
             pub mvp: glam::Mat4,
             pub point_size: f32,
             pub height_range: f32,
+            pub z_clip_min: f32,
+            pub z_clip_max: f32,
         }
     }
 //}
