@@ -21,6 +21,7 @@ const CORRIDOR_POINT_LIMIT: i64 = 60_000_000;
 
 mod raw_miniquad;
 mod polylines;
+mod gcp;
 mod classify;
 mod export;
 
@@ -740,6 +741,152 @@ fn polylines_window(
         });
 }
 
+/// Ground control point overlay: load text tables, review/override the detected
+/// column mapping, and control how the markers are drawn in both views.
+fn gcp_window(
+    egui_ctx: &egui_macroquad::egui::Context,
+    gcp_files: &mut Vec<gcp::GcpFile>,
+    selected_gcp: &mut Option<(usize, usize)>,
+    gcp_load_error: &mut Option<String>,
+    background: Color,
+) {
+    use egui_macroquad::egui;
+    egui::Window::new("Ground Control Points")
+        .default_pos([10.0, 700.0])
+        // See the note in `polylines_window`.
+        .constrain(false)
+        .default_open(false)
+        .show(egui_ctx, |ui| {
+            let luma = background.r * 0.299 + background.g * 0.587 + background.b * 0.114;
+            let default_color = if luma > 0.5 {
+                Color::new(0.85, 0.1, 0.1, 1.0)
+            } else {
+                Color::new(1.0, 0.3, 0.3, 1.0)
+            };
+            if ui.button("Load GCP File...").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("GCP table", &["txt", "csv", "asc", "pts", "xyz", "dat", "tsv", ""])
+                    .add_filter("All files", &["*"])
+                    .pick_file()
+            {
+                match gcp::load(path.to_str().unwrap_or(""), default_color) {
+                    Ok(f) => { *gcp_load_error = None; gcp_files.push(f); }
+                    Err(e) => { *gcp_load_error = Some(e); }
+                }
+            }
+            if let Some(ref err) = *gcp_load_error {
+                ui.colored_label(egui::Color32::RED, err);
+            }
+            ui.separator();
+
+            let mut to_remove: Option<usize> = None;
+            for (fi, f) in gcp_files.iter_mut().enumerate() {
+                let fname = std::path::Path::new(&f.path)
+                    .file_name().and_then(|n| n.to_str()).unwrap_or(&f.path);
+                ui.collapsing(format!("{} ({} points)", fname, f.points.len()), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut f.visible, "Show");
+                        ui.checkbox(&mut f.show_labels, "Labels");
+                        let mut ec = mq_to_egui(f.color);
+                        if ui.color_edit_button_srgba(&mut ec).changed() {
+                            f.color = egui_to_mq(ec);
+                        }
+                        if ui.small_button("Remove").clicked() {
+                            to_remove = Some(fi);
+                            if selected_gcp.map(|(s, _)| s) == Some(fi) { *selected_gcp = None; }
+                        }
+                    });
+                    ui.add(egui::Slider::new(&mut f.size, 4.0..=24.0).text("marker (px)"));
+
+                    // ---- Column mapping ----
+                    let ncols = f.rows.iter().map(|r| r.len()).max().unwrap_or(3);
+                    let col_name = |f: &gcp::GcpFile, c: usize| -> String {
+                        match f.layout.headers.get(c) {
+                            Some(h) if !h.is_empty() => format!("{}: {}", c + 1, h),
+                            _ => format!("col {}", c + 1),
+                        }
+                    };
+                    let mut remap = false;
+                    ui.collapsing("Columns", |ui| {
+                        ui.label(format!(
+                            "separator: {}{}",
+                            f.layout.sep.name(),
+                            if f.layout.has_header { ", header row" } else { "" },
+                        ));
+                        egui::Grid::new(("gcp_cols", fi)).num_columns(2).show(ui, |ui| {
+                            let mut label_sel: i32 = f.layout.label_col.map(|c| c as i32).unwrap_or(-1);
+                            ui.label("label");
+                            egui::ComboBox::from_id_salt(("gcp_label", fi))
+                                .selected_text(if label_sel < 0 { "— none —".to_string() } else { col_name(f, label_sel as usize) })
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut label_sel, -1, "— none —");
+                                    for c in 0..ncols {
+                                        ui.selectable_value(&mut label_sel, c as i32, col_name(f, c));
+                                    }
+                                });
+                            let new_label = if label_sel < 0 { None } else { Some(label_sel as usize) };
+                            if new_label != f.layout.label_col { f.layout.label_col = new_label; remap = true; }
+                            ui.end_row();
+
+                            for (name, id) in [("x", "gcp_x"), ("y", "gcp_y"), ("z", "gcp_z")] {
+                                let cur = match name {
+                                    "x" => f.layout.x_col,
+                                    "y" => f.layout.y_col,
+                                    _ => f.layout.z_col,
+                                };
+                                let mut sel = cur;
+                                ui.label(name);
+                                egui::ComboBox::from_id_salt((id, fi))
+                                    .selected_text(col_name(f, cur))
+                                    .width(150.0)
+                                    .show_ui(ui, |ui| {
+                                        for c in 0..ncols {
+                                            ui.selectable_value(&mut sel, c, col_name(f, c));
+                                        }
+                                    });
+                                if sel != cur {
+                                    match name {
+                                        "x" => f.layout.x_col = sel,
+                                        "y" => f.layout.y_col = sel,
+                                        _ => f.layout.z_col = sel,
+                                    }
+                                    remap = true;
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                    if remap {
+                        gcp::rebuild(f);
+                        *selected_gcp = None;
+                    }
+
+                    // ---- Point list ----
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .id_salt(("gcp_pts", fi))
+                        .show(ui, |ui| {
+                            for (pi, p) in f.points.iter().enumerate() {
+                                let is_sel = *selected_gcp == Some((fi, pi));
+                                let text = format!(
+                                    "{}  {:.3}  {:.3}  {:.3}",
+                                    p.label, p.world[0], p.world[1], p.world[2],
+                                );
+                                if ui.selectable_label(is_sel, text).clicked() {
+                                    *selected_gcp = if is_sel { None } else { Some((fi, pi)) };
+                                }
+                            }
+                        });
+                });
+            }
+            if let Some(fi) = to_remove {
+                gcp_files.remove(fi);
+                *selected_gcp = None;
+            }
+        });
+}
+
 /// Built-in editor for classification labels & colours (classes.txt).
 /// Lists every class id up to the maximum present in the loaded data, plus any
 /// ids already defined beyond that; missing entries are seeded from the default
@@ -1382,6 +1529,10 @@ async fn main() {
     let mut selected_poly: Option<(usize, usize)> = None; // (file_idx, poly_idx)
     let mut poly_load_error: Option<String> = None;
 
+    let mut gcp_files: Vec<gcp::GcpFile> = Vec::new();
+    let mut selected_gcp: Option<(usize, usize)> = None; // (file_idx, point_idx)
+    let mut gcp_load_error: Option<String> = None;
+
     let mut edl_enabled = false;
     let mut edl_strength: f32 = 8.0;
     let mut edl_renderer = {
@@ -1750,6 +1901,16 @@ async fn main() {
 
                 }
 
+                if !gcp_files.is_empty() &&
+                    let (Some(start), Some(end)) = (section_start, section_end) {
+                        gcp::draw_section(
+                            &gcp_files, data_offset, start, end,
+                            section_depth, sec.length,
+                            section_pan, section_zoom,
+                            selected_gcp,
+                        );
+                }
+
                 // ---- Measure overlays ----
                 let marker_sz = 8.0;
                 if let Some(a) = sec_measure_a {
@@ -2040,6 +2201,7 @@ async fn main() {
                     max_class, &class_defs,
                 );
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
+                gcp_window(egui_ctx, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
             });
 
             // A narrowed band should drive the height ramp too: colouring
@@ -2823,6 +2985,7 @@ async fn main() {
                     max_class, &class_defs,
                 );
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
+                gcp_window(egui_ctx, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
             });
 
             // A narrowed band should drive the height ramp too: colouring
@@ -2838,6 +3001,14 @@ async fn main() {
                     height_color_max = height_range;
                 }
                 height_color_changed = true;
+            }
+
+            // ---- GCP overlay ----
+            // Screen-space markers under the default camera, so they keep one
+            // size at any zoom and are never swallowed by the cloud. Drawn
+            // before egui so the panels still sit on top.
+            if !gcp_files.is_empty() {
+                gcp::draw_3d(&gcp_files, data_offset, &view_proj, selected_gcp);
             }
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
@@ -3241,6 +3412,7 @@ async fn main() {
                     max_class, &class_defs,
                 );
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
+                gcp_window(egui_ctx, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
             });
 
             // A narrowed band should drive the height ramp too: colouring
@@ -3256,6 +3428,14 @@ async fn main() {
                     height_color_max = height_range;
                 }
                 height_color_changed = true;
+            }
+
+            // ---- GCP overlay ----
+            // Screen-space markers under the default camera, so they keep one
+            // size at any zoom and are never swallowed by the cloud. Drawn
+            // before egui so the panels still sit on top.
+            if !gcp_files.is_empty() {
+                gcp::draw_3d(&gcp_files, data_offset, &view_proj, selected_gcp);
             }
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
@@ -3709,6 +3889,7 @@ async fn main() {
                     max_class, &class_defs,
                 );
                 polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
+                gcp_window(egui_ctx, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
             });
 
             // A narrowed band should drive the height ramp too: colouring
@@ -3724,6 +3905,14 @@ async fn main() {
                     height_color_max = height_range;
                 }
                 height_color_changed = true;
+            }
+
+            // ---- GCP overlay ----
+            // Screen-space markers under the default camera, so they keep one
+            // size at any zoom and are never swallowed by the cloud. Drawn
+            // before egui so the panels still sit on top.
+            if !gcp_files.is_empty() {
+                gcp::draw_3d(&gcp_files, data_offset, &view_proj, selected_gcp);
             }
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
