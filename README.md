@@ -187,6 +187,10 @@ Each loaded file is listed with its polylines, where you can:
 Polylines are drawn both in the 3D view and, where they intersect the corridor,
 in cross-section view.
 
+## GCP Overlay
+
+Open the **Ground Control Points** window and **Load GCP File...**. Column separators and column types are auto-detected. GCP coordinates are drawn as overlays and are visible in both 3D and section view.
+
 ## Manual classification
 
 Two tools, both lasso-driven and both recorded the same way.
