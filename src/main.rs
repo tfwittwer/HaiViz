@@ -2604,6 +2604,8 @@ async fn main() {
             let overrides_before: Vec<Option<[f32; 3]>> =
                 stages.iter().map(|s| s.rgb_override).collect();
             let mut new_overrides = overrides_before.clone();
+            let visible_before: Vec<bool> = stages.iter().map(|s| s.visible).collect();
+            let mut new_visible = visible_before.clone();
             let mut egui_wants_pointer = false;
             let mut egui_wants_keyboard = false;
             let mut do_zoom_all = false;
@@ -2761,10 +2763,12 @@ async fn main() {
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| s.filepath.clone());
                             ui.horizontal(|ui| {
+                                ui.checkbox(&mut new_visible[i], "")
+                                    .on_hover_text("Show / hide this cloud");
+                                ui.label(name);
                                 if ui.button("Unload").clicked() {
                                     stage_unload_request = Some(i);
                                 }
-                                ui.label(name);
                             });
                         }
                         if app_mode == AppMode::SectionAdjustDepth {
@@ -2862,6 +2866,7 @@ async fn main() {
             let pick_across = |view_proj: &glam::Mat4, mx: f32, my: f32| -> Option<(usize, usize)> {
                 let mut best: Option<(usize, usize, f32)> = None;
                 for (si, s) in stages.iter().enumerate() {
+                    if !s.visible { continue; }
                     if let Some(idx) = s.find_nearest_point(view_proj, mx, my, screen_width(), screen_height()) {
                         let pos = s.positions[idx];
                         let p = *view_proj * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
@@ -2956,6 +2961,11 @@ async fn main() {
                     stages[i].rebuild_colors(&mut *gl.quad_context, color_mode);
                 }
             }
+            for (i, vis) in new_visible.iter().enumerate() {
+                if *vis != visible_before[i] {
+                    stages[i].visible = *vis;
+                }
+            }
         }
 
         // ---- COPC mode rendering ----
@@ -2972,6 +2982,8 @@ async fn main() {
             }
 
             let copc_overrides_before: Vec<Option<[f32; 3]>> = copc_stages.iter().map(|cs| cs.rgb_override).collect();
+            let copc_visible_before: Vec<bool> = copc_stages.iter().map(|cs| cs.visible).collect();
+            let mut new_copc_visible = copc_visible_before.clone();
             let mut new_copc_overrides = copc_overrides_before.clone();
 
             // Render visible chunks (with optional EDL).
@@ -3181,10 +3193,12 @@ async fn main() {
                                 .map(|s| s.to_string_lossy().to_string())
                                 .unwrap_or_else(|| cs.filepath.clone());
                             ui.horizontal(|ui| {
+                                ui.checkbox(&mut new_copc_visible[i], "")
+                                    .on_hover_text("Show / hide this cloud");
+                                ui.label(name);
                                 if ui.button("Unload").clicked() {
                                     copc_unload_request = Some(i);
                                 }
-                                ui.label(name);
                             });
                         }
                         if let (Some(a), Some(b)) = (measure_a, measure_b) {
@@ -3275,7 +3289,7 @@ async fn main() {
                 match app_mode {
                     AppMode::PointPick => {
                         let mut best_dist = f32::MAX;
-                        for cs in &copc_stages {
+                        for cs in copc_stages.iter().filter(|cs| cs.visible) {
                             if let Some((p, _vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) 
                                 && dist < best_dist { best_dist = dist; picked_copc_point = Some(p.clone()); 
                             }
@@ -3306,6 +3320,9 @@ async fn main() {
                             let mut length = 0.0_f32;
                             let height_range = copc_stages[0].height_range();
                             for cs in &copc_stages {
+                                // Hidden clouds still push an (empty) entry so
+                                // `per_stage_raw` stays indexed by stage.
+                                if !cs.visible { per_stage_raw.push(Vec::new()); continue; }
                                 let (verts, raw, len, hmin, hmax) =
                                     cs.extract_section_verts(start, end, section_depth, color_mode);
                                 all_verts.extend(verts);
@@ -3332,7 +3349,7 @@ async fn main() {
                     }
                     AppMode::MeasureFirst => {
                         let mut best_dist = f32::MAX;
-                        for cs in &copc_stages {
+                        for cs in copc_stages.iter().filter(|cs| cs.visible) {
                             if let Some((_p, vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) 
                                 && dist < best_dist { best_dist = dist; measure_a = Some(vpos); measure_b = None; app_mode = AppMode::MeasureSecond; 
                             }
@@ -3340,7 +3357,7 @@ async fn main() {
                     }
                     AppMode::MeasureSecond => {
                         let mut best_dist = f32::MAX;
-                        for cs in &copc_stages {
+                        for cs in copc_stages.iter().filter(|cs| cs.visible) {
                             if let Some((_p, vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) 
                                 && dist < best_dist { best_dist = dist; measure_b = Some(vpos); 
                             }
@@ -3381,6 +3398,11 @@ async fn main() {
                         copc_stages[i].rgb_override = new_ov;
                         copc_stages[i].rebuild_colors(&mut *gl.quad_context, color_mode);
                     }
+                }
+            }
+            for (i, vis) in new_copc_visible.iter().enumerate() {
+                if *vis != copc_visible_before[i] {
+                    copc_stages[i].visible = *vis;
                 }
             }
         }

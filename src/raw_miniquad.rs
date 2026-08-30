@@ -241,6 +241,10 @@
         pub viewer_origin: [f64; 3],
         pub class_defs: Option<ClassDefs>,
         pub rgb_override: Option<[f32; 3]>,
+        /// Whether this cloud is drawn. Hidden clouds stay resident on the GPU
+        /// and keep their index in `stages`, they are only skipped when
+        /// rendering, picking and cutting sections.
+        pub visible: bool,
         /// Lower/upper bound of the height colour bar, relative to the dataset
         /// minimum (same space as `positions[..][2]`). Defaults to `0.0` and the
         /// full `height_range()`; editable from the UI.
@@ -543,6 +547,7 @@
                 viewer_origin,
                 class_defs,
                 rgb_override: None,
+                visible: true,
                 color_h_min: 0.0,
                 color_h_max: height_range,
                 z_clip: ZClip::OPEN,
@@ -729,6 +734,7 @@
         }
 
         pub fn draw_visible(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4, point_size: f32) -> i32 {
+            if !self.visible { return 0; }
             let planes = extract_frustum_planes(view_proj);
             let mut drawn = 0;
             let height_range = self.height_range();
@@ -1431,6 +1437,10 @@
         pub time_max: f64,
         pub class_defs: Option<ClassDefs>,
         pub rgb_override: Option<[f32; 3]>,
+        /// Whether this cloud is drawn. Hidden clouds keep loading their LOD in
+        /// the background and keep their index in `copc_stages`, they are only
+        /// skipped when rendering, picking and cutting sections.
+        pub visible: bool,
         /// Highest classification id seen across all ingested nodes.
         pub max_class: u8,
         /// Height colour-bar bounds, relative to `global_min[2]`. See `Stage::color_h_min`.
@@ -1720,6 +1730,7 @@
                 time_max: f64::MIN,
                 class_defs,
                 rgb_override: None,
+                visible: true,
                 max_class: 0,
                 color_h_min: 0.0,
                 color_h_max: (global_max[2] - global_min[2]) as f32,
@@ -2152,6 +2163,7 @@
             view_proj: &glam::Mat4,
             point_size: f32,
         ) -> i32 {
+            if !self.visible { return 0; }
             let planes = extract_frustum_planes(view_proj);
             let height_range = self.height_range();
             let mut drawn = 0;
@@ -2394,6 +2406,7 @@
         let (mut h_min, mut h_max) = (f32::MAX, f32::MIN);
         let mut length = 0.0_f32;
         for s in stages {
+            if !s.visible { continue; }
             let (verts, len, hmin, hmax) = s.extract_section_verts(start, end, depth, color_mode);
             all_verts.extend(verts);
             h_min = h_min.min(hmin);
