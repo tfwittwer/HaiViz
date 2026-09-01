@@ -163,7 +163,9 @@ There you can:
 
 - **scroll** to zoom the section,
 - **Measure** distances between two clicked points (with slope readout),
-- click **Point Info** and then a point to inspect its attributes,
+- click **Point Info** and then a point to inspect its attributes; the
+  **Copy** buttons beside the coordinate and GPS time readouts put those
+  values on the clipboard (coordinates tab separated),
 - see any polylines that cross the corridor drawn into the slice.
 
 Click **Back to 3D** to return.

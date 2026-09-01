@@ -390,17 +390,23 @@ fn height_color_controls(
         return false;
     }
     let mut changed = false;
+    // Same rounding trap as the height band sliders: compare the stored value,
+    // not egui's `.changed()`, or the ramp rebuilds every frame.
     ui.horizontal(|ui| {
         ui.label("Height color:");
         let mut abs_min = *h_min as f64 + z_offset;
         let mut abs_max = *h_max as f64 + z_offset;
-        if ui.add(egui::DragValue::new(&mut abs_min).speed(0.1).max_decimals(2).suffix(" m")).changed() {
-            *h_min = (abs_min - z_offset) as f32;
+        ui.add(egui::DragValue::new(&mut abs_min).speed(0.1).max_decimals(2).suffix(" m"));
+        let new_min = (abs_min - z_offset) as f32;
+        if new_min != *h_min {
+            *h_min = new_min;
             changed = true;
         }
         ui.label("to");
-        if ui.add(egui::DragValue::new(&mut abs_max).speed(0.1).max_decimals(2).suffix(" m")).changed() {
-            *h_max = (abs_max - z_offset) as f32;
+        ui.add(egui::DragValue::new(&mut abs_max).speed(0.1).max_decimals(2).suffix(" m"));
+        let new_max = (abs_max - z_offset) as f32;
+        if new_max != *h_max {
+            *h_max = new_max;
             changed = true;
         }
     });
@@ -516,12 +522,19 @@ fn z_clip_controls(
     }
     let lo_bound = z_offset;
     let hi_bound = z_offset + height_range as f64;
-    let mut abs_lo = *z_lo as f64 + z_offset;
-    let mut abs_hi = *z_hi as f64 + z_offset;
+    // `max_decimals` makes egui round the value it displays and report that
+    // rounding as a change — on every frame, not just the ones the operator
+    // touched. Taking `.changed()` at face value here re-coloured and
+    // re-uploaded the whole cloud 60 times a second for as long as the filter
+    // was open, so compare the band actually stored instead. The stored value
+    // round-trips to the same rounding next frame, so this settles after one.
     ui.horizontal(|ui| {
         ui.label("  Top:");
-        if ui.add(egui::Slider::new(&mut abs_hi, lo_bound..=hi_bound).max_decimals(2).suffix(" m")).changed() {
-            *z_hi = (abs_hi - z_offset) as f32;
+        let mut abs_hi = *z_hi as f64 + z_offset;
+        ui.add(egui::Slider::new(&mut abs_hi, lo_bound..=hi_bound).max_decimals(2).suffix(" m"));
+        let new_hi = (abs_hi - z_offset) as f32;
+        if new_hi != *z_hi {
+            *z_hi = new_hi;
             // Dragging one end past the other would blank the view; push
             // rather than swap, so the drag stays predictable.
             *z_lo = z_lo.min(*z_hi);
@@ -530,13 +543,31 @@ fn z_clip_controls(
     });
     ui.horizontal(|ui| {
         ui.label("  Bot:");
-        if ui.add(egui::Slider::new(&mut abs_lo, lo_bound..=hi_bound).max_decimals(2).suffix(" m")).changed() {
-            *z_lo = (abs_lo - z_offset) as f32;
+        let mut abs_lo = *z_lo as f64 + z_offset;
+        ui.add(egui::Slider::new(&mut abs_lo, lo_bound..=hi_bound).max_decimals(2).suffix(" m"));
+        let new_lo = (abs_lo - z_offset) as f32;
+        if new_lo != *z_lo {
+            *z_lo = new_lo;
             *z_hi = z_hi.max(*z_lo);
             changed = true;
         }
     });
     changed
+}
+
+/// Swap in a new cross section, parking the old one's GPU buffers in `trash`.
+/// They cannot be freed here: most callers are already holding the GL context
+/// to build the replacement. The per-frame drain in the main loop releases
+/// them, at a point where nothing else has the context borrowed.
+fn set_section(
+    section_data: &mut Option<SectionData>,
+    trash: &mut Vec<SectionData>,
+    new: Option<SectionData>,
+) {
+    if let Some(old) = section_data.take() {
+        trash.push(old);
+    }
+    *section_data = new;
 }
 
 /// Push the height band onto every loaded data source.
@@ -572,6 +603,51 @@ fn apply_height_color(
         mgr.color_h_min = h_min;
         mgr.color_h_max = h_max;
     }
+}
+
+/// A readout line with a copy button beside it, so the value can be lifted
+/// out without retyping it. `clip` is what lands on the clipboard, which is
+/// not always what is displayed — the coordinates are copied tab separated
+/// for pasting into a spreadsheet.
+fn copyable_line(ui: &mut egui_macroquad::egui::Ui, text: String, clip: String, hint: &str) {
+    ui.horizontal(|ui| {
+        ui.label(text);
+        if ui.small_button("Copy").on_hover_text(hint).clicked() {
+            ui.ctx().copy_text(clip);
+        }
+    });
+}
+
+/// Point Info block, shared by every viewer mode. `title` lets the tile
+/// browser name the file the point came from.
+fn point_info_ui(
+    ui: &mut egui_macroquad::egui::Ui,
+    title: &str,
+    p: &LasPoint,
+    class_defs: &Option<ClassDefs>,
+) {
+    ui.label(title);
+    copyable_line(
+        ui,
+        format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z),
+        format!("{:.3}	{:.3}	{:.3}", p.x, p.y, p.z),
+        "Copy the coordinates to the clipboard, tab separated",
+    );
+    ui.label(format!("  Intensity: {}", p.intensity));
+    ui.label(format!("  Classification: {}", class_label(p, class_defs)));
+    ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
+    if let Some(ref color) = p.color {
+        ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
+    }
+    if let Some(time) = p.gps_time {
+        copyable_line(
+            ui,
+            format!("  GPS time: {:.6}", time),
+            format!("{:.6}", time),
+            "Copy the GPS time to the clipboard",
+        );
+    }
+    ui.label(format!("  Point Source Id: {}", p.point_source_id));
 }
 
 /// Format classification label using custom class_defs or default debug format.
@@ -1454,6 +1530,9 @@ async fn main() {
     let mut section_end: Option<(f32, f32)> = None;
     let mut section_depth: f32 = 2.0;
     let mut section_data: Option<SectionData> = None;
+    // Sections replaced since the last drain, waiting for their buffers to be
+    // released. See `set_section`.
+    let mut section_trash: Vec<SectionData> = Vec::new();
     // Cache of raw COPC section points (one Vec per stage) used to recolour on mode change.
     #[allow(clippy::type_complexity)]
     let mut copc_section_raw: Option<(Vec<Vec<(LasPoint, f32, f32)>>, f32, f32, f32)> = None;
@@ -1665,7 +1744,7 @@ async fn main() {
             info!("Unloading COPC file: {}", cs.filepath);
             let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
             cs.unload(ctx);
-            section_data = None;
+            set_section(&mut section_data, &mut section_trash, None);
             copc_section_raw = None;
         }
         if let Some(idx) = stage_unload_request.take()
@@ -1675,7 +1754,7 @@ async fn main() {
             info!("Unloading LAZ file: {}", s.filepath);
             let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
             s.unload(ctx);
-            section_data = None;
+            set_section(&mut section_data, &mut section_trash, None);
             // Picked point may reference an unloaded stage.
             if let Some((si, _)) = picked_point && si >= stages.len() {
                 picked_point = None;
@@ -1701,6 +1780,13 @@ async fn main() {
             crate::raw_miniquad::ZClip::OPEN
         };
         apply_z_clip(&mut stages, &mut copc_stages, &mut tile_mgr, z_clip);
+
+        if !section_trash.is_empty() {
+            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+            for sec in section_trash.drain(..) {
+                sec.unload(ctx);
+            }
+        }
 
         // Highest classification id present in the loaded data; the class editor
         // shows one row per id up to this value.
@@ -1757,7 +1843,7 @@ async fn main() {
                 corridor_status = None;
                 lasso.clear();
                 app_mode = AppMode::View3D;
-                section_data = None;
+                set_section(&mut section_data, &mut section_trash, None);
             } else {
                 break;
             }
@@ -1823,8 +1909,9 @@ async fn main() {
                         let h_max = if h_max == f32::MIN { 0.0 } else { h_max };
                         info!("COPC Section re-cut at full resolution: {} points", all_verts.len());
                         copc_section_raw = Some((per_stage_raw, length, h_min, h_max));
-                        section_data = Some(make_section_data(
-                            &mut *gl.quad_context, all_verts, length, h_min, h_max, height_range));
+                        let sec = make_section_data(
+                            &mut *gl.quad_context, all_verts, length, h_min, h_max, height_range);
+                        set_section(&mut section_data, &mut section_trash, Some(sec));
                         sec_picked_point = None;
                     }
                     corridor_status = None;
@@ -2031,7 +2118,7 @@ async fn main() {
                     .show(egui_ctx, |ui| {
                         if ui.button("Back to 3D").clicked() {
                             app_mode = AppMode::View3D;
-                            section_data = None;
+                            set_section(&mut section_data, &mut section_trash, None);
                             sec_measure_a = None;
                             sec_measure_b = None;
                             sec_picked_point = None;
@@ -2118,18 +2205,7 @@ async fn main() {
                         }
                         if let Some((ref p, _)) = sec_picked_point {
                             ui.separator();
-                            ui.label("Point Info:");
-                            ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
-                            ui.label(format!("  Intensity: {}", p.intensity));
-                            ui.label(format!("  Classification: {}", class_label(p, &class_defs)));
-                            ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
-                            if let Some(ref color) = p.color {
-                                ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
-                            }
-                            if let Some(time) = p.gps_time {
-                                ui.label(format!("  GPS time: {:.6}", time));
-                            }
-                            ui.label(format!("  Point Source Id: {}", p.point_source_id));
+                            point_info_ui(ui, "Point Info:", p, &class_defs);
                         }
 
                         // ---- Manual classification ----
@@ -2209,14 +2285,19 @@ async fn main() {
             // levels that are no longer drawn. Route it through the existing
             // height-colour path rather than adding a parallel one.
             if z_clip_changed {
-                if z_clip_enabled {
-                    height_color_min = z_clip_lo;
-                    height_color_max = z_clip_hi;
+                let (new_min, new_max) = if z_clip_enabled {
+                    (z_clip_lo, z_clip_hi)
                 } else {
-                    height_color_min = 0.0;
-                    height_color_max = height_range;
+                    (0.0, height_range)
+                };
+                // A band that maps onto the ramp already in force costs nothing
+                // to "apply", and re-uploading every colour to arrive at the
+                // same bytes is the most expensive thing this view can do.
+                if (new_min, new_max) != (height_color_min, height_color_max) {
+                    height_color_min = new_min;
+                    height_color_max = new_max;
+                    height_color_changed = true;
                 }
-                height_color_changed = true;
             }
             egui_macroquad::draw();
 
@@ -2327,14 +2408,16 @@ async fn main() {
                         let mut gl = unsafe { get_internal_gl() };
                         gl.flush();
                         if !stages.is_empty() {
-                            section_data = Some(build_section_from_stages(
+                            let sec = build_section_from_stages(
                                 &mut *gl.quad_context, &stages, start, end, section_depth, section_color_mode,
-                            ));
+                            );
+                            set_section(&mut section_data, &mut section_trash, Some(sec));
                         } else if let Some((ref per_stage_raw, length, h_min, h_max)) = copc_section_raw {
-                            section_data = Some(build_section_from_raw_stages(
+                            let sec = build_section_from_raw_stages(
                                 &mut *gl.quad_context, &copc_stages, per_stage_raw,
                                 length, h_min, h_max, section_color_mode,
-                            ));
+                            );
+                            set_section(&mut section_data, &mut section_trash, Some(sec));
                         }
                     }
 
@@ -2404,9 +2487,10 @@ async fn main() {
                 if stages_touched && let (Some(a), Some(b)) = (section_start, section_end) {
                     let mut gl = unsafe { get_internal_gl() };
                     gl.flush();
-                    section_data = Some(build_section_from_stages(
+                    let sec = build_section_from_stages(
                         &mut *gl.quad_context, &stages, a, b, section_depth, section_color_mode,
-                    ));
+                    );
+                    set_section(&mut section_data, &mut section_trash, Some(sec));
                 } else if copc_touched {
                     // The corridor has to stream in again before the slice can
                     // be rebuilt; go back through the loading state.
@@ -2515,27 +2599,36 @@ async fn main() {
             }
 
             let class_rebuild = class_colors_changed && section_color_mode == ColorMode::Classification;
-            if (section_color_mode != prev_color_mode || height_color_changed || class_rebuild) &&
+            // Storing the ramp bounds is cheap; re-uploading every colour is
+            // not. Only Height mode reads the ramp, so in any other mode the
+            // new bounds are recorded and the upload waits until the view is
+            // switched back to Height — which is what the height filter needs,
+            // since it drives these bounds on every slider frame.
+            if height_color_changed {
+                apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
+            }
+            let height_rebuild = height_color_changed && section_color_mode == ColorMode::Height;
+            if (section_color_mode != prev_color_mode || height_rebuild || class_rebuild) &&
                 let (Some(start), Some(end)) = (section_start, section_end) {
-                    if height_color_changed {
-                        apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
-                    }
                     let gl = unsafe { get_internal_gl() };
                     if !stages.is_empty() {
-                        section_data = Some(build_section_from_stages(
+                        let sec = build_section_from_stages(
                             &mut *gl.quad_context, &stages, start, end, section_depth, section_color_mode,
-                        ));
+                        );
+                        set_section(&mut section_data, &mut section_trash, Some(sec));
                     } else if !copc_stages.is_empty() {
                         if let Some((ref per_stage_raw, length, h_min, h_max)) = copc_section_raw {
-                            section_data = Some(build_section_from_raw_stages(
+                            let sec = build_section_from_raw_stages(
                                 &mut *gl.quad_context, &copc_stages, per_stage_raw,
                                 length, h_min, h_max, section_color_mode,
-                            ));
+                            );
+                            set_section(&mut section_data, &mut section_trash, Some(sec));
                         }
                     } else if let Some(ref mgr) = tile_mgr {
-                        section_data = Some(mgr.extract_section(
+                        let sec = mgr.extract_section(
                             &mut *gl.quad_context, start, end, section_depth, section_color_mode,
-                        ));
+                        );
+                        set_section(&mut section_data, &mut section_trash, Some(sec));
                     }
             }
 
@@ -2800,7 +2893,7 @@ async fn main() {
                                 }
                                 _ => {
                                     app_mode = AppMode::View3D;
-                                    section_data = None;
+                                    set_section(&mut section_data, &mut section_trash, None);
                                 }
                             }
                         }
@@ -2965,18 +3058,7 @@ async fn main() {
                             && let Some(p) = s.cloud.points.get(idx)
                         {
                             ui.separator();
-                            ui.label("Point Info:");
-                            ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
-                            ui.label(format!("  Intensity: {}", p.intensity));
-                            ui.label(format!("  Classification: {}", class_label(p, &class_defs)));
-                            ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
-                            if let Some(ref color) = p.color {
-                                ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
-                            }
-                            if let Some(time) = p.gps_time {
-                                ui.label(format!("  GPS time: {:.6}", time));
-                            }
-                            ui.label(format!("  Point Source Id: {}", p.point_source_id));
+                            point_info_ui(ui, "Point Info:", p, &class_defs);
                         }
                     });
                 export_request = export_window(
@@ -2993,14 +3075,19 @@ async fn main() {
             // levels that are no longer drawn. Route it through the existing
             // height-colour path rather than adding a parallel one.
             if z_clip_changed {
-                if z_clip_enabled {
-                    height_color_min = z_clip_lo;
-                    height_color_max = z_clip_hi;
+                let (new_min, new_max) = if z_clip_enabled {
+                    (z_clip_lo, z_clip_hi)
                 } else {
-                    height_color_min = 0.0;
-                    height_color_max = height_range;
+                    (0.0, height_range)
+                };
+                // A band that maps onto the ramp already in force costs nothing
+                // to "apply", and re-uploading every colour to arrive at the
+                // same bytes is the most expensive thing this view can do.
+                if (new_min, new_max) != (height_color_min, height_color_max) {
+                    height_color_min = new_min;
+                    height_color_max = new_max;
+                    height_color_changed = true;
                 }
-                height_color_changed = true;
             }
 
             // ---- GCP overlay ----
@@ -3079,7 +3166,7 @@ async fn main() {
                             );
                             section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
                             section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
-                            section_data = Some(sec);
+                            set_section(&mut section_data, &mut section_trash, Some(sec));
                             sec_picked_point = None;
                             if !section_color_mode_pinned { section_color_mode = color_mode; }
                             app_mode = AppMode::SectionView;
@@ -3108,12 +3195,18 @@ async fn main() {
                 apply_class_defs(&mut stages, &mut copc_stages, &mut tile_mgr, &class_defs);
             }
             let class_rebuild = class_colors_changed && color_mode == ColorMode::Classification;
-            if color_mode != prev_color_mode || height_color_changed || class_rebuild {
+            // Storing the ramp bounds is cheap; re-uploading every colour is
+            // not. Only Height mode reads the ramp, so in any other mode the
+            // new bounds are recorded and the upload waits until the view is
+            // switched back to Height — which is what the height filter needs,
+            // since it drives these bounds on every slider frame.
+            if height_color_changed {
+                apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
+            }
+            let height_rebuild = height_color_changed && color_mode == ColorMode::Height;
+            if color_mode != prev_color_mode || height_rebuild || class_rebuild {
                 let gl = unsafe { get_internal_gl() };
-                if height_color_changed {
-                    apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
-                }
-                if height_color_changed || class_rebuild {
+                if height_rebuild || class_rebuild {
                     for cs in copc_stages.iter_mut() {
                         cs.rebuild_colors(&mut *gl.quad_context, color_mode);
                     }
@@ -3236,7 +3329,7 @@ async fn main() {
                                 }
                                 _ => {
                                     app_mode = AppMode::View3D;
-                                    section_data = None;
+                                    set_section(&mut section_data, &mut section_trash, None);
                                     leave_corridor = true;
                                     corridor_status = None;
                                 }
@@ -3392,18 +3485,7 @@ async fn main() {
                         }
                         if let Some(ref p) = picked_copc_point {
                             ui.separator();
-                            ui.label("Point Info:");
-                            ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
-                            ui.label(format!("  Intensity: {}", p.intensity));
-                            ui.label(format!("  Classification: {}", class_label(p, &class_defs)));
-                            ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
-                            if let Some(ref color) = p.color {
-                                ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
-                            }
-                            if let Some(time) = p.gps_time {
-                                ui.label(format!("  GPS time: {:.6}", time));
-                            }
-                            ui.label(format!("  Point Source Id: {}", p.point_source_id));
+                            point_info_ui(ui, "Point Info:", p, &class_defs);
                         }
                     });
                 export_request = export_window(
@@ -3420,14 +3502,19 @@ async fn main() {
             // levels that are no longer drawn. Route it through the existing
             // height-colour path rather than adding a parallel one.
             if z_clip_changed {
-                if z_clip_enabled {
-                    height_color_min = z_clip_lo;
-                    height_color_max = z_clip_hi;
+                let (new_min, new_max) = if z_clip_enabled {
+                    (z_clip_lo, z_clip_hi)
                 } else {
-                    height_color_min = 0.0;
-                    height_color_max = height_range;
+                    (0.0, height_range)
+                };
+                // A band that maps onto the ramp already in force costs nothing
+                // to "apply", and re-uploading every colour to arrive at the
+                // same bytes is the most expensive thing this view can do.
+                if (new_min, new_max) != (height_color_min, height_color_max) {
+                    height_color_min = new_min;
+                    height_color_max = new_max;
+                    height_color_changed = true;
                 }
-                height_color_changed = true;
             }
 
             // ---- GCP overlay ----
@@ -3520,7 +3607,7 @@ async fn main() {
                                 sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
                             section_zoom = (sec.length / 2.0)
                                 .max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
-                            section_data = Some(sec);
+                            set_section(&mut section_data, &mut section_trash, Some(sec));
                             sec_picked_point = None;
                             corridor_status = None;
                             if !section_color_mode_pinned { section_color_mode = color_mode; }
@@ -3554,12 +3641,18 @@ async fn main() {
                 apply_class_defs(&mut stages, &mut copc_stages, &mut tile_mgr, &class_defs);
             }
             let class_rebuild = class_colors_changed && color_mode == ColorMode::Classification;
-            if color_mode != prev_color_mode || height_color_changed || class_rebuild {
+            // Storing the ramp bounds is cheap; re-uploading every colour is
+            // not. Only Height mode reads the ramp, so in any other mode the
+            // new bounds are recorded and the upload waits until the view is
+            // switched back to Height — which is what the height filter needs,
+            // since it drives these bounds on every slider frame.
+            if height_color_changed {
+                apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
+            }
+            let height_rebuild = height_color_changed && color_mode == ColorMode::Height;
+            if color_mode != prev_color_mode || height_rebuild || class_rebuild {
                 let gl = unsafe { get_internal_gl() };
-                if height_color_changed {
-                    apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
-                }
-                if height_color_changed || class_rebuild {
+                if height_rebuild || class_rebuild {
                     for s in stages.iter_mut() {
                         s.rebuild_colors(&mut *gl.quad_context, color_mode);
                     }
@@ -3716,7 +3809,7 @@ async fn main() {
                                 }
                                 _ => {
                                     app_mode = AppMode::View3D;
-                                    section_data = None;
+                                    set_section(&mut section_data, &mut section_trash, None);
                                 }
                             }
                         }
@@ -3868,18 +3961,7 @@ async fn main() {
                             let Some(ref lt) = mgr.loaded[tile_idx] {
                                 ui.separator();
                                 let p = &lt.cloud.points[point_idx];
-                                ui.label(format!("Point Info ({})", mgr.tiles[tile_idx].filename));
-                                ui.label(format!("  X: {:.3}  Y: {:.3}  Z: {:.3}", p.x, p.y, p.z));
-                                ui.label(format!("  Intensity: {}", p.intensity));
-                                ui.label(format!("  Classification: {}", class_label(p, &class_defs)));
-                                ui.label(format!("  Return: {}/{}", p.return_number, p.number_of_returns));
-                                if let Some(ref color) = p.color {
-                                    ui.label(format!("  RGB: {} {} {}", color.red, color.green, color.blue));
-                                }
-                                if let Some(time) = p.gps_time {
-                                    ui.label(format!("  GPS time: {:.6}", time));
-                                }
-                                ui.label(format!("  Intensity: {}", p.point_source_id));
+                                point_info_ui(ui, &format!("Point Info ({})", mgr.tiles[tile_idx].filename), p, &class_defs);
                             
                         }
                     });
@@ -3897,14 +3979,19 @@ async fn main() {
             // levels that are no longer drawn. Route it through the existing
             // height-colour path rather than adding a parallel one.
             if z_clip_changed {
-                if z_clip_enabled {
-                    height_color_min = z_clip_lo;
-                    height_color_max = z_clip_hi;
+                let (new_min, new_max) = if z_clip_enabled {
+                    (z_clip_lo, z_clip_hi)
                 } else {
-                    height_color_min = 0.0;
-                    height_color_max = height_range;
+                    (0.0, height_range)
+                };
+                // A band that maps onto the ramp already in force costs nothing
+                // to "apply", and re-uploading every colour to arrive at the
+                // same bytes is the most expensive thing this view can do.
+                if (new_min, new_max) != (height_color_min, height_color_max) {
+                    height_color_min = new_min;
+                    height_color_max = new_max;
+                    height_color_changed = true;
                 }
-                height_color_changed = true;
             }
 
             // ---- GCP overlay ----
@@ -3975,7 +4062,7 @@ async fn main() {
                             );
                             section_pan = glam::Vec2::new(sec.length / 2.0, (sec.height_min + sec.height_max) / 2.0);
                             section_zoom = (sec.length / 2.0).max((sec.height_max - sec.height_min) / 2.0).max(1.0) * 1.2;
-                            section_data = Some(sec);
+                            set_section(&mut section_data, &mut section_trash, Some(sec));
                             sec_picked_point = None;
                             if !section_color_mode_pinned { section_color_mode = color_mode; }
                             app_mode = AppMode::SectionView;
@@ -4028,22 +4115,23 @@ async fn main() {
                 apply_class_defs(&mut stages, &mut copc_stages, &mut tile_mgr, &class_defs);
             }
             let class_rebuild = class_colors_changed && color_mode == ColorMode::Classification;
-            if color_mode != prev_color_mode || height_color_changed || class_rebuild {
+            // Storing the ramp bounds is cheap; re-uploading every colour is
+            // not. Only Height mode reads the ramp, so in any other mode the
+            // new bounds are recorded and the upload waits until the view is
+            // switched back to Height — which is what the height filter needs,
+            // since it drives these bounds on every slider frame.
+            if height_color_changed {
+                apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
+            }
+            let height_rebuild = height_color_changed && color_mode == ColorMode::Height;
+            if color_mode != prev_color_mode || height_rebuild || class_rebuild {
                 let gl = unsafe { get_internal_gl() };
-                if height_color_changed || class_rebuild {
+                if height_rebuild || class_rebuild {
                     for s in stages.iter_mut() {
-                        if height_color_changed {
-                            s.color_h_min = height_color_min;
-                            s.color_h_max = height_color_max;
-                        }
                         s.rebuild_colors(&mut *gl.quad_context, color_mode);
                     }
                 }
                 if let Some(ref mut mgr) = tile_mgr {
-                    if height_color_changed {
-                        mgr.color_h_min = height_color_min;
-                        mgr.color_h_max = height_color_max;
-                    }
                     mgr.rebuild_colors(&mut *gl.quad_context, color_mode);
                 }
             }

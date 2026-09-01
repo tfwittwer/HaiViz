@@ -217,6 +217,19 @@
         point_indices: Vec<usize>,
     }
 
+    impl SectionData {
+        /// Free the GPU buffers backing this section. A section is rebuilt on
+        /// every colour, depth or endpoint change, so dropping one without
+        /// this leaks a position, colour and index buffer each time.
+        pub fn unload(self, ctx: &mut dyn RenderingBackend) {
+            let Bindings { vertex_buffers, index_buffer, .. } = self.bindings;
+            for vb in vertex_buffers {
+                ctx.delete_buffer(vb);
+            }
+            ctx.delete_buffer(index_buffer);
+        }
+    }
+
     pub struct SectionData {
         bindings: Bindings,
         pub num_points: i32,
@@ -425,11 +438,14 @@
             )
             .unwrap();
 
+        // Positions and colours live in separate vertex buffers. Only the
+        // colours ever change — a recolour after a ramp or class edit then
+        // re-uploads half as many bytes, and never touches the position data.
         ctx.new_pipeline(
-            &[BufferLayout::default()],
+            &[BufferLayout::default(), BufferLayout::default()],
             &[
-                VertexAttribute::new("pos", VertexFormat::Float3),
-                VertexAttribute::new("color", VertexFormat::Float3),
+                VertexAttribute::with_buffer("pos", VertexFormat::Float3, 0),
+                VertexAttribute::with_buffer("color", VertexFormat::Float3, 1),
             ],
             shader,
             PipelineParams {
@@ -441,10 +457,43 @@
         )
     }
 
+    /// Free every GPU buffer a chunk owns. Positions and colours sit in
+    /// separate buffers, so both have to be released.
+    fn free_chunk(ctx: &mut dyn RenderingBackend, chunk: Chunk) {
+        let Bindings { vertex_buffers, index_buffer, .. } = chunk.bindings;
+        for vb in vertex_buffers {
+            ctx.delete_buffer(vb);
+        }
+        ctx.delete_buffer(index_buffer);
+    }
+
+    /// Upload interleaved section vertices as the separate position and
+    /// colour buffers the pipeline expects. Sections are static, so both are
+    /// immutable.
+    fn upload_split_verts(
+        ctx: &mut dyn RenderingBackend,
+        verts: &[Vertex],
+    ) -> (BufferId, BufferId) {
+        let positions: Vec<[f32; 3]> = verts.iter().map(|v| v.pos).collect();
+        let colors: Vec<[f32; 3]> = verts.iter().map(|v| v.color).collect();
+        (
+            ctx.new_buffer(
+                BufferType::VertexBuffer,
+                BufferUsage::Immutable,
+                BufferSource::slice(&positions),
+            ),
+            ctx.new_buffer(
+                BufferType::VertexBuffer,
+                BufferUsage::Immutable,
+                BufferSource::slice(&colors),
+            ),
+        )
+    }
+
     fn build_chunks(
         ctx: &mut dyn RenderingBackend,
         positions: &[[f32; 3]],
-        vertices: &[Vertex],
+        colors: &[[f32; 3]],
     ) -> Vec<Chunk> {
         let mut chunk_map: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
         for (i, pos) in positions.iter().enumerate() {
@@ -455,22 +504,29 @@
 
         chunk_map.into_values()
             .map(|point_indices| {
-                let chunk_verts: Vec<Vertex> =
-                point_indices.iter().map(|&i| vertices[i]).collect();
+                let chunk_pos: Vec<[f32; 3]> =
+                    point_indices.iter().map(|&i| positions[i]).collect();
+                let chunk_colors: Vec<[f32; 3]> =
+                    point_indices.iter().map(|&i| colors[i]).collect();
                 let mut aabb_min = [f32::MAX; 3];
                 let mut aabb_max = [f32::MIN; 3];
-                for v in &chunk_verts {
+                for pos in &chunk_pos {
                     for j in 0..3 {
-                        aabb_min[j] = aabb_min[j].min(v.pos[j]);
-                        aabb_max[j] = aabb_max[j].max(v.pos[j]);
+                        aabb_min[j] = aabb_min[j].min(pos[j]);
+                        aabb_max[j] = aabb_max[j].max(pos[j]);
                     }
                 }
 
-                let n = chunk_verts.len() as i32;
-                let vertex_buffer = ctx.new_buffer(
+                let n = chunk_pos.len() as i32;
+                let pos_buffer = ctx.new_buffer(
+                    BufferType::VertexBuffer,
+                    BufferUsage::Immutable,
+                    BufferSource::slice(&chunk_pos),
+                );
+                let color_buffer = ctx.new_buffer(
                     BufferType::VertexBuffer,
                     BufferUsage::Dynamic,
-                    BufferSource::slice(&chunk_verts),
+                    BufferSource::slice(&chunk_colors),
                 );
                 let indices: Vec<u32> = (0..n as u32).collect();
                 let index_buffer = ctx.new_buffer(
@@ -481,7 +537,7 @@
 
                 Chunk {
                     bindings: Bindings {
-                        vertex_buffers: vec![vertex_buffer],
+                        vertex_buffers: vec![pos_buffer, color_buffer],
                         index_buffer,
                         images: vec![],
                     },
@@ -520,19 +576,16 @@
                 ])
                 .collect();
 
-            let vertices: Vec<Vertex> = cloud
+            let colors: Vec<[f32; 3]> = cloud
                 .points
                 .iter()
                 .enumerate()
-                .map(|(i, p)| Vertex {
-                    pos: positions[i],
-                    color: color_for_point(p, positions[i][2], 0.0, height_range, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &class_defs, None),
-                })
+                .map(|(i, p)| color_for_point(p, positions[i][2], 0.0, height_range, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &class_defs, None))
                 .collect();
 
             let pipeline = create_pipeline(ctx);
-            let total_points = vertices.len() as i32;
-            let chunks = build_chunks(ctx, &positions, &vertices);
+            let total_points = colors.len() as i32;
+            let chunks = build_chunks(ctx, &positions, &colors);
 
             info!("{} points in {} chunks ({}m cells), height range: {:.1}m",
                 total_points, chunks.len(), CHUNK_SIZE, height_range);
@@ -613,8 +666,7 @@
         /// Free all GPU buffers held by this stage. Consumes the stage.
         pub fn unload(mut self, ctx: &mut dyn RenderingBackend) {
             for chunk in self.chunks.drain(..) {
-                ctx.delete_buffer(chunk.bindings.vertex_buffers[0]);
-                ctx.delete_buffer(chunk.bindings.index_buffer);
+                free_chunk(ctx, chunk);
             }
         }
 
@@ -660,21 +712,18 @@
             let time_range = self.cloud.time_max - self.cloud.time_min;
 
             for chunk in &mut self.chunks {
-                let chunk_verts: Vec<Vertex> = chunk
+                let chunk_colors: Vec<[f32; 3]> = chunk
                     .point_indices
                     .iter()
                     .map(|&i| {
                         let p = &self.cloud.points[i];
-                        Vertex {
-                            pos: self.positions[i],
-                            color: color_for_point(p, self.positions[i][2], h_lo, h_hi, self.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.cloud.time_min, time_range, color_mode, &self.class_defs, self.rgb_override),
-                        }
+                        color_for_point(p, self.positions[i][2], h_lo, h_hi, self.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.cloud.time_min, time_range, color_mode, &self.class_defs, self.rgb_override)
                     })
                     .collect();
 
                 ctx.buffer_update(
-                    chunk.bindings.vertex_buffers[0],
-                    BufferSource::slice(&chunk_verts),
+                    chunk.bindings.vertex_buffers[1],
+                    BufferSource::slice(&chunk_colors),
                 );
             }
         }
@@ -962,13 +1011,12 @@
                 (p.z - self.global_min[2]) as f32,
             ]).collect();
 
-            let vertices: Vec<Vertex> = cloud.points.iter().enumerate().map(|(i, p)| Vertex {
-                pos: positions[i],
-                color: color_for_point(p, positions[i][2], h_lo, h_hi, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &self.class_defs, override_rgb),
+            let colors: Vec<[f32; 3]> = cloud.points.iter().enumerate().map(|(i, p)| {
+                color_for_point(p, positions[i][2], h_lo, h_hi, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &self.class_defs, override_rgb)
             }).collect();
 
-            let total_points = vertices.len() as i32;
-            let chunks = build_chunks(ctx, &positions, &vertices);
+            let total_points = colors.len() as i32;
+            let chunks = build_chunks(ctx, &positions, &colors);
 
             info!("Tile {} loaded: {} points, {} chunks",
                 self.tiles[index].filename, total_points, chunks.len());
@@ -985,8 +1033,7 @@
         pub fn unload_tile(&mut self, ctx: &mut dyn RenderingBackend, index: usize) {
             if let Some(tile) = self.loaded[index].take() {
                 for chunk in tile.chunks {
-                    ctx.delete_buffer(chunk.bindings.vertex_buffers[0]);
-                    ctx.delete_buffer(chunk.bindings.index_buffer);
+                    free_chunk(ctx, chunk);
                 }
                 info!("Tile {} unloaded", self.tiles[index].filename);
             }
@@ -1025,14 +1072,11 @@
                 let time_range = loaded.cloud.time_max - loaded.cloud.time_min;
                 let override_rgb = loaded.rgb_override;
                 for chunk in &mut loaded.chunks {
-                    let chunk_verts: Vec<Vertex> = chunk.point_indices.iter().map(|&i| {
+                    let chunk_colors: Vec<[f32; 3]> = chunk.point_indices.iter().map(|&i| {
                         let p = &loaded.cloud.points[i];
-                        Vertex {
-                            pos: loaded.positions[i],
-                            color: color_for_point(p, loaded.positions[i][2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &class_defs, override_rgb),
-                        }
+                        color_for_point(p, loaded.positions[i][2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &class_defs, override_rgb)
                     }).collect();
-                    ctx.buffer_update(chunk.bindings.vertex_buffers[0], BufferSource::slice(&chunk_verts));
+                    ctx.buffer_update(chunk.bindings.vertex_buffers[1], BufferSource::slice(&chunk_colors));
                 }
             }
         }
@@ -1045,14 +1089,11 @@
                 let time_range = loaded.cloud.time_max - loaded.cloud.time_min;
                 let override_rgb = loaded.rgb_override;
                 for chunk in &mut loaded.chunks {
-                    let chunk_verts: Vec<Vertex> = chunk.point_indices.iter().map(|&i| {
+                    let chunk_colors: Vec<[f32; 3]> = chunk.point_indices.iter().map(|&i| {
                         let p = &loaded.cloud.points[i];
-                        Vertex {
-                            pos: loaded.positions[i],
-                            color: color_for_point(p, loaded.positions[i][2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &class_defs, override_rgb),
-                        }
+                        color_for_point(p, loaded.positions[i][2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &class_defs, override_rgb)
                     }).collect();
-                    ctx.buffer_update(chunk.bindings.vertex_buffers[0], BufferSource::slice(&chunk_verts));
+                    ctx.buffer_update(chunk.bindings.vertex_buffers[1], BufferSource::slice(&chunk_colors));
                 }
             }
         }
@@ -1162,11 +1203,7 @@
             info!("Section: {:.1}m long, {:.1}m depth, {} points, height {:.1}..{:.1}m",
                 len, depth, num_points, h_min, h_max);
 
-            let vertex_buffer = ctx.new_buffer(
-                BufferType::VertexBuffer,
-                BufferUsage::Immutable,
-                BufferSource::slice(&section_verts),
-            );
+            let (pos_buffer, color_buffer) = upload_split_verts(ctx, &section_verts);
             let indices: Vec<u32> = (0..num_points as u32).collect();
             let index_buffer = ctx.new_buffer(
                 BufferType::IndexBuffer,
@@ -1176,7 +1213,7 @@
 
             SectionData {
                 bindings: Bindings {
-                    vertex_buffers: vec![vertex_buffer],
+                    vertex_buffers: vec![pos_buffer, color_buffer],
                     index_buffer,
                     images: vec![],
                 },
@@ -1888,8 +1925,7 @@
             for key in keys {
                 if let Some(node) = self.loaded_nodes.remove(&key) {
                     for chunk in node.chunks {
-                        ctx.delete_buffer(chunk.bindings.vertex_buffers[0]);
-                        ctx.delete_buffer(chunk.bindings.index_buffer);
+                        free_chunk(ctx, chunk);
                     }
                 }
             }
@@ -1991,17 +2027,16 @@
                 (p.z - self.viewer_origin[2]) as f32,
             ]).collect();
 
-            let vertices: Vec<Vertex> = pts.iter().enumerate().map(|(i, p)| Vertex {
-                pos: positions[i],
-                color: color_for_point(
+            let colors: Vec<[f32; 3]> = pts.iter().enumerate().map(|(i, p)| {
+                color_for_point(
                     p, positions[i][2], h_lo, h_hi,
                     self.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.time_min, time_range,
                     color_mode, &self.class_defs, self.rgb_override,
-                ),
+                )
             }).collect();
 
-            let total_points = vertices.len() as i32;
-            let chunks = build_chunks(ctx, &positions, &vertices);
+            let total_points = colors.len() as i32;
+            let chunks = build_chunks(ctx, &positions, &colors);
 
             self.loaded_nodes.insert(key, CopcLoadedNode { chunks, positions, points: pts, total_points });
         }
@@ -2088,8 +2123,7 @@
             for key in to_unload {
                 if let Some(node) = self.loaded_nodes.remove(&key) {
                     for chunk in node.chunks {
-                        ctx.delete_buffer(chunk.bindings.vertex_buffers[0]);
-                        ctx.delete_buffer(chunk.bindings.index_buffer);
+                        free_chunk(ctx, chunk);
                     }
                 }
             }
@@ -2196,8 +2230,7 @@
         pub fn unload(mut self, ctx: &mut dyn RenderingBackend) {
             for (_, node) in self.loaded_nodes.drain() {
                 for chunk in node.chunks {
-                    ctx.delete_buffer(chunk.bindings.vertex_buffers[0]);
-                    ctx.delete_buffer(chunk.bindings.index_buffer);
+                    free_chunk(ctx, chunk);
                 }
             }
             // `self` drops here, which drops `load_tx`, signalling workers to exit.
@@ -2251,15 +2284,14 @@
             };
             for node in self.loaded_nodes.values_mut() {
                 for chunk in &mut node.chunks {
-                    let verts: Vec<Vertex> = chunk.point_indices.iter().map(|&i| Vertex {
-                        pos: node.positions[i],
-                        color: color_for_point(
+                    let colors: Vec<[f32; 3]> = chunk.point_indices.iter().map(|&i| {
+                        color_for_point(
                             &node.points[i], node.positions[i][2], h_lo, h_hi,
                             self.intensity_min, intensity_range, node.points[i].gps_time.unwrap_or(0.), self.time_min, time_range,
                             color_mode, &self.class_defs, self.rgb_override,
-                        ),
+                        )
                     }).collect();
-                    ctx.buffer_update(chunk.bindings.vertex_buffers[0], BufferSource::slice(&verts));
+                    ctx.buffer_update(chunk.bindings.vertex_buffers[1], BufferSource::slice(&colors));
                 }
             }
         }
@@ -2366,11 +2398,7 @@
         height_range: f32,
     ) -> SectionData {
         let num_points = verts.len() as i32;
-        let vertex_buffer = ctx.new_buffer(
-            BufferType::VertexBuffer,
-            BufferUsage::Immutable,
-            BufferSource::slice(&verts),
-        );
+        let (pos_buffer, color_buffer) = upload_split_verts(ctx, &verts);
         let indices: Vec<u32> = (0..num_points as u32).collect();
         let index_buffer = ctx.new_buffer(
             BufferType::IndexBuffer,
@@ -2379,7 +2407,7 @@
         );
         SectionData {
             bindings: Bindings {
-                vertex_buffers: vec![vertex_buffer],
+                vertex_buffers: vec![pos_buffer, color_buffer],
                 index_buffer,
                 images: vec![],
             },
