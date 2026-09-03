@@ -613,9 +613,29 @@ fn copyable_line(ui: &mut egui_macroquad::egui::Ui, text: String, clip: String, 
     ui.horizontal(|ui| {
         ui.label(text);
         if ui.small_button("Copy").on_hover_text(hint).clicked() {
-            ui.ctx().copy_text(clip);
+            set_clipboard(clip);
         }
     });
+}
+
+/// Put `text` on the system clipboard.
+///
+/// Deliberately bypasses egui's `copy_text`, which routes through miniquad.
+/// Miniquad's X11 clipboard answers only `UTF8_STRING` selection requests and
+/// refuses everything else, `TARGETS` included, so a copy reaches only those
+/// apps that happen to ask for `UTF8_STRING` directly. Under Wayland it
+/// reaches nothing at all: we run on XWayland, and the compositor asks the
+/// selection owner for `TARGETS` to learn which MIME types to bridge across.
+///
+/// `arboard` talks the Wayland data-control protocol directly when
+/// `WAYLAND_DISPLAY` is set, and falls back to a complete X11 implementation
+/// otherwise.
+fn set_clipboard(text: String) {
+    // The first call sets up arboard's clipboard serving, which stays alive for
+    // the rest of the process; later calls reuse it.
+    if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+        error!("Could not copy to the clipboard: {e}");
+    }
 }
 
 /// Point Info block, shared by every viewer mode. `title` lets the tile

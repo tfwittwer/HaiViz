@@ -1,6 +1,6 @@
 [package]
 name = "haiviz"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 
 [dependencies]
@@ -11,5 +11,8 @@ las = { version = "0.10", features = ["laz-parallel"] }
 miniquad = "0.4"
 glam = { version="0.27" }
 rfd = "0.15"
+# Used directly for clipboard copies instead of egui/miniquad — see `set_clipboard`.
+# `wayland-data-control` is what makes a copy land on the clipboard under Wayland.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 env_logger = "0.11"
 log = "0.4"
