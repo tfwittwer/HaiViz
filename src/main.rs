@@ -272,9 +272,47 @@ enum AppMode {
     SectionCorridorLoad,
     /// Drawing a lasso in the section view to reclassify the points inside it.
     SectionLasso,
-    /// Drawing a plan-view lasso to reclassify whatever stands above the local
-    /// ground inside it.
+    /// Drawing a plan-view lasso to reclassify what falls inside it. What
+    /// "inside" means is `LassoKind`, kept separate so both flavours share
+    /// one drawing mode.
     GroundLasso,
+}
+
+/// What a plan-view lasso selects once it is closed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LassoKind {
+    /// Fit the local ground and take only what stands above it.
+    AboveGround,
+    /// Take everything in the column, bounded only by the height band.
+    Inside,
+}
+
+/// How far off straight-down the camera may sit and still count as top view.
+///
+/// The footprint is unprojected onto one horizontal plane, so any tilt shears
+/// it in proportion to a point's height above that plane — at one degree a
+/// point 20 m up already lands a third of a metre from where it was clicked.
+/// The snaps (`T`, or the cube's top face) land exactly on zero, so this is a
+/// tolerance for floating point, not an invitation to eyeball it.
+const TOP_VIEW_TOL: f32 = std::f32::consts::PI / 180.0;
+
+/// Shown wherever a plan-view lasso is refused for want of the top view.
+const TOP_VIEW_HINT: &str = "Top view only — press T or click the cube's Top face.";
+
+/// True when the camera is looking straight down, which is the only attitude
+/// the plan-view lassos are meaningful from. Yaw does not matter: the view
+/// direction is vertical whatever it is.
+fn is_top_view(pitch: f32) -> bool {
+    (pitch - view_cube::VIEW_TOP.1).abs() <= TOP_VIEW_TOL
+}
+
+impl LassoKind {
+    fn label(self) -> &'static str {
+        match self {
+            LassoKind::AboveGround => "Above-ground lasso",
+            LassoKind::Inside => "Inside lasso",
+        }
+    }
 }
 
 /*impl AppMode {
@@ -1080,13 +1118,15 @@ fn class_picker(
     ui.add(egui_macroquad::egui::DragValue::new(value).range(0..=255));
 }
 
-/// Controls for the plan-view ground tool, shared by the three 3D panels.
-/// Returns true if the operator asked to start a new footprint.
+/// Controls for the plan-view lasso tools, shared by the three 3D panels.
+/// Returns the flavour of lasso the operator asked to start, if any.
 #[allow(clippy::too_many_arguments)]
 fn ground_tool_controls(
     ui: &mut egui_macroquad::egui::Ui,
     app_mode: &mut AppMode,
     lasso_len: usize,
+    kind: LassoKind,
+    top_view: bool,
     target: &mut u8,
     from: &mut Option<u8>,
     offset: &mut f32,
@@ -1095,11 +1135,12 @@ fn ground_tool_controls(
     status: &Option<String>,
     apply: &mut bool,
     cancel: &mut bool,
-) -> bool {
+) -> Option<LassoKind> {
     use egui_macroquad::egui;
-    let mut start = false;
+    let drawing = *app_mode == AppMode::GroundLasso;
+    let mut start = None;
     ui.separator();
-    ui.label("Classify above ground:");
+    ui.label("Classify in plan view:");
     ui.horizontal(|ui| {
         ui.label("To:");
         class_picker(ui, "ground_to", target, max_class, class_defs);
@@ -1113,13 +1154,22 @@ fn ground_tool_controls(
             class_picker(ui, "ground_from", f, max_class, class_defs);
         }
     });
-    ui.horizontal(|ui| {
-        ui.label("Height above ground:");
-        ui.add(egui::DragValue::new(offset).speed(0.05).range(0.0..=50.0)
-            .max_decimals(2).suffix(" m"));
+    // Only the above-ground tool has a ground to measure from, so the offset
+    // greys out rather than disappearing — the panel keeps its shape when the
+    // operator switches between the two.
+    let offset_live = !drawing || kind == LassoKind::AboveGround;
+    ui.add_enabled_ui(offset_live, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Height above ground:");
+            ui.add(egui::DragValue::new(offset).speed(0.05).range(0.0..=50.0)
+                .max_decimals(2).suffix(" m"));
+        });
     });
-    if *app_mode == AppMode::GroundLasso {
-        ui.label(format!("Click to outline an area ({lasso_len} points so far)"));
+    if drawing {
+        ui.label(format!("{}: click to outline an area ({lasso_len} points so far)", kind.label()));
+        if kind == LassoKind::Inside {
+            ui.label("Everything inside the outline is reclassified, ground included.");
+        }
         ui.horizontal(|ui| {
             if ui.add_enabled(lasso_len >= 3, egui::Button::new("Apply")).clicked() {
                 *apply = true;
@@ -1129,8 +1179,23 @@ fn ground_tool_controls(
             }
         });
         ui.label("Enter applies, Backspace removes a point, Esc cancels.");
-    } else if ui.button("Ground lasso (G)").clicked() {
-        start = true;
+    } else {
+        // Both tools unproject the outline onto a horizontal plane, so they are
+        // offered only from straight above — anywhere else the polygon would
+        // mean something other than what was drawn.
+        ui.add_enabled_ui(top_view, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Above-ground lasso (G)").clicked() {
+                    start = Some(LassoKind::AboveGround);
+                }
+                if ui.button("Inside lasso (V)").clicked() {
+                    start = Some(LassoKind::Inside);
+                }
+            });
+        });
+        if !top_view {
+            ui.label(TOP_VIEW_HINT);
+        }
     }
     if let Some(msg) = status {
         ui.label(msg.as_str());
@@ -1584,6 +1649,8 @@ async fn main() {
     let mut ground_lasso: Vec<glam::Vec2> = Vec::new();
     let mut ground_offset: f32 = 0.20;
     let mut ground_status: Option<String> = None;
+    // Which flavour of plan-view lasso is being drawn.
+    let mut lasso_kind = LassoKind::AboveGround;
     // Classes omitted from an export — the noise-filtering half of the workflow.
     let mut export_filter = crate::classify::ExportFilter::default();
     let mut export_job: Option<crate::export::ExportJob> = None;
@@ -2657,7 +2724,7 @@ async fn main() {
         }
 
         // ---- 3D view modes (shared navigation) ----
-        let mut start_ground_lasso = false;
+        let mut start_ground_lasso: Option<LassoKind> = None;
         let mut apply_ground_lasso = false;
         let mut cancel_ground_lasso = false;
         // `C` mirrors the Cross Section button, including its toggle-to-cancel
@@ -2684,9 +2751,21 @@ async fn main() {
         // ---- Plan-view ground tool ----
         // Handled once here rather than in each render block's click `match`,
         // since it behaves identically in single-file, COPC and tile modes.
-        if is_key_pressed(KeyCode::G) && !egui_wants_keyboard_prev {
+        // `G` fits the ground and takes what stands above it; `V` takes the
+        // whole column. Both toggle off the same way.
+        for (key, kind) in [
+            (KeyCode::G, LassoKind::AboveGround),
+            (KeyCode::V, LassoKind::Inside),
+        ] {
+            if !is_key_pressed(key) || egui_wants_keyboard_prev { continue; }
             match app_mode {
-                AppMode::View3D | AppMode::PointPick => start_ground_lasso = true,
+                AppMode::View3D | AppMode::PointPick => {
+                    if is_top_view(pitch) {
+                        start_ground_lasso = Some(kind);
+                    } else {
+                        ground_status = Some(TOP_VIEW_HINT.to_string());
+                    }
+                }
                 AppMode::GroundLasso => {
                     ground_lasso.clear();
                     app_mode = AppMode::View3D;
@@ -2984,12 +3063,13 @@ async fn main() {
                                 ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
                             }
                         });
-                        if ground_tool_controls(
-                            ui, &mut app_mode, ground_lasso.len(),
+                        if let Some(kind) = ground_tool_controls(
+                            ui, &mut app_mode, ground_lasso.len(), lasso_kind,
+                            is_top_view(pitch),
                             &mut classify_target, &mut classify_from, &mut ground_offset,
                             max_class, &class_defs, &ground_status,
                             &mut apply_ground_lasso, &mut cancel_ground_lasso,
-                        ) { start_ground_lasso = true; }
+                        ) { start_ground_lasso = Some(kind); }
                         if color_mode == ColorMode::Rgb {
                             for (i, ov) in new_overrides.iter_mut().enumerate() {
                                 let label = if stages.len() > 1 {
@@ -3414,12 +3494,13 @@ async fn main() {
                                 ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
                             }
                         });
-                        if ground_tool_controls(
-                            ui, &mut app_mode, ground_lasso.len(),
+                        if let Some(kind) = ground_tool_controls(
+                            ui, &mut app_mode, ground_lasso.len(), lasso_kind,
+                            is_top_view(pitch),
                             &mut classify_target, &mut classify_from, &mut ground_offset,
                             max_class, &class_defs, &ground_status,
                             &mut apply_ground_lasso, &mut cancel_ground_lasso,
-                        ) { start_ground_lasso = true; }
+                        ) { start_ground_lasso = Some(kind); }
                         if color_mode == ColorMode::Rgb {
                             for (i, ov) in new_copc_overrides.iter_mut().enumerate() {
                                 let label = if copc_stages.len() > 1 {
@@ -3905,12 +3986,13 @@ async fn main() {
                                 ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
                             }
                         });
-                        if ground_tool_controls(
-                            ui, &mut app_mode, ground_lasso.len(),
+                        if let Some(kind) = ground_tool_controls(
+                            ui, &mut app_mode, ground_lasso.len(), lasso_kind,
+                            is_top_view(pitch),
                             &mut classify_target, &mut classify_from, &mut ground_offset,
                             max_class, &class_defs, &ground_status,
                             &mut apply_ground_lasso, &mut cancel_ground_lasso,
-                        ) { start_ground_lasso = true; }
+                        ) { start_ground_lasso = Some(kind); }
                         ui.label(format!(
                             "{}/{} points | {} chunks | {}/{} tiles | FPS: {:.0}",
                             drawn, total, mgr.total_chunks(),
@@ -4197,19 +4279,12 @@ async fn main() {
         }
 
         // ---- Plan-view ground tool: start / cancel / apply ----
-        if start_ground_lasso {
+        if let Some(kind) = start_ground_lasso {
             ground_lasso.clear();
             ground_status = None;
-            // Snap to top-down. The footprint is unprojected onto a horizontal
-            // plane, so it only equals what was drawn when looking straight
-            // down; from an oblique view the polygon would come out sheared.
-            // Reposition the camera the same way a view-cube click does, so
-            // the pivot stays framed rather than the view swinging off it.
-            let old_front = front;
-            (yaw, pitch) = view_cube::VIEW_TOP;
-            front = vec3(yaw.cos() * pitch.cos(), yaw.sin() * pitch.cos(), pitch.sin()).normalize();
-            (right, up) = recompute_right_up(yaw, pitch, front);
-            position = orbit_pivot + front * (position - orbit_pivot).dot(old_front);
+            lasso_kind = kind;
+            // The camera is left exactly where it is: the tools are only
+            // offered from the top view, so there is nothing to correct for.
             app_mode = AppMode::GroundLasso;
         }
         if cancel_ground_lasso {
@@ -4243,86 +4318,117 @@ async fn main() {
                 by0 = by0.min(y); by1 = by1.max(y);
             }
 
-            let mut samples: Vec<(f64, f64, f64)> = Vec::new();
-            for st in &stages { st.collect_points_in_bbox((bx0, by0), (bx1, by1), z_lo, z_hi, &mut samples); }
-            for cs in &copc_stages { cs.collect_points_in_bbox((bx0, by0), (bx1, by1), z_lo, z_hi, &mut samples); }
-            if let Some(mgr) = tile_mgr.as_ref() { mgr.collect_points_in_bbox((bx0, by0), (bx1, by1), z_lo, z_hi, &mut samples); }
+            // The inside lasso is a plain prism: no samples to gather and no
+            // plane to fit, so it cannot fail the way the ground tool can.
+            let region = match lasso_kind {
+                LassoKind::Inside => Some((
+                    crate::classify::ClassRegion::Volume {
+                        polygon: polygon.clone(),
+                        z_min: z_lo,
+                        z_max: z_hi,
+                    },
+                    None,
+                )),
+                LassoKind::AboveGround => {
+                    let mut samples: Vec<(f64, f64, f64)> = Vec::new();
+                    for st in &stages { st.collect_points_in_bbox((bx0, by0), (bx1, by1), z_lo, z_hi, &mut samples); }
+                    for cs in &copc_stages { cs.collect_points_in_bbox((bx0, by0), (bx1, by1), z_lo, z_hi, &mut samples); }
+                    if let Some(mgr) = tile_mgr.as_ref() { mgr.collect_points_in_bbox((bx0, by0), (bx1, by1), z_lo, z_hi, &mut samples); }
 
-            match crate::classify::fit_ground_plane(&samples, &polygon, z_lo, z_hi) {
-                None => {
-                    ground_status = Some(format!(
-                        "Not enough ground in view to fit a plane ({} points found). \
-                         Zoom in so more detail is loaded, or outline a larger area.",
-                        samples.len(),
-                    ));
+                    match crate::classify::fit_ground_plane(&samples, &polygon, z_lo, z_hi) {
+                        None => {
+                            ground_status = Some(format!(
+                                "Not enough ground in view to fit a plane ({} points found). \
+                                 Zoom in so more detail is loaded, or outline a larger area.",
+                                samples.len(),
+                            ));
+                            None
+                        }
+                        Some(fit) => Some((
+                            crate::classify::ClassRegion::AboveGround {
+                                polygon: polygon.clone(),
+                                origin: fit.origin,
+                                plane: fit.plane,
+                                offset: ground_offset as f64,
+                                z_min: z_lo,
+                                z_max: z_hi,
+                            },
+                            Some(fit),
+                        )),
+                    }
                 }
-                Some(fit) => {
-                    let op = crate::classify::ClassOp::new(
-                        0,
-                        crate::classify::ClassRegion::AboveGround {
-                            polygon: polygon.clone(),
-                            origin: fit.origin,
-                            plane: fit.plane,
-                            offset: ground_offset as f64,
-                            z_min: z_lo,
-                            z_max: z_hi,
-                        },
-                        classify_target,
-                        classify_from,
-                    );
+            };
 
-                    let mut changed = 0usize;
-                    let mut touched = 0usize;
-                    {
-                        let mut gl = unsafe { get_internal_gl() };
-                        gl.flush();
-                        for st in stages.iter_mut() {
-                            if !op.intersects_aabb(&st.cloud.min, &st.cloud.max) { continue; }
-                            let from = st.edits.ops.len();
-                            st.edits.push(op.clone());
-                            changed += st.apply_edits(&mut *gl.quad_context, color_mode, from);
-                            touched += 1;
-                        }
-                        for cs in copc_stages.iter_mut() {
-                            if !op.intersects_aabb(&cs.global_min, &cs.global_max) { continue; }
-                            let from = cs.edits.ops.len();
-                            cs.edits.push(op.clone());
-                            changed += cs.apply_edits_to_loaded(&mut *gl.quad_context, color_mode, from);
-                            touched += 1;
-                        }
-                    }
+            if let Some((region, fit)) = region {
+                let op = crate::classify::ClassOp::new(
+                    0,
+                    region,
+                    classify_target,
+                    classify_from,
+                );
 
-                    let mut save_err = None;
-                    for st in stages.iter_mut().filter(|s| s.edits.dirty) {
-                        let path = st.filepath.clone();
-                        if let Err(e) = st.edits.save(&path) { save_err = Some(e.to_string()); }
+                let mut changed = 0usize;
+                let mut touched = 0usize;
+                {
+                    let mut gl = unsafe { get_internal_gl() };
+                    gl.flush();
+                    for st in stages.iter_mut() {
+                        if !op.intersects_aabb(&st.cloud.min, &st.cloud.max) { continue; }
+                        let from = st.edits.ops.len();
+                        st.edits.push(op.clone());
+                        changed += st.apply_edits(&mut *gl.quad_context, color_mode, from);
+                        touched += 1;
                     }
-                    for cs in copc_stages.iter_mut().filter(|c| c.edits.dirty) {
-                        let path = cs.filepath.clone();
-                        if let Err(e) = cs.edits.save(&path) { save_err = Some(e.to_string()); }
+                    for cs in copc_stages.iter_mut() {
+                        if !op.intersects_aabb(&cs.global_min, &cs.global_max) { continue; }
+                        let from = cs.edits.ops.len();
+                        cs.edits.push(op.clone());
+                        changed += cs.apply_edits_to_loaded(&mut *gl.quad_context, color_mode, from);
+                        touched += 1;
                     }
+                }
 
-                    let centre = (
-                        (bx0 + bx1) * 0.5,
-                        (by0 + by1) * 0.5,
-                    );
-                    info!(
-                        "Ground fit: {} cells from {} points, {:.2}m at footprint centre, \
-                         slope {:.2}°, rms {:.3}m; {} points reclassified",
-                        fit.cells_used, fit.points_considered,
-                        fit.height_at(centre.0, centre.1), fit.slope_degrees(), fit.rms, changed,
-                    );
-                    ground_status = Some(match (save_err, touched) {
-                        (Some(e), _) => format!("{changed} points reclassified — SAVE FAILED: {e}"),
-                        (None, 0) => "Footprint did not overlap any loaded file".to_string(),
-                        (None, _) => format!(
+                let mut save_err = None;
+                for st in stages.iter_mut().filter(|s| s.edits.dirty) {
+                    let path = st.filepath.clone();
+                    if let Err(e) = st.edits.save(&path) { save_err = Some(e.to_string()); }
+                }
+                for cs in copc_stages.iter_mut().filter(|c| c.edits.dirty) {
+                    let path = cs.filepath.clone();
+                    if let Err(e) = cs.edits.save(&path) { save_err = Some(e.to_string()); }
+                }
+
+                match &fit {
+                    Some(fit) => {
+                        let centre = (
+                            (bx0 + bx1) * 0.5,
+                            (by0 + by1) * 0.5,
+                        );
+                        info!(
+                            "Ground fit: {} cells from {} points, {:.2}m at footprint centre, \
+                             slope {:.2}°, rms {:.3}m; {} points reclassified",
+                            fit.cells_used, fit.points_considered,
+                            fit.height_at(centre.0, centre.1), fit.slope_degrees(), fit.rms, changed,
+                        );
+                    }
+                    None => info!(
+                        "Inside lasso: {:.2}m band, {} points reclassified",
+                        z_hi - z_lo, changed,
+                    ),
+                }
+                ground_status = Some(match (save_err, touched) {
+                    (Some(e), _) => format!("{changed} points reclassified — SAVE FAILED: {e}"),
+                    (None, 0) => "Footprint did not overlap any loaded file".to_string(),
+                    (None, _) => match &fit {
+                        Some(fit) => format!(
                             "{changed} points → class {classify_target}  (ground rms {:.2} m, slope {:.1}°)",
                             fit.rms, fit.slope_degrees(),
                         ),
-                    });
-                    ground_lasso.clear();
-                    app_mode = AppMode::View3D;
-                }
+                        None => format!("{changed} points → class {classify_target}"),
+                    },
+                });
+                ground_lasso.clear();
+                app_mode = AppMode::View3D;
             }
         }
 

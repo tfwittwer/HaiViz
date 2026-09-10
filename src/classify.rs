@@ -82,6 +82,20 @@ pub enum ClassRegion {
         z_min: f64,
         z_max: f64,
     },
+    /// Everything inside a plan-view footprint, between two absolute heights.
+    ///
+    /// The ground-free counterpart to `AboveGround`: nothing is fitted and
+    /// nothing is excluded from below, so the height band is the only vertical
+    /// limit. Use it where the ground is not a meaningful reference — indoors,
+    /// on a bridge deck, or wherever the thing to be reclassified sits on top
+    /// of something that must not be swept up with it.
+    Volume {
+        /// Lasso footprint in absolute world XY.
+        polygon: Vec<(f64, f64)>,
+        /// Height band in force when the op was made, in absolute Z.
+        z_min: f64,
+        z_max: f64,
+    },
 }
 
 /// One manual classification operation.
@@ -169,7 +183,8 @@ impl ClassOp {
                 self.bbox_min = [xmin, ymin, z0];
                 self.bbox_max = [xmax, ymax, z1];
             }
-            ClassRegion::AboveGround { polygon, z_min, z_max, .. } => {
+            ClassRegion::AboveGround { polygon, z_min, z_max, .. }
+            | ClassRegion::Volume { polygon, z_min, z_max } => {
                 if polygon.is_empty() { return; }
                 let (mut xmin, mut ymin) = (f64::MAX, f64::MAX);
                 let (mut xmax, mut ymax) = (f64::MIN, f64::MIN);
@@ -205,6 +220,10 @@ impl ClassOp {
                 if z < *z_min || z > *z_max { return false; }
                 let ground = plane.0 * (x - origin.0) + plane.1 * (y - origin.1) + plane.2;
                 if z < ground + *offset { return false; }
+                point_in_polygon(polygon, x, y)
+            }
+            ClassRegion::Volume { polygon, z_min, z_max } => {
+                if z < *z_min || z > *z_max { return false; }
                 point_in_polygon(polygon, x, y)
             }
         }
@@ -357,6 +376,7 @@ impl ClassEdits {
         out.push_str(&format!("# source: {}\n", source));
         out.push_str("# op;seq;from(*=any);target;sx;sy;ex;ey;depth;along,z;...\n");
         out.push_str("# gop;seq;from(*=any);target;zmin;zmax;ox;oy;a;b;c;offset;x,y;...\n");
+        out.push_str("# vop;seq;from(*=any);target;zmin;zmax;x,y;...\n");
         for op in &self.ops {
             out.push_str(&format_op(op));
             out.push('\n');
@@ -391,6 +411,16 @@ fn format_op(op: &ClassOp) -> String {
                 op.seq, from, op.target_class,
                 z_min, z_max, origin.0, origin.1,
                 plane.0, plane.1, plane.2, offset,
+            );
+            for (x, y) in polygon {
+                s.push_str(&format!(";{x},{y}"));
+            }
+            s
+        }
+        ClassRegion::Volume { polygon, z_min, z_max } => {
+            let mut s = format!(
+                "vop;{};{};{};{};{}",
+                op.seq, from, op.target_class, z_min, z_max,
             );
             for (x, y) in polygon {
                 s.push_str(&format!(";{x},{y}"));
@@ -440,6 +470,14 @@ fn parse_op(line: &str) -> Option<ClassOp> {
                 plane: (f(8)?, f(9)?, f(10)?),
                 offset: f(11)?,
                 polygon: read_polygon(12)?,
+            }
+        }
+        "vop" => {
+            if parts.len() < 9 { return None; }
+            ClassRegion::Volume {
+                z_min: f(4)?,
+                z_max: f(5)?,
+                polygon: read_polygon(6)?,
             }
         }
         _ => return None,
@@ -978,6 +1016,63 @@ mod tests {
         }
         // And it still selects the same points either side of the round trip.
         for probe in [(20.0, 30.0, 6.0), (20.0, 30.0, 12.0), (0.0, 0.0, 12.0)] {
+            assert_eq!(
+                op.contains(probe.0, probe.1, probe.2),
+                parsed.contains(probe.0, probe.1, probe.2),
+            );
+        }
+    }
+
+    #[test]
+    fn volume_op_selects_everything_inside_the_footprint() {
+        let op = ClassOp::new(
+            0,
+            ClassRegion::Volume {
+                polygon: square(20.0),
+                z_min: 5.0,
+                z_max: 30.0,
+            },
+            7,
+            None,
+        );
+        // Inside the footprint and inside the band: selected, at any height —
+        // this is the whole difference from `AboveGround`, which would leave
+        // whatever the ground plane sits under untouched.
+        assert!(op.contains(0.0, 0.0, 5.0));
+        assert!(op.contains(0.0, 0.0, 17.0));
+        assert!(op.contains(-18.0, 12.0, 30.0));
+        // Outside the band: untouched.
+        assert!(!op.contains(0.0, 0.0, 4.9));
+        assert!(!op.contains(0.0, 0.0, 30.1));
+        // Outside the footprint: untouched.
+        assert!(!op.contains(60.0, 0.0, 17.0));
+    }
+
+    #[test]
+    fn volume_op_survives_the_sidecar() {
+        let op = ClassOp::new(
+            0,
+            ClassRegion::Volume {
+                polygon: vec![(10.0, 20.0), (30.0, 20.0), (30.0, 40.0), (10.0, 40.0)],
+                z_min: 1.0,
+                z_max: 40.0,
+            },
+            18,
+            Some(1),
+        );
+        let line = format_op(&op);
+        assert!(line.starts_with("vop;"));
+        let parsed = parse_op(&line).expect("parses");
+        assert_eq!(parsed.target_class, 18);
+        assert_eq!(parsed.from_class, Some(1));
+        match parsed.region {
+            ClassRegion::Volume { z_min, z_max, ref polygon } => {
+                assert_eq!((z_min, z_max), (1.0, 40.0));
+                assert_eq!(polygon.len(), 4);
+            }
+            _ => panic!("wrong region kind"),
+        }
+        for probe in [(20.0, 30.0, 6.0), (20.0, 30.0, 0.0), (0.0, 0.0, 6.0)] {
             assert_eq!(
                 op.contains(probe.0, probe.1, probe.2),
                 parsed.contains(probe.0, probe.1, probe.2),
