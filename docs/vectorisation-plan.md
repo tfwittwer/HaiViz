@@ -1,6 +1,6 @@
 # Manual vectorisation in HaiViz — implementation plan
 
-Status: **phases 0, 1, 2a and 2b implemented; 3–6 are still plan only.**
+Status: **phases 0–3 implemented; 4–6 are still plan only.**
 Written 2026-09-10.
 
 Paths below are relative to the workspace root (`haicloudrs/`).
@@ -509,6 +509,34 @@ committed edit (vertex moved or deleted, line deleted), and on exit.
 
 Consequences:
 
+### Status: built (3)
+
+`haiviz/src/vectorise.rs` plus the mode wiring in `main.rs`: `AppMode::Digitise`,
+`P` beside the `G`/`V` lasso keys, click/Backspace/Enter/Esc in the shared input
+block, one `vectorise::controls` panel called from all three per-mode blocks,
+and the overlay drawn through `draw_3d_overlays`.
+
+A vertex resolves through `pick_world_point`, a new shared screen-space pick
+across all three backends — the same rule Measure and Point Info use, so a
+vertex lands where a pick would. Shift-click places freely on a horizontal
+plane through the previous vertex. Phase 4 replaces `pick_world_point` with the
+ray and percentile snapping from phase 0 without touching anything else here.
+
+The panel returns a `Request` rather than taking `AppMode`, so `vectorise.rs`
+never learns about the mode enum; `main.rs` acts on it in one place, next to the
+`start_ground_lasso` handler.
+
+**A phase-0 bug surfaced while testing this.** `cell = sqrt(area · occupancy /
+n)` is self-scaling — the cell count comes out as `n / occupancy` whatever the
+footprint — but the `MAX_CELL` clamp broke that in the expensive direction: a
+cell forced *smaller* than the formula asked for means *more* cells than there
+are points. A COPC root node is a thinned sample of the whole file, so 50 k
+points over a 30 km extent asked for a 130 m cell, got clamped to 5 m, and
+allocated 36 M cells — **720 MB** — on the loader thread while the camera
+moves. `MAX_CELLS_PER_POINT` is now a floor on the cell size that overrides
+`MAX_CELL`, taking that case to 4 MB, and it is enforced in `build_with_cell`
+too so an explicit cell size cannot bypass it.
+
 - A crash loses at most the line currently being drawn. That is an acceptable
   loss and much simpler than journalling in-progress geometry.
 - Whole-file rewrite cost is negligible at realistic sizes — a GeoPackage of
@@ -605,7 +633,7 @@ what the tracer sees, tuning channel weights is guesswork.
 | **1** | B — class visibility: state, shader cull, all filter sites, `ClassOp` mask, Classes window UI | ~500 | **yes, standalone — done** |
 | **2a** | C — polyline model: f64, layers, mutability, undo, Salome writer | ~250 | marginally — **done** |
 | **2b** | C — GeoPackage read + write, EPSG detection, differential tests | ~1400 | **yes — overlay any GPKG — done** |
-| **3** | D — digitising mode, free vertex placement, panel wiring | ~450 | yes |
+| **3** | D — digitising mode, free vertex placement, panel wiring | ~450 | yes — **done** |
 | **4** | E — snapping, radius control, feedback, COPC guard + pinning | ~450 | yes, the core tool |
 | **5** | F — edge following, cost channels, livewire, heatmap | ~600 | yes |
 | **6** | G — vertex editing, section-view digitising, re-drape | ~400 | yes |

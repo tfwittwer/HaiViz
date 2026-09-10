@@ -105,6 +105,7 @@ The 3D view uses an orthographic camera shared across all modes:
 | `Tab` | Toggle mouse-look (cursor grab) |
 | `C` | Start a cross section (press again to cancel) |
 | `G` | Start the ground lasso (press again to cancel) |
+| `P` | Start digitising a polyline (press again to cancel) |
 | `T` `F` `B` `L` `R` | Snap to top / front / back / left / right view |
 | `Esc` | Cancel the current pick / measure / section action |
 | **Zoom All** button | Frame all loaded data |
@@ -256,6 +257,44 @@ length_3d, created`.
 outside the main file, so reading it alone would quietly give you the state
 before whatever the other program last wrote. Close the file there, or run
 `sqlite3 <file> "PRAGMA wal_checkpoint(TRUNCATE);"` first.
+
+## Vectorisation
+
+Press `P` or use **Digitise** in the classification panel to draw polylines
+straight onto the cloud. Click to place a vertex, and it lands on the point
+under the cursor — not on a guessed plane, so the elevation is measured rather
+than invented. Shift-click places one freely instead, at the previous vertex's
+height, which is what lets you draw across a gap in the data.
+
+`Backspace` removes the last vertex, `Enter` finishes the line, `Esc` discards
+it and a second `Esc` leaves digitising. The panel shows the running vertex
+count, total length, and the last segment's length, ΔZ and slope.
+
+**Digitising works from any camera angle**, unlike the plan-view lassos, which
+insist on a top view. That is not an oversight: a lasso drawn obliquely is
+ambiguous because a screen polygon says nothing about depth, whereas a digitised
+vertex comes from a real point and means the same thing from anywhere.
+
+### Where lines go
+
+New lines land in a layer beside the cloud, `<cloud>.haiviz-vectors.gpkg` —
+the same convention the classification sidecar uses. There is no file dialog
+when the layer is created, because layers **auto-save** and a layer without a
+destination is not a state that can exist. Use **Into:** in the panel to send
+lines to any other loaded layer instead, including one opened from QGIS.
+
+Saving happens when a line is finished, not on every vertex — the same
+granularity the classification sidecar uses, and for the same reason: a
+half-drawn line is not a meaningful thing to persist. **A crash loses at most
+the line you are drawing.**
+
+If the target file changed on disk since it was loaded, the line is kept in
+memory and not written, and the panel says so. Use **Save As…** in the
+Polylines window to keep it somewhere else.
+
+`{n}` in the **Name** field becomes the line's number within its layer, so a run
+of lines does not need renaming one at a time. **Code** is written to the
+`code` attribute.
 
 ## GCP Overlay
 
@@ -442,8 +481,19 @@ If no `classes.txt` is present, built-in default labels and colours are used.
 | `Tab` | Toggle mouse-look (cursor grab) |
 | `C` | Start / cancel a cross section |
 | `G` | Start / cancel the ground lasso |
+| `P` | Start / cancel digitising |
 | `T` `F` `B` `L` `R` | Top / front / back / left / right view |
 | `Esc` | Cancel current pick / measure / section action |
+
+**Digitising a polyline** (`P`, or the **Digitise** button)
+
+| Input | Action |
+|-------|--------|
+| Left-click | Place a vertex on the point under the cursor |
+| Shift + left-click | Place a vertex freely, at the previous vertex's height |
+| `Backspace` | Remove the last vertex |
+| `Enter` | Finish the line and save |
+| `Esc` | Discard the line; again to leave digitising |
 
 **Building a cross section** (start from the **Cross Section** button)
 

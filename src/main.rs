@@ -24,6 +24,7 @@ mod raw_miniquad;
 mod spatial;
 mod polylines;
 mod gpkg;
+mod vectorise;
 mod gcp;
 mod classify;
 mod export;
@@ -279,6 +280,14 @@ enum AppMode {
     /// "inside" means is `LassoKind`, kept separate so both flavours share
     /// one drawing mode.
     GroundLasso,
+    /// Drawing a polyline onto the cloud, vertex by vertex.
+    ///
+    /// Unlike the lassos this works from any camera angle — an explicit
+    /// exception to the `TOP_VIEW_HINT` rule. A lasso in an oblique view is
+    /// ambiguous because a screen polygon says nothing about depth; a
+    /// digitised vertex comes from a real point and is unambiguous from
+    /// anywhere.
+    Digitise,
 }
 
 /// What a plan-view lasso selects once it is closed.
@@ -352,6 +361,77 @@ fn screen_to_world_xy(sx: f32, sy: f32, view_proj: &glam::Mat4, z_plane: f32) ->
     }
     let t = (z_plane - near.z) / dir.z;
     Some((near.x + dir.x * t, near.y + dir.y * t))
+}
+
+/// The file a new vector layer should sit beside.
+///
+/// The first loaded source wins. Digitising onto several clouds at once is
+/// possible, but the layer has to land somewhere, and "beside the first one"
+/// is at least predictable.
+fn cloud_source_path(
+    stages: &[Stage],
+    copc_stages: &[CopcStage],
+    tile_mgr: &Option<TileStageManager>,
+) -> Option<String> {
+    if let Some(s) = stages.first() { return Some(s.filepath.clone()); }
+    if let Some(c) = copc_stages.first() { return Some(c.filepath.clone()); }
+    // Tile mode has a directory rather than a file; the sidecar goes inside it.
+    tile_mgr.as_ref()
+        .and_then(|m| m.tiles.first())
+        .and_then(|t| Path::new(&t.filepath).parent().map(|p| p.join("tiles").to_string_lossy().into_owned()))
+}
+
+/// The world-space point nearest the cursor in screen space, across whichever
+/// backends are loaded.
+///
+/// Screen-space nearest is the rule Measure and Point Info already use, so a
+/// digitised vertex lands where the operator would expect a pick to. The three
+/// backends return different things, so each one's own answer is re-projected
+/// here to compare them on the same footing — a single-file stage and a COPC
+/// stage can both be loaded at once.
+fn pick_world_point(
+    stages: &[Stage],
+    copc_stages: &[CopcStage],
+    tile_mgr: &Option<TileStageManager>,
+    view_proj: &glam::Mat4,
+    mx: f32,
+    my: f32,
+) -> Option<[f64; 3]> {
+    let (sw, sh) = (screen_width(), screen_height());
+    let ndc_x = mx / sw * 2.0 - 1.0;
+    let ndc_y = 1.0 - my / sh * 2.0;
+    let ndc_dist = |v: glam::Vec3| {
+        let p = *view_proj * glam::Vec4::new(v.x, v.y, v.z, 1.0);
+        let (px, py) = (p.x / p.w, p.y / p.w);
+        (px - ndc_x) * (px - ndc_x) + (py - ndc_y) * (py - ndc_y)
+    };
+
+    let mut best: Option<(f32, [f64; 3])> = None;
+    let mut consider = |d: f32, w: [f64; 3]| {
+        if best.as_ref().is_none_or(|(bd, _)| d < *bd) { best = Some((d, w)); }
+    };
+
+    for s in stages {
+        if !s.visible { continue; }
+        if let Some(i) = s.find_nearest_point(view_proj, mx, my, sw, sh) {
+            let p = &s.cloud.points[i];
+            consider(ndc_dist(glam::Vec3::from(s.positions[i])), [p.x, p.y, p.z]);
+        }
+    }
+    for cs in copc_stages {
+        if !cs.visible { continue; }
+        if let Some((p, vpos, dist)) = cs.find_nearest_point(view_proj, mx, my, sw, sh) {
+            consider(dist, [p.x, p.y, p.z]);
+            let _ = vpos;
+        }
+    }
+    if let Some(mgr) = tile_mgr
+        && let Some((ti, i)) = mgr.find_nearest_point(view_proj, mx, my, sw, sh)
+        && let Some(lt) = mgr.loaded[ti].as_ref() {
+        let p = &lt.cloud.points[i];
+        consider(ndc_dist(glam::Vec3::from(lt.positions[i])), [p.x, p.y, p.z]);
+    }
+    best.map(|(_, w)| w)
 }
 
 /// Project a world position to screen coordinates.
@@ -475,7 +555,14 @@ fn draw_3d_overlays(
     ortho_scale: f32,
     ground_lasso: &[glam::Vec2],
     ground_color: Color,
+    digitise: &vectorise::Digitise,
+    // Viewer origin, to project the digitised vertices — which are stored in
+    // world coordinates — into the space everything else here is drawn in.
+    data_offset: [f64; 3],
+    // World-space point the next vertex would land on, for the rubber band.
+    digitise_cursor: Option<[f64; 3]>,
 ) {
+    vectorise::draw_3d(digitise, data_offset, digitise_cursor, app_mode == AppMode::Digitise);
     if !ground_lasso.is_empty() {
         let pts: Vec<Vec3> = ground_lasso.iter().map(|v| vec3(v.x, v.y, mid_z)).collect();
         for w in pts.windows(2) {
@@ -1956,6 +2043,10 @@ async fn main() {
     let mut poly_files: Vec<polylines::PolylineFile> = Vec::new();
     let mut selected_poly: Option<polylines::PolyRef> = None;
     let mut poly_save_status: Option<String> = None;
+    let mut digitise = vectorise::Digitise::default();
+    // Set by the panel or by `P`, acted on once below rather than in each of
+    // the three per-mode blocks.
+    let mut digitise_request: Option<vectorise::Request> = None;
     let mut pending_salome: Option<(usize, String, Vec<String>)> = None;
     let mut poly_load_error: Option<String> = None;
 
@@ -2199,6 +2290,11 @@ async fn main() {
                 } else {
                     ground_lasso.clear();
                 }
+            } else if app_mode == AppMode::Digitise {
+                // Esc drops the line in progress; a second Esc leaves the mode.
+                // Same shape as the lasso, so the two do not need learning
+                // separately.
+                if digitise.is_drawing() { digitise.clear(); } else { app_mode = AppMode::View3D; }
             } else if app_mode == AppMode::SectionLasso {
                 if lasso.is_empty() {
                     app_mode = AppMode::SectionView;
@@ -3066,6 +3162,17 @@ async fn main() {
                 _ => {}
             }
         }
+        // ---- Digitising ----
+        // `P` starts and cancels, mirroring how `G` and `V` toggle the lassos.
+        // Unlike them it does not require a top view: see `AppMode::Digitise`.
+        if is_key_pressed(KeyCode::P) && !egui_wants_keyboard_prev {
+            match app_mode {
+                AppMode::View3D | AppMode::PointPick => digitise_request = Some(vectorise::Request::Start),
+                AppMode::Digitise => digitise_request = Some(vectorise::Request::Cancel),
+                _ => {}
+            }
+        }
+
         if is_key_pressed(KeyCode::Tab) {
             grabbed = !grabbed;
             set_cursor_grab(grabbed);
@@ -3122,7 +3229,7 @@ async fn main() {
         
         let mode_uses_click = matches!(app_mode,
             AppMode::SectionPickStart | AppMode::SectionPickEnd |
-            AppMode::SectionAdjustDepth | AppMode::GroundLasso |
+            AppMode::SectionAdjustDepth | AppMode::GroundLasso | AppMode::Digitise |
             AppMode::PointPick | AppMode::MeasureFirst | AppMode::MeasureSecond
         );
         pivot_locked = false;
@@ -3195,6 +3302,55 @@ async fn main() {
             }
         }
 
+        // Digitising input, handled once here rather than in each render
+        // block's click match, exactly as the plan-view lasso above is.
+        if app_mode == AppMode::Digitise {
+            if !egui_wants_pointer_prev && is_mouse_button_pressed(MouseButton::Left) {
+                let free = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+                let placed = if free {
+                    // Free placement: the cursor ray meets a horizontal plane
+                    // through the previous vertex. The only well-defined answer
+                    // when the operator has said they do not want the data to
+                    // decide — and it is what makes drawing across a gap in the
+                    // cloud possible at all.
+                    let z_view = digitise.last()
+                        .map(|p| (p[2] - data_offset[2]) as f32)
+                        .unwrap_or(mid_z);
+                    screen_to_world_xy(mx, my, &view_proj, z_view).map(|(wx, wy)| [
+                        wx as f64 + data_offset[0],
+                        wy as f64 + data_offset[1],
+                        z_view as f64 + data_offset[2],
+                    ])
+                } else {
+                    pick_world_point(&stages, &copc_stages, &tile_mgr, &view_proj, mx, my)
+                };
+                match placed {
+                    Some(v) => { digitise.push(v); digitise.status = None; }
+                    None => digitise.status = Some(
+                        "Nothing under the cursor to place a vertex on. \
+                         Shift-click to place one freely.".to_string(),
+                    ),
+                }
+            }
+            if !egui_wants_keyboard_prev {
+                if is_key_pressed(KeyCode::Backspace) { digitise.pop(); }
+                if is_key_pressed(KeyCode::Enter) {
+                    digitise_request = Some(vectorise::Request::Finish);
+                }
+            }
+        }
+
+        // Where the next vertex would land. Resolved once per frame rather
+        // than per render block, and only while digitising — it is a pick over
+        // the resident points, not something to spend on every frame of
+        // ordinary navigation.
+        let have_cloud = !stages.is_empty() || !copc_stages.is_empty() || tile_mgr.is_some();
+        let digitise_cursor = if app_mode == AppMode::Digitise && digitise.is_drawing() {
+            pick_world_point(&stages, &copc_stages, &tile_mgr, &view_proj, mx, my)
+        } else {
+            None
+        };
+
         // Measure markers and the section preview are drawn per-render-block,
         // after the cloud has been composited. See `draw_3d_overlays`.
 
@@ -3229,6 +3385,7 @@ async fn main() {
                 app_mode, measure_a, measure_b, section_start, section_end,
                 cursor_world, section_depth, mid_z, height_range, ortho_scale,
                 &ground_lasso, class_color_mq(classify_target, &class_defs),
+                &digitise, data_offset, digitise_cursor,
             );
 
             set_default_camera();
@@ -3268,7 +3425,8 @@ async fn main() {
                     .show(egui_ctx, |ui| {
                         let section_label = match app_mode {
                             AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
-                                | AppMode::MeasureSecond | AppMode::GroundLasso => "Cross Section",
+                                | AppMode::MeasureSecond | AppMode::GroundLasso
+                                | AppMode::Digitise => "Cross Section",
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
@@ -3363,6 +3521,10 @@ async fn main() {
                             max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                             &mut apply_ground_lasso, &mut cancel_ground_lasso,
                         ) { start_ground_lasso = Some(kind); }
+                        if let Some(r) = vectorise::controls(
+                            ui, &mut digitise, &poly_files,
+                            app_mode == AppMode::Digitise, have_cloud,
+                        ) { digitise_request = Some(r); }
                         if color_mode == ColorMode::Rgb {
                             for (i, ov) in new_overrides.iter_mut().enumerate() {
                                 let label = if stages.len() > 1 {
@@ -3671,6 +3833,7 @@ async fn main() {
                 app_mode, measure_a, measure_b, section_start, section_end,
                 cursor_world, section_depth, mid_z, height_range, ortho_scale,
                 &ground_lasso, class_color_mq(classify_target, &class_defs),
+                &digitise, data_offset, digitise_cursor,
             );
 
             set_default_camera();
@@ -3706,7 +3869,8 @@ async fn main() {
                     .show(egui_ctx, |ui| {
                         let section_label = match app_mode {
                             AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
-                                | AppMode::MeasureSecond | AppMode::GroundLasso => "Cross Section",
+                                | AppMode::MeasureSecond | AppMode::GroundLasso
+                                | AppMode::Digitise => "Cross Section",
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
@@ -3795,6 +3959,10 @@ async fn main() {
                             max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                             &mut apply_ground_lasso, &mut cancel_ground_lasso,
                         ) { start_ground_lasso = Some(kind); }
+                        if let Some(r) = vectorise::controls(
+                            ui, &mut digitise, &poly_files,
+                            app_mode == AppMode::Digitise, have_cloud,
+                        ) { digitise_request = Some(r); }
                         if color_mode == ColorMode::Rgb {
                             for (i, ov) in new_copc_overrides.iter_mut().enumerate() {
                                 let label = if copc_stages.len() > 1 {
@@ -4135,6 +4303,7 @@ async fn main() {
                 app_mode, measure_a, measure_b, section_start, section_end,
                 cursor_world, section_depth, mid_z, height_range, ortho_scale,
                 &ground_lasso, class_color_mq(classify_target, &class_defs),
+                &digitise, data_offset, digitise_cursor,
             );
 
             set_default_camera();
@@ -4188,7 +4357,8 @@ async fn main() {
                         // Cross Section button
                         let section_label = match app_mode {
                             AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
-                                | AppMode::MeasureSecond | AppMode::GroundLasso => "Cross Section",
+                                | AppMode::MeasureSecond | AppMode::GroundLasso
+                                | AppMode::Digitise => "Cross Section",
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
@@ -4288,6 +4458,10 @@ async fn main() {
                             max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                             &mut apply_ground_lasso, &mut cancel_ground_lasso,
                         ) { start_ground_lasso = Some(kind); }
+                        if let Some(r) = vectorise::controls(
+                            ui, &mut digitise, &poly_files,
+                            app_mode == AppMode::Digitise, have_cloud,
+                        ) { digitise_request = Some(r); }
                         ui.label(format!(
                             "{}/{} points | {} chunks | {}/{} tiles | FPS: {:.0}",
                             drawn, total, mgr.total_chunks(),
@@ -4572,6 +4746,71 @@ async fn main() {
                     });
             });
             egui_macroquad::draw();
+        }
+
+        // ---- Act on a digitising request ----
+        // One place, whether it came from `P`, from Enter, or from the panel
+        // in any of the three per-mode blocks.
+        if let Some(req) = digitise_request.take() {
+            match req {
+                vectorise::Request::Start => {
+                    if digitise.target.is_none() {
+                        // A layer has a destination from the moment it exists,
+                        // because layers auto-save — there is no later "save
+                        // this somewhere" step to hang a file dialog on.
+                        match cloud_source_path(&stages, &copc_stages, &tile_mgr) {
+                            Some(cloud) => {
+                                let srs = poly_files.iter()
+                                    .flat_map(|f| &f.layers)
+                                    .map(|l| l.srs_id)
+                                    .find(|s| *s != 0)
+                                    .unwrap_or(0);
+                                let t = vectorise::ensure_target(&mut poly_files, &cloud, srs);
+                                digitise.target = Some(t);
+                                digitise.status = Some(format!(
+                                    "New lines go to {}",
+                                    vectorise::short_path(&poly_files[t.0].path),
+                                ));
+                            }
+                            None => digitise.status =
+                                Some("Load a point cloud first.".to_string()),
+                        }
+                    }
+                    if digitise.target.is_some() {
+                        digitise.clear();
+                        app_mode = AppMode::Digitise;
+                    }
+                }
+                vectorise::Request::Cancel => {
+                    digitise.clear();
+                    app_mode = AppMode::View3D;
+                }
+                vectorise::Request::UndoVertex => { digitise.pop(); }
+                vectorise::Request::Finish => {
+                    if let Some(fi) = digitise.finish(&mut poly_files) {
+                        // Granularity is the completed line, not the vertex:
+                        // a whole-file rewrite per click would be waste, and a
+                        // half-drawn line is not a meaningful thing to persist.
+                        // A crash therefore costs at most the line in progress.
+                        let pf = &mut poly_files[fi];
+                        digitise.status = Some(if pf.changed_on_disk() {
+                            format!(
+                                "{} changed on disk since it was loaded — the line is \
+                                 held in memory, not written. Use Save As to keep it.",
+                                pf.file_name(),
+                            )
+                        } else {
+                            match pf.save() {
+                                Ok(()) => format!(
+                                    "{} lines saved to {}",
+                                    pf.line_count(), pf.file_name(),
+                                ),
+                                Err(e) => format!("Save failed: {e}"),
+                            }
+                        });
+                    }
+                }
+            }
         }
 
         // ---- Plan-view ground tool: start / cancel / apply ----

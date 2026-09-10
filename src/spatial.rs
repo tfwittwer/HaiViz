@@ -54,6 +54,20 @@ const TARGET_OCCUPANCY: f64 = 2.0;
 const MIN_CELL: f32 = 0.05;
 const MAX_CELL: f32 = 5.0;
 
+/// Hard ceiling on cells per indexed point.
+///
+/// `cell = sqrt(area * occupancy / n)` is self-scaling: substitute it back and
+/// the cell count is `n / occupancy` whatever the footprint. Clamping breaks
+/// that, and [`MAX_CELL`] breaks it in the expensive direction — a cell forced
+/// *smaller* than the formula asked for means *more* cells than there are
+/// points.
+///
+/// That is not hypothetical. A COPC root node is a thinned sample of the whole
+/// file: 50 k points spread over a 30 km extent asks for a 130 m cell, gets
+/// clamped to 5 m, and allocates 36 M cells — 720 MB — for 50 k points, on the
+/// loader thread, while the camera is moving. This is the floor that stops it.
+const MAX_CELLS_PER_POINT: f64 = 4.0;
+
 /// Sentinel for "this cell is empty" in `arg_min` / `arg_max`.
 const NO_POINT: u32 = u32::MAX;
 
@@ -152,8 +166,14 @@ impl SpatialGrid {
             // cell size gives one column of buckets; take the middle.
             return 1.0;
         }
-        let cell = (area * TARGET_OCCUPANCY / positions.len() as f64).sqrt();
-        (cell as f32).clamp(MIN_CELL, MAX_CELL)
+        let n = positions.len() as f64;
+        let ideal = (area * TARGET_OCCUPANCY / n).sqrt();
+        // The smallest cell the budget can pay for. Applied *after* the
+        // clamps, so it can override `MAX_CELL`: a sparse cloud over a huge
+        // extent genuinely wants cells bigger than 5 m, and refusing to give
+        // it them is what costs the memory.
+        let affordable = (area / (MAX_CELLS_PER_POINT * n)).sqrt();
+        ((ideal as f32).clamp(MIN_CELL, MAX_CELL)).max(affordable as f32)
     }
 
     /// Build with an explicit cell size. Mostly for tests and the bench; normal
@@ -170,6 +190,16 @@ impl SpatialGrid {
 
         let (min, max) = bounds_xy(positions);
         let origin = [min[0], min[1]];
+        // The budget again, here rather than only in `auto_cell`, because this
+        // is `pub`: an explicit cell size must not be able to ask for a grid
+        // that does not fit in memory.
+        let mut cell = cell;
+        loop {
+            let w = ((max[0] - min[0]) / cell) as f64 + 1.0;
+            let h = ((max[1] - min[1]) / cell) as f64 + 1.0;
+            if w * h <= MAX_CELLS_PER_POINT * positions.len() as f64 { break; }
+            cell *= 2.0;
+        }
         // +1 so a point exactly on the upper bound lands in the last cell
         // rather than one past it.
         let nx = (((max[0] - min[0]) / cell) as usize) + 1;
@@ -903,6 +933,35 @@ mod tests {
         out.clear();
         g.points_in_radius(&same, 1.0, 1.0, 0.01, NO_FILTER, &mut out);
         assert_eq!(out.len(), 500);
+    }
+
+    #[test]
+    fn the_cell_count_stays_within_budget_however_sparse_the_cloud() {
+        // The shape that used to cost 720 MB: a thin sample over a huge
+        // extent, which is exactly what a COPC root node is.
+        let mut pts: Vec<[f32; 3]> = Vec::new();
+        let mut s: u64 = 12345;
+        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s >> 11) as f32 / (1u64 << 53) as f32 };
+        for _ in 0..5_000 {
+            pts.push([next() * 30_000.0, next() * 30_000.0, next() * 50.0]);
+        }
+        let g = SpatialGrid::build(&pts);
+        let cells = g.nx() * g.ny();
+        assert!(
+            cells as f64 <= MAX_CELLS_PER_POINT * pts.len() as f64,
+            "{cells} cells for {} points (cell {} m)", pts.len(), g.cell_size(),
+        );
+        assert!(g.cell_size() > MAX_CELL, "the budget must be allowed to override MAX_CELL");
+
+        // And it still answers correctly at that cell size.
+        let mut out = Vec::new();
+        g.points_in_radius(&pts, pts[7][0], pts[7][1], 1.0, NO_FILTER, &mut out);
+        assert!(out.contains(&7), "a big cell must not lose the point it holds");
+        assert_eq!(out, brute_in_radius(&pts, pts[7][0], pts[7][1], 1.0));
+
+        // An explicit cell size cannot bypass the budget either.
+        let g = SpatialGrid::build_with_cell(&pts, 0.01);
+        assert!((g.nx() * g.ny()) as f64 <= MAX_CELLS_PER_POINT * pts.len() as f64);
     }
 
     #[test]
