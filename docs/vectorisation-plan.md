@@ -1,0 +1,488 @@
+# Manual vectorisation in HaiViz — implementation plan
+
+Status: **plan only, nothing implemented.** Written 2026-09-10.
+
+Paths below are relative to the workspace root (`haicloudrs/`).
+
+## 1. Scope
+
+Draw 3D polylines directly on the point cloud, by hand, with the machine doing
+the precision work:
+
+- **Digitising mode** — click to place vertices, rubber band to the cursor,
+  undo, finish, cancel. Works in the 3D view from any camera angle, and later
+  in the section view.
+- **Snapping** — each vertex is pulled onto real data: nearest point, a low or
+  high percentile of Z within a radius, the previous vertex's height, or an
+  existing polyline.
+- **Edge following** — between two clicks the tool traces a real feature
+  (kerb, breakline, wall foot, painted road marking) rather than a straight
+  line.
+- **Class visibility** — classes can be switched off in the Classes window, and
+  everything the operator does then ignores them. This is not a side feature:
+  it is the primary control over *what you snap to*.
+- **File I/O** — read and write GeoPackage, keep the existing Salome Hydro
+  ASCII format.
+
+## 2. Decisions already taken
+
+| # | Decision | Rationale |
+|---|---|---|
+| 1 | Percentile snapping, not raw min/max | Raw extrema on LiDAR are usually noise. Default 5th / 95th percentile, slider-exposed; 0 / 100 gives the raw behaviour back. |
+| 2 | Snap radius on **modifier+wheel** | Plain wheel keeps zooming. Diverges from `SectionAdjustDepth`, deliberately — this is a tool you sit in for minutes. |
+| 3 | Both COPC mitigations | Refuse the snap when LOD spacing exceeds the radius, *and* pin the octree nodes under the cursor. |
+| 4 | GeoPackage read + write, hand-rolled, pure Rust | No new dependencies; see §7.2. |
+| 5 | Salome ASCII stays | Read and write, alongside GeoPackage. |
+| 6 | Digitising works from oblique views | Ray-snapped vertices come from real points and are unambiguous from any angle. Explicit exception to the `TOP_VIEW_HINT` rule. |
+| 7 | `haiviz/src/gpkg.rs`, not a shared crate | Duplicates a little of `hqmatcher/src/gpkg.rs`; accepted. |
+| 8 | Edge following in the 3D/oblique view only | Not offered in the section view. Section-view digitising still gets plain placement and snapping. |
+| 9 | Digitised layers **auto-save** | Granularity is the completed line, not the vertex; see §8.2. |
+| 10 | Class visibility is **not** persisted in `classes.txt` | A view setting, like the height filter. The documented `id;r;g;b;label` format stays valid. |
+| 11 | Snap radius is absolute, default **0.2 m** | Predictable — a metre value means the same thing at every zoom level. |
+
+## 3. What already exists
+
+| Piece | Where | Role here |
+|---|---|---|
+| `Polyline` / `PolylineFile`, 3D + section drawing, screen-space pick | `haiviz/src/polylines.rs` | Data model and rendering. Load-only today: no writer, no mutation, no vertex-level pick. |
+| Plan-view lasso interaction | `haiviz/src/main.rs:2891`, `:462` | The click / rubber-band / Backspace / Enter / Esc skeleton, already shared across all three loading modes. |
+| `ground_tool_controls` | `haiviz/src/main.rs:1124` | The pattern for one tool panel called from three per-mode egui panels. |
+| `find_nearest_point` ×3 | `haiviz/src/raw_miniquad.rs:673`, `:1101`, `:2246` | Screen picking — full linear scans, see §5. |
+| `ZClip` | `haiviz/src/raw_miniquad.rs:27` | The doctrine class visibility copies: hidden means unpickable, not merely invisible. |
+| `ClassOp` / `ClassEdits` | `haiviz/src/classify.rs` | Op model and sidecar. Extended in §6.3. |
+| `apply_z_clip` | `haiviz/src/main.rs:612` | The pattern for pushing a view setting onto all three backends. |
+| Minimal GPKG writer | `hqmatcher/src/gpkg.rs` | Reference for the GeoPackage table layout and WKB encoding. Not reused directly (C dependency, 2D only). |
+| Counting-sort voxel grid | `haicloudrs/src/voxelgrid.rs` | In-house model to copy for the spatial index. haiviz does not depend on haicloudrs; port, don't link. |
+
+## 4. Two facts that shape everything
+
+**There is no spatial index.** Every existing query is a linear scan over all
+resident points. That is fine for a click and fatal for snapping, which needs a
+radius query every frame while the mouse moves. Work package A exists solely to
+fix this and everything else depends on it.
+
+**Everything is written three times.** `main.rs` has three per-mode blocks
+(single-file, COPC, tile) that each render, draw overlays and build an egui
+panel. Shared input handling already lives above them (`main.rs:2891`), and
+`draw_3d_overlays` is called identically from all three. New code must route
+through shared functions or it will be triplicated by default.
+
+---
+
+## 5. Work package A — spatial index
+
+**New file: `haiviz/src/spatial.rs`.**
+
+A 2D XY grid built by counting sort, same shape as `Voxelgrid::compute`:
+
+- `origin`, `cell`, `nx`, `ny`
+- `starts: Vec<u32>`, `idx: Vec<u32>` — CSR-style bucket layout
+- per-cell `z_min`, `z_max`, and the point indices achieving them
+
+Roughly 12 bytes per point, O(n) build.
+
+Query API:
+
+- `nearest_ray(origin, dir, max_screen_dist) -> Option<usize>`
+- `percentile_in_radius(x, y, r, pct) -> Option<(usize, f64)>`
+- `points_in_radius(x, y, r, out: &mut Vec<u32>)`
+- `cells_in_box(...)` for the edge-following raster
+
+Every query takes a filter closure so `ZClip` **and class visibility** are
+applied inside the grid walk rather than by the caller.
+
+### Attaching it to the three backends
+
+- **`Stage`** — all points resident, order immutable. Build once in
+  `Stage::new`, never invalidate.
+- **`TileStageManager`** — one grid per `LoadedTile`, built on load, dropped on
+  unload.
+- **`CopcStage`** — the hard case. `loaded_nodes` churns continuously as the
+  camera moves. Build **one grid per node at ingest** and query only the nodes
+  whose AABB meets the query circle. Nothing to invalidate, no rebuild storm.
+
+### The COPC LOD problem
+
+Zoomed out, the resident set is a thinned sample, so "5th percentile of Z within
+0.5 m" would be computed over whatever sparse subset happened to be loaded and
+be silently wrong by decimetres. Both mitigations:
+
+1. **Spacing guard.** Compare the current LOD spacing against the snap radius.
+   When spacing > radius, the snap marker renders in a distinct *coarse* state
+   and clicking is refused with a status line explaining why.
+2. **Neighbourhood pinning.** While digitising, pin the nodes intersecting a box
+   around the cursor (default 20 m, or 4× the snap radius), reusing
+   `CopcStage::pinned` and the existing force-load pump. Guard with a point
+   budget analogous to `CORRIDOR_POINT_LIMIT` but far smaller — 5 M.
+
+Deliverables: `spatial.rs` with unit tests, a criterion bench on a synthetic
+10 M-point cloud, and the three backends wired up. **No user-visible change.**
+
+---
+
+## 6. Work package B — class visibility
+
+### 6.1 State
+
+`ClassDefs` is `HashMap<u8, (String, [f32; 3])>` — a tuple that is awkward to
+extend, and used in many places. So visibility lives **beside** it, not in it:
+
+```
+pub struct ClassVis([bool; 256]);   // haiviz/src/raw_miniquad.rs, next to ZClip
+```
+
+Held per stage / COPC stage / tile manager exactly as `z_clip` is, and pushed
+from the UI by a helper modelled on `apply_z_clip` (`main.rs:612`).
+
+`classes.txt` is **not** extended (decision 10). Visibility is a view setting,
+like the height filter, and the documented `id;r;g;b;label` format stays valid.
+
+### 6.2 Rendering
+
+The vertex shader is GLSL ES 100 (`raw_miniquad.rs:2495`), which has no bit
+operations. Two viable options:
+
+- **Sentinel colour (recommended).** A hidden point gets its red channel set to
+  `-1.0` during the colour rebuild — impossible for a real colour. The vertex
+  shader culls it with the same "push past the far plane" trick `ZClip` already
+  uses. Zero memory cost, no vertex-format change, and it reuses
+  `rebuild_colors` as the single update path for both colour changes and
+  visibility toggles. Overloads a channel, so it needs the same kind of
+  explanatory comment the `ZClip` hack already carries.
+- **vec4 colour.** Cleaner, but +4 bytes per point on the GPU (~17 % of total
+  vertex memory) and it touches `Vertex`, `build_chunks`, `upload_split_verts`
+  and section extraction.
+
+Toggling a class therefore costs one colour-buffer rebuild — the same cost as
+changing colour mode, which is already accepted as interactive.
+
+### 6.3 Everything else must honour it
+
+The `ZClip` doctrine is that a clipped point is not merely invisible: it cannot
+be measured, inspected or lassoed either. Class visibility extends exactly the
+same rule, which means every one of these sites gains the check:
+
+- vertex shader cull (above)
+- `find_nearest_point` ×3
+- `extract_section_verts` and its COPC / tile equivalents
+- `pick_section_point` (`main.rs:750`)
+- `collect_points_in_bbox` ×3 — the ground-plane fit
+- all new snap queries and the edge-following raster
+
+The ground fit is a real bonus: hide everything but class 2 and the plane is
+fitted to actual ground instead of to whatever minima the grid found.
+
+### 6.4 Ops must freeze the visible set
+
+Ops are replayed on COPC nodes as they stream in and again on every node at
+export, so *"the exported file agrees with the display by construction"*. If a
+lasso's meaning depended on the live visibility state, an export an hour later
+with different classes toggled would reclassify different points and break that
+guarantee. So the visible set is **frozen into the op** when it is made, exactly
+as the ground plane and the height band already are.
+
+The clean way to do this is to generalise the field that already exists.
+`ClassOp::from_class: Option<u8>` becomes a 256-bit mask:
+
+- "Only from: 5" is the singleton mask
+- no restriction is the all-ones mask
+- the visible set is a mask
+- what gets stored is the **intersection**, and `apply_point` does one test
+
+Serialisation stays positional-safe because the `from` token sits at index 2,
+ahead of the variable-length polygon. It gains a third form:
+
+```
+op;seq;*;...          unchanged — no restriction
+op;seq;5;...          unchanged — single class
+op;seq;2|5|6;...      new — an explicit set
+```
+
+**Downgrade behaviour:** an older haiviz cannot parse `2|5|6` and would skip the
+op with a warning (`ClassEdits::load` skips malformed lines). Mitigation: emit
+the set form **only when a visibility filter was actually in force**. Ordinary
+sessions keep writing byte-identical old-format sidecars. Bump the header
+comment to `v2` and document the new token in the comment block
+`ClassEdits::save` already writes.
+
+### 6.5 UI
+
+In the Classes window (`main.rs:1030`): a checkbox per row, plus **All**,
+**None**, **Invert** and **Isolate** (show only this one).
+
+Two things that must be loud, because both are foot-guns:
+
+- **Visibility does not affect export.** Same as the height filter. Use *Omit
+  classes* for that. Say so in the panel, not only in the README.
+- **A hidden class is invisible in more ways than one.** When any class is
+  hidden, show a persistent indicator near the tool panels ("3 classes hidden"),
+  or the first "why did my lasso catch nothing?" report is inevitable.
+
+Also: if *Only from: 5* is set while class 5 is hidden, the intersection is
+empty and the op would do nothing. Warn at that point rather than applying a
+no-op.
+
+---
+
+## 7. Work package C — polyline model and file I/O
+
+### 7.1 Model changes
+
+`polylines.rs` currently stores `points: Vec<[f32; 3]>` in viewer space and can
+only load. It needs:
+
+- **f64 world coordinates as the master representation**, with a cached f32
+  viewer-space copy for drawing. f32-relative-to-origin is fine for a
+  cloud-local overlay (sub-mm within a few km of the origin) but round-tripping
+  an external GeoPackage through it would quantise coordinates. Cheap to do now,
+  painful later.
+- **A layer level.** GeoPackage is a container of named feature tables; Salome
+  is one flat file. `PolylineFile` gains `format` and a layer grouping so a
+  GeoPackage round-trips its table name, and the panel becomes a layer tree
+  rather than a flat list.
+- **Mutability**: append vertex, pop vertex, insert, delete, close ring, plus a
+  `dirty` flag and an undo stack.
+- **A destination from the moment the layer is created**, because layers
+  auto-save (§8.2). A new layer defaults to a sidecar beside the cloud —
+  `<cloud>.haiviz-vectors.gpkg`, mirroring the existing
+  `<cloud>.haiviz-class.txt` convention — with *Save As* to relocate it. No
+  file dialog on layer creation.
+- **Atomic writes.** We always rewrite a whole file rather than editing in
+  place, so every save goes to a temporary file and is renamed over the target.
+  A crash mid-write must not be able to destroy the previous version.
+
+The undo stack should be a plain `Vec` of edits — deliberately *not* modelled on
+`ClassEdits`. That design stores geometric ops in a sidecar because
+classification has to be replayable against streaming nodes and at export. A
+polyline is just data.
+
+### 7.2 GeoPackage, pure Rust
+
+Every mainstream SQLite crate (`rusqlite`, `sqlx`, `diesel`) wraps the C
+library. `turso` is a genuine pure-Rust SQLite, but it is pre-1.0 and is a full
+MVCC engine — a lot of dependency for writing a table of blobs.
+
+**Decision: hand-roll a GeoPackage-specific SQLite codec in
+`haiviz/src/gpkg.rs`.** This is not "implement SQLite". Two constraints we
+control shrink it drastically:
+
+- We **only ever write a fresh file**, never update in place. No freelists, no
+  page reuse, no incremental vacuum, no journalling.
+- We **only ever read feature tables**. No SQL engine, no query planner, no
+  indexes, no triggers, no virtual tables.
+
+What that leaves: varints, the record serial-type encoding, table b-tree leaf
+and interior traversal, overflow pages (needed — a long linestring blob exceeds
+the page payload), and reading `sqlite_schema` to find the feature tables.
+Budget ~900 lines on top of the GeoPackage-specific work.
+
+GeoPackage specifics, following `hqmatcher/src/gpkg.rs` but going 3D:
+
+- `gpkg_spatial_ref_sys`, `gpkg_contents`, `gpkg_geometry_columns` as there.
+- **`LineStringZ`** — WKB type 1002, and `z = 1` in `gpkg_geometry_columns`.
+  A 2D export would throw away the elevation all the snapping worked to get
+  right. Read `LineString`, `LineStringZ`, `MultiLineString(Z)` and
+  `Polygon(Z)` rings.
+- `application_id` (0x47504B47) and `user_version` (10300) live at fixed header
+  offsets 68 and 60, so we write them directly and never need `PRAGMA`.
+- Attributes: write `fid, geom, name, code, n_vertices, length_3d, created`. On
+  read, pull non-geometry columns into a per-feature string map and write them
+  back verbatim on save, so a file from QGIS round-trips without losing columns.
+  Typed attribute *editing* is out of scope for v1.
+
+Risks:
+
+- **WAL sidecars.** A `.gpkg-wal` means committed data lives outside the main
+  file. Detect it and refuse with a clear message rather than silently reading
+  stale rows. Implementing WAL reads is a separate chunk of work; not up front.
+- **QGIS files carry rtree virtual tables.** The reader must skip
+  `sqlite_schema` entries it does not understand rather than failing on them.
+- **Validation is the real cost, not the code.** Needs a differential test
+  suite: write, verify with the `sqlite3` CLI, open in QGIS; and read files QGIS
+  produced. "It parses on my machine" means very little for a format other
+  people's tools must consume.
+
+Fallback if reading real-world files proves hairier than expected:
+`sqlite-parser-nom` (pure Rust, read-only b-tree/record parser) for the read
+half, hand-rolled writer for the other. Adds one small dependency.
+
+### 7.3 Format handling
+
+- **Detect on load by magic bytes** (`SQLite format 3\0`), not extension —
+  `.gpkg` is not guaranteed, and the existing Salome files use
+  `.txt` / `.xyz` / `.poly` / no extension.
+- **Save** writes back in the format the file came from; **Save As** offers
+  both.
+- Salome carries no attributes, so GeoPackage → Salome silently drops
+  `name` / `code` / columns. Warn; do not just do it.
+
+---
+
+## 8. Work package D — digitising mode
+
+**New file: `haiviz/src/vectorise.rs`.** `main.rs` is already 4437 lines and
+should hold only the mode wiring.
+
+- New `AppMode::Digitise`, alongside `GroundLasso`.
+- Shared input handling next to the existing lasso block (`main.rs:2891`):
+  left-click appends, Backspace pops, Enter finishes the line, Esc cancels.
+- Rubber band and committed vertices drawn through `draw_3d_overlays`, which is
+  already called identically from all three per-mode blocks.
+- Target layer selection, new-layer creation, line naming.
+- One shared panel function, called from the three egui blocks, in the shape of
+  `ground_tool_controls`.
+
+Proposed keys — `P` start/cancel digitising, `E` toggle edge following, `N`
+cycle snap mode, modifier+wheel for radius, Shift-click for an unsnapped vertex.
+(`O`, `G`, `V`, `C`, `T/F/B/L/R`, `WASD` are taken.)
+
+### 8.2 Auto-save
+
+Layers save themselves, following the classification sidecar's habit of writing
+out immediately rather than waiting for a Save.
+
+**Granularity is the completed line, not the vertex.** `ClassEdits` saves after
+each lasso, not after each lasso point, and the same reasoning applies here: a
+whole-file rewrite per vertex would be wasteful, and a half-drawn line is not a
+meaningful thing to persist. So a save fires on Enter (line finished), on a
+committed edit (vertex moved or deleted, line deleted), and on exit.
+
+Consequences:
+
+- A crash loses at most the line currently being drawn. That is an acceptable
+  loss and much simpler than journalling in-progress geometry.
+- Whole-file rewrite cost is negligible at realistic sizes — a GeoPackage of
+  10 k linestrings is a few MB and writes in milliseconds. Worth a note in the
+  code so nobody is surprised if a project reaches six figures of lines.
+- **External edits can be clobbered.** If the file changed on disk since we
+  loaded it — someone editing the same GeoPackage in QGIS — an auto-save would
+  overwrite their work without asking. Record the mtime at load, compare before
+  writing, and stop and ask rather than silently winning.
+
+## 9. Work package E — snapping
+
+Modes, all within radius `R` of the cursor, all honouring `ZClip` **and class
+visibility**:
+
+- **Nearest point** — true 3D, ray-based, works from any camera angle
+- **Low percentile Z** (default 5th) — gutters, ditch invert, toe of slope
+- **High percentile Z** (default 95th) — kerb top, crest, cable, roof ridge
+- **Same Z as previous vertex** — contour and breakline digitising
+- **Existing polyline** vertex or segment — closing loops, tying into
+  neighbouring lines
+
+Radius is an absolute metre value, default 0.2 m, adjusted with modifier+wheel.
+Absolute rather than zoom-relative because a metre means the same thing at every
+zoom level, which is what makes a snap reproducible.
+
+Percentiles are computed over the in-radius set after filtering; a few hundred
+points, so sorting is free.
+
+Visual feedback:
+
+- Snap candidate marker (cross, like `measure_a` / `measure_b`) and the radius
+  circle drawn at the snapped Z
+- A visibly distinct *coarse* / *snap failed* state, never a silent fallback
+- Live readout: segment length, slope, ΔZ, total length, vertex count — the
+  format the measure tool already uses
+
+Class visibility is what makes this precise: hide everything but ground and
+"lowest Z in radius" means the ground. Hide ground and show class 6 and it means
+the building.
+
+## 10. Work package F — edge following
+
+Livewire / intelligent scissors, adapted to point clouds. **3D / oblique view
+only** — the section view gets placement and snapping, but not tracing.
+
+1. On each new anchor (the last committed vertex), rasterise resident points in
+   a window around it into a world-XY grid — per cell: count, z_min, z_max, mean
+   intensity, dominant class. ~40 m window, capped at 512×512 cells.
+2. Derive an **edge-strength field** as a weighted sum of normalised channels:
+   - gradient of z_min → kerbs, breaklines, ditch edges, embankment tops
+   - z_max − z_min per cell → walls, building footprints, vertical faces
+   - **intensity gradient → road markings and painted lines**, probably the
+     highest-value channel for road work
+   - classification boundary → veg/ground, building/ground (much sharper once
+     hidden classes are excluded from the raster entirely)
+   - occupancy gradient → cloud boundary, roof outline
+3. Dijkstra once per anchor over the grid (8-connected, cost ≈ `1/(edge+ε)` plus
+   a small length term), caching cost and parent. Then **every frame** the ghost
+   path is just a parent-pointer walk from the cursor cell back to the anchor —
+   this is what makes it feel live. 512² ≈ 262 k nodes, a few ms per anchor,
+   nothing per frame.
+4. Click commits the traced path through Douglas–Peucker, so the result is a
+   handful of vertices rather than one per cell.
+5. Optionally constrain the search to a corridor around the straight
+   anchor→cursor line, so the path cannot wander around the far side of a
+   building.
+6. Vertex Z comes from the raster channel matching the active snap mode, then
+   optionally re-snapped per vertex at full resolution.
+
+Fallback when the cursor is unreachable or outside the window: plain straight
+rubber band. The tool must never block.
+
+**Edge-strength heatmap overlay, toggleable.** Not a nicety — without seeing
+what the tracer sees, tuning channel weights is guesswork.
+
+## 11. Work package G — editing and section view
+
+- Vertex-level pick (`polylines::pick` only resolves to a whole polyline), then
+  move / insert / delete vertex.
+- Delete line, close ring, re-drape (re-snap every vertex after changing snap
+  mode).
+- Digitising in the section view, in (along, Z) space — the natural place to
+  pick a rail profile or a kerb face precisely. Placement and snapping only; no
+  edge following (decision 8).
+
+---
+
+## 12. Order of work
+
+| Phase | Content | Rough size | Ships something? |
+|---|---|---|---|
+| **0** | A — spatial index, all three backends, tests + bench | ~400 | no |
+| **1** | B — class visibility: state, shader cull, all filter sites, `ClassOp` mask, Classes window UI | ~500 | **yes, standalone** |
+| **2a** | C — polyline model: f64, layers, mutability, undo, Salome writer | ~250 | marginally |
+| **2b** | C — GeoPackage read + write, EPSG detection, differential tests | ~1400 | **yes — overlay any GPKG** |
+| **3** | D — digitising mode, free vertex placement, panel wiring | ~450 | yes |
+| **4** | E — snapping, radius control, feedback, COPC guard + pinning | ~450 | yes, the core tool |
+| **5** | F — edge following, cost channels, livewire, heatmap | ~600 | yes |
+| **6** | G — vertex editing, section-view digitising, re-drape | ~400 | yes |
+
+Phase 1 is worth doing early and independently: it is useful on its own, it
+improves the ground-plane fit immediately, and every later phase depends on the
+filter being in place.
+
+Phase 0 is the risk concentration — nothing above it works without a fast radius
+query, and it is the only part whose performance cannot be predicted by reading
+the code. Build it with the bench first.
+
+## 13. Risks
+
+1. **Spatial index performance on COPC.** Per-node grids may fragment queries
+   badly when many small nodes are resident. Measure before building on it.
+2. **GeoPackage interoperability.** The format is easy to write plausibly and
+   hard to write correctly. Budget as much time for the differential tests as
+   for the codec.
+3. **Sidecar downgrade.** Sidecars containing a visibility mask are dropped
+   silently by older builds. Mitigated by only emitting the new token when a
+   filter was in force, but it should be in the release notes.
+4. **Hidden-class confusion.** A view setting that silently changes what a
+   destructive tool does is dangerous. The persistent indicator in §6.5 is a
+   requirement, not a nicety.
+5. **Scope.** Phases 0–4 are a complete, useful tool. Phase 5 is the speculative
+   one — its value cannot be judged until the heatmap can be seen on real data.
+6. **Auto-save over a whole-file rewrite.** Combining "save on every completed
+   line" with "always write the file fresh" means the write path is exercised
+   constantly and a bug there destroys work rather than merely failing. Atomic
+   temp-file-plus-rename and the mtime check (§7.1, §8.2) are load-bearing, not
+   polish.
+
+## 14. Documentation to update on completion
+
+`haiviz/README.md` needs: a Vectorisation section (modes, keys, snapping, edge
+following, auto-save and where a new layer lands), class visibility under Manual
+classification — including that it does not affect export — the GeoPackage
+format in the Polylines section, the controls cheat-sheet, and an explicit note
+on why digitising works from oblique views when the plan-view lassos do not.
