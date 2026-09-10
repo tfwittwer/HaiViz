@@ -1,6 +1,6 @@
 # Manual vectorisation in HaiViz — implementation plan
 
-Status: **phases 0 and 1 implemented; phases 2–6 are still plan only.**
+Status: **phases 0, 1 and 2a implemented; 2b–6 are still plan only.**
 Written 2026-09-10.
 
 Paths below are relative to the workspace root (`haicloudrs/`).
@@ -353,6 +353,30 @@ The undo stack should be a plain `Vec` of edits — deliberately *not* modelled 
 classification has to be replayable against streaming nodes and at export. A
 polyline is just data.
 
+### Status: built (2a)
+
+`Polyline` holds world f64 `points` plus a private viewer-space `view` cache;
+mutation goes through `PolylineFile` rather than through the line, which is what
+keeps the undo entry and the cache refresh from being forgettable.
+`PolylineFile::refresh_view(origin)` is called once a frame and is a single
+float comparison unless the origin actually moved.
+
+The undo stack stores **inverses**, not actions — `Truncate`, `Reinsert`,
+`Uninsert`, `Restore`, `Unadd`, `Readd`, `Unclose` — so undo is a straight apply
+with nothing re-derived. `add_line` goes on the same stack, so a full unwind
+removes the line too.
+
+Also landed here, ahead of their users: `detect_format` by magic bytes (§7.3),
+`changed_on_disk` for the auto-save mtime check (§8.2), `salome_losses` for the
+§7.3 downgrade warning, and `pick_vertex` for §11. The atomic write is
+temp-file + `sync_all` + rename within the same directory; without the sync the
+rename can order ahead of the data and leave the new name over empty content,
+which is worse than either version.
+
+A new layer does **not** yet get a default destination — that belongs with the
+digitising flow in phase 3, which is when a layer is first created from inside
+haiviz. `PolylineFile::save` refuses a GeoPackage until 2b lands.
+
 ### 7.2 GeoPackage, pure Rust
 
 Every mainstream SQLite crate (`rusqlite`, `sqlx`, `diesel`) wraps the C
@@ -540,7 +564,7 @@ what the tracer sees, tuning channel weights is guesswork.
 |---|---|---|---|
 | **0** | A — spatial index, all three backends, tests + bench | ~400 | no — **done** |
 | **1** | B — class visibility: state, shader cull, all filter sites, `ClassOp` mask, Classes window UI | ~500 | **yes, standalone — done** |
-| **2a** | C — polyline model: f64, layers, mutability, undo, Salome writer | ~250 | marginally |
+| **2a** | C — polyline model: f64, layers, mutability, undo, Salome writer | ~250 | marginally — **done** |
 | **2b** | C — GeoPackage read + write, EPSG detection, differential tests | ~1400 | **yes — overlay any GPKG** |
 | **3** | D — digitising mode, free vertex placement, panel wiring | ~450 | yes |
 | **4** | E — snapping, radius control, feedback, COPC guard + pinning | ~450 | yes, the core tool |

@@ -876,7 +876,7 @@ fn pick_section_point(
 fn polylines_window(
     egui_ctx: &egui_macroquad::egui::Context,
     poly_files: &mut Vec<polylines::PolylineFile>,
-    selected_poly: &mut Option<(usize, usize)>,
+    selected_poly: &mut Option<polylines::PolyRef>,
     poly_load_error: &mut Option<String>,
     data_offset: [f64; 3],
     background: Color,
@@ -909,25 +909,41 @@ fn polylines_window(
             }
             ui.separator();
             let mut to_remove: Option<usize> = None;
+            // File → layer → line. A GeoPackage is a container of named feature
+            // tables, so the panel is a tree even when a Salome file gives it
+            // only one layer to show.
             for (fi, pf) in poly_files.iter_mut().enumerate() {
-                let fname = std::path::Path::new(&pf.path)
-                    .file_name().and_then(|n| n.to_str()).unwrap_or(&pf.path);
-                ui.collapsing(format!("{} ({} lines)", fname, pf.polylines.len()), |ui| {
-                    if ui.small_button("Remove file").clicked() {
-                        to_remove = Some(fi);
-                        if selected_poly.map(|(f, _)| f) == Some(fi) { *selected_poly = None; }
-                    }
-                    for (pi, pl) in pf.polylines.iter_mut().enumerate() {
+                let header = format!("{} ({} lines)", pf.file_name(), pf.line_count());
+                ui.collapsing(header, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(pf.format.label());
+                        if pf.dirty { ui.label("• unsaved"); }
+                        if ui.small_button("Remove file").clicked() {
+                            to_remove = Some(fi);
+                            if selected_poly.map(|r| r.file) == Some(fi) { *selected_poly = None; }
+                        }
+                    });
+                    for (li, layer) in pf.layers.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
-                            let is_sel = *selected_poly == Some((fi, pi));
-                            if ui.selectable_label(is_sel, &pl.name).clicked() {
-                                *selected_poly = if is_sel { None } else { Some((fi, pi)) };
+                            ui.checkbox(&mut layer.visible, "")
+                                .on_hover_text("Show this layer");
+                            ui.label(format!("{} ({})", layer.name, layer.polylines.len()));
+                        });
+                        ui.indent(("poly_layer", fi, li), |ui| {
+                            for (pi, pl) in layer.polylines.iter_mut().enumerate() {
+                                let at = polylines::PolyRef { file: fi, layer: li, line: pi };
+                                ui.horizontal(|ui| {
+                                    let is_sel = *selected_poly == Some(at);
+                                    if ui.selectable_label(is_sel, &pl.name).clicked() {
+                                        *selected_poly = if is_sel { None } else { Some(at) };
+                                    }
+                                    let mut ec = mq_to_egui(pl.color);
+                                    if ui.color_edit_button_srgba(&mut ec).changed() {
+                                        pl.color = egui_to_mq(ec);
+                                    }
+                                    ui.add(egui_macroquad::egui::Slider::new(&mut pl.radius, 0.001..=0.05).text("r (m)").logarithmic(true));
+                                });
                             }
-                            let mut ec = mq_to_egui(pl.color);
-                            if ui.color_edit_button_srgba(&mut ec).changed() {
-                                pl.color = egui_to_mq(ec);
-                            }
-                            ui.add(egui_macroquad::egui::Slider::new(&mut pl.radius, 0.001..=0.05).text("r (m)").logarithmic(true));
                         });
                     }
                 });
@@ -1818,7 +1834,7 @@ async fn main() {
     };
 
     let mut poly_files: Vec<polylines::PolylineFile> = Vec::new();
-    let mut selected_poly: Option<(usize, usize)> = None; // (file_idx, poly_idx)
+    let mut selected_poly: Option<polylines::PolyRef> = None;
     let mut poly_load_error: Option<String> = None;
 
     let mut gcp_files: Vec<gcp::GcpFile> = Vec::new();
@@ -1993,6 +2009,12 @@ async fn main() {
             crate::raw_miniquad::ZClip::OPEN
         };
         apply_z_clip(&mut stages, &mut copc_stages, &mut tile_mgr, z_clip);
+        // Polylines are stored in world f64 and drawn from a viewer-space
+        // cache. The origin is re-pinned whenever everything is unloaded and
+        // new data arrives somewhere else, so the caches are checked against
+        // it here rather than assumed to be current. A no-op — one float
+        // comparison per file — unless the origin actually moved.
+        for pf in poly_files.iter_mut() { pf.refresh_view(data_offset); }
         // Same treatment for the visible class set. Unlike the height band this
         // is baked into the colour buffers, so a change — including a file
         // arriving unfiltered while a filter is on — has to force a rebuild.
