@@ -12,6 +12,7 @@
 
     use crate::ColorMode;
     use crate::classify::ClassEdits;
+    use crate::spatial::{Hit, RayHit, SpatialGrid, percentile_by_z};
 
     const CHUNK_SIZE: f32 = 50.0;
 
@@ -269,6 +270,13 @@
         /// resident, so ops are applied directly and only kept for persistence
         /// and undo.
         pub edits: ClassEdits,
+        /// XY index over `positions`. Built once in `Stage::new` and never
+        /// invalidated: all points are resident, and `positions` is written
+        /// once and never touched again — reclassification and `reload_points`
+        /// replace `cloud.points` and the colours, not the geometry.
+        /// Unused until phase 4 wires up snapping — see spatial.rs.
+        #[allow(dead_code)]
+        pub index: SpatialGrid,
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -586,9 +594,10 @@
             let pipeline = create_pipeline(ctx);
             let total_points = colors.len() as i32;
             let chunks = build_chunks(ctx, &positions, &colors);
+            let index = SpatialGrid::build(&positions);
 
-            info!("{} points in {} chunks ({}m cells), height range: {:.1}m",
-                total_points, chunks.len(), CHUNK_SIZE, height_range);
+            info!("{} points in {} chunks ({}m cells), height range: {:.1}m, index cell {:.2}m",
+                total_points, chunks.len(), CHUNK_SIZE, height_range, index.cell_size());
 
             let mut stage = Stage {
                 pipeline,
@@ -605,6 +614,7 @@
                 color_h_max: height_range,
                 z_clip: ZClip::OPEN,
                 edits: ClassEdits::default(),
+                index,
             };
             // Replay any sidecar written in an earlier session before the
             // cloud is first shown, so the view opens on the edited state.
@@ -700,6 +710,44 @@
             }
 
             best_idx
+        }
+
+        /// Point-visibility test for every indexed query on this stage.
+        ///
+        /// The `ZClip` doctrine — a clipped point cannot be measured, inspected
+        /// or lassoed either — reaches the snap queries here, and it is passed
+        /// *into* the grid walk rather than applied to the result: a hidden
+        /// point that is nearer than every visible one would otherwise win the
+        /// contest and be discarded, leaving the snap empty over data the
+        /// operator can plainly see. Class visibility joins this test in
+        /// phase 1.
+        #[allow(dead_code)]
+        fn snap_filter(&self) -> impl Fn(u32) -> bool + '_ {
+            move |i: u32| self.z_clip.contains(self.positions[i as usize][2])
+        }
+
+        /// Frontmost point within `max_dist` of a viewer-space ray.
+        ///
+        /// Unlike `find_nearest_point`, which ranks by screen distance, this is
+        /// a true 3D query — which is what makes digitising work from an
+        /// oblique camera instead of only from directly above.
+        #[allow(dead_code)]
+        pub fn snap_nearest_ray(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<RayHit> {
+            self.index.nearest_ray(&self.positions, origin, dir, max_dist, self.snap_filter())
+        }
+
+        /// The `pct`-th percentile of Z within `r` metres of a viewer-space XY
+        /// position, and the point realising it.
+        #[allow(dead_code)]
+        pub fn snap_percentile_z(&self, x: f32, y: f32, r: f32, pct: f32) -> Option<Hit> {
+            self.index.percentile_in_radius(&self.positions, x, y, r, pct, self.snap_filter())
+        }
+
+        /// Every visible point within `r` metres of a viewer-space XY position,
+        /// appended to `out` as indices into `positions` / `cloud.points`.
+        #[allow(dead_code)]
+        pub fn snap_points_in_radius(&self, x: f32, y: f32, r: f32, out: &mut Vec<u32>) {
+            self.index.points_in_radius(&self.positions, x, y, r, self.snap_filter(), out);
         }
 
         pub fn height_range(&self) -> f32 {
@@ -820,6 +868,12 @@
         chunks: Vec<Chunk>,
         pub total_points: i32,
         pub rgb_override: Option<[f32; 3]>,
+        /// XY index over this tile's `positions`. Built on load, dropped with
+        /// the tile on unload — there is nothing to invalidate, because a tile
+        /// never changes shape while it is resident.
+        /// Unused until phase 4 wires up snapping — see spatial.rs.
+        #[allow(dead_code)]
+        pub index: SpatialGrid,
     }
 
     pub struct TileStageManager {
@@ -1017,9 +1071,10 @@
 
             let total_points = colors.len() as i32;
             let chunks = build_chunks(ctx, &positions, &colors);
+            let grid = SpatialGrid::build(&positions);
 
-            info!("Tile {} loaded: {} points, {} chunks",
-                self.tiles[index].filename, total_points, chunks.len());
+            info!("Tile {} loaded: {} points, {} chunks, index cell {:.2}m",
+                self.tiles[index].filename, total_points, chunks.len(), grid.cell_size());
 
             self.loaded[index] = Some(LoadedTile {
                 cloud,
@@ -1027,6 +1082,7 @@
                 chunks,
                 total_points,
                 rgb_override: override_rgb,
+                index: grid,
             });
         }
 
@@ -1126,6 +1182,68 @@
                 }
             }
             best
+        }
+
+        /// Frontmost point within `max_dist` of a viewer-space ray, across
+        /// every loaded tile. Returns the tile and the hit within it.
+        ///
+        /// Each tile answers for its own points and the frontmost of those
+        /// answers wins, which is why `RayHit` carries `t`: a ray crossing a
+        /// tile boundary must not prefer whichever tile happened to be visited
+        /// first.
+        #[allow(dead_code)]
+        pub fn snap_nearest_ray(
+            &self,
+            origin: [f32; 3],
+            dir: [f32; 3],
+            max_dist: f32,
+        ) -> Option<(usize, RayHit)> {
+            let mut best: Option<(usize, RayHit)> = None;
+            for (tile_idx, loaded) in self.loaded.iter().enumerate() {
+                let Some(lt) = loaded else { continue };
+                let z_clip = self.z_clip;
+                let positions = &lt.positions;
+                let hit = lt.index.nearest_ray(
+                    positions, origin, dir, max_dist,
+                    move |i: u32| z_clip.contains(positions[i as usize][2]),
+                );
+                if let Some(h) = hit
+                    && best.as_ref().is_none_or(|(_, b)| h.t < b.t) {
+                    best = Some((tile_idx, h));
+                }
+            }
+            best
+        }
+
+        /// The `pct`-th percentile of Z within `r` metres of a viewer-space XY
+        /// position, across every loaded tile. Returns `(tile index, point
+        /// index, z)`.
+        ///
+        /// Candidates from all tiles are pooled before the rank is taken. A
+        /// percentile of a union is not the union of percentiles, and a snap
+        /// radius straddling a tile edge is the normal case, not an edge case.
+        #[allow(dead_code)]
+        pub fn snap_percentile_z(
+            &self,
+            x: f32, y: f32, r: f32, pct: f32,
+        ) -> Option<(usize, u32, f32)> {
+            let mut samples: Vec<(f32, (usize, u32))> = Vec::new();
+            let mut cands: Vec<u32> = Vec::new();
+            for (tile_idx, loaded) in self.loaded.iter().enumerate() {
+                let Some(lt) = loaded else { continue };
+                if !lt.index.circle_overlaps(x, y, r) { continue; }
+                cands.clear();
+                let z_clip = self.z_clip;
+                let positions = &lt.positions;
+                lt.index.points_in_radius(
+                    positions, x, y, r,
+                    move |i: u32| z_clip.contains(positions[i as usize][2]),
+                    &mut cands,
+                );
+                samples.extend(cands.iter().map(|&i| (lt.positions[i as usize][2], (tile_idx, i))));
+            }
+            let (z, (tile_idx, i)) = percentile_by_z(&mut samples, pct)?;
+            Some((tile_idx, i, z))
         }
 
         /// Append every resident point inside the XY box and Z band, in
@@ -1417,6 +1535,15 @@
 
     // ---- COPC Stage ----
 
+    /// Upper bound on the points a snap neighbourhood pin may hold.
+    ///
+    /// Analogous to `CORRIDOR_POINT_LIMIT`, but far smaller: a section corridor
+    /// is pinned once, deliberately, and the operator waits for it. A snap
+    /// neighbourhood follows the cursor, so it must stay small enough to stream
+    /// in without the tool ever feeling like it stalled.
+    #[allow(dead_code)]
+    pub const SNAP_PIN_POINT_LIMIT: i64 = 5_000_000;
+
     struct CopcEntry {
         key: VoxelKey,
         offset: u64,
@@ -1431,6 +1558,26 @@
         positions: Vec<[f32; 3]>,
         points: Vec<Point>,
         total_points: i32,
+        /// XY index over this node's `positions`.
+        ///
+        /// One grid per node, built at ingest. `loaded_nodes` churns
+        /// continuously as the camera moves, so a single grid over the resident
+        /// set would have to be rebuilt every time a node arrived or was
+        /// evicted — a rebuild storm exactly when the operator is moving. A
+        /// per-node grid is built once, dropped with the node, and never
+        /// invalidated; a query walks only the nodes whose bounds it meets.
+        #[allow(dead_code)]
+        index: SpatialGrid,
+    }
+
+    /// The neighbourhood `CopcStage::pin_neighbourhood` last pinned for, in
+    /// world coordinates, and what it cost.
+    #[derive(Clone, Copy)]
+    struct PinBox {
+        cx: f64,
+        cy: f64,
+        half: f64,
+        points: i64,
     }
 
     /// Request sent to the background loader thread.
@@ -1492,6 +1639,11 @@
         /// operator classifies is the full-resolution data rather than
         /// whatever sample the LOD happened to pick.
         pinned: HashSet<VoxelKey>,
+        /// The box `pin_neighbourhood` last pinned for. Lets a cursor that has
+        /// barely moved reuse the existing pin set instead of rescanning the
+        /// hierarchy every frame. `None` when the pins came from somewhere
+        /// else, or from nowhere.
+        pin_box: Option<PinBox>,
         /// Manual classification ops, applied to every node as it is ingested.
         pub edits: ClassEdits,
         /// Send requests to the background loader thread.
@@ -1774,6 +1926,7 @@
                 z_clip: ZClip::OPEN,
                 in_flight: HashSet::new(),
                 pinned: HashSet::new(),
+                pin_box: None,
                 edits: ClassEdits::load(filepath),
                 load_tx,
                 result_rx,
@@ -1833,6 +1986,7 @@
             let depth = depth as f64;
 
             self.pinned.clear();
+            self.pin_box = None;
             let mut points: i64 = 0;
             for e in &self.entries {
                 if corridor_meets_aabb_2d(
@@ -1903,9 +2057,10 @@
             }
         }
 
-        /// Release the section corridor pins, letting normal LOD resume.
+        /// Release the corridor or neighbourhood pins, letting normal LOD resume.
         pub fn clear_pins(&mut self) {
             self.pinned.clear();
+            self.pin_box = None;
         }
 
         /// Pinned nodes not yet resident. Zero means the corridor is fully loaded.
@@ -2037,8 +2192,9 @@
 
             let total_points = colors.len() as i32;
             let chunks = build_chunks(ctx, &positions, &colors);
+            let index = SpatialGrid::build(&positions);
 
-            self.loaded_nodes.insert(key, CopcLoadedNode { chunks, positions, points: pts, total_points });
+            self.loaded_nodes.insert(key, CopcLoadedNode { chunks, positions, points: pts, total_points, index });
         }
 
         /// Called every frame. Drains completed results, then dispatches new requests.
@@ -2267,6 +2423,142 @@
                 }
             }
             best
+        }
+
+        /// Frontmost point within `max_dist` of a viewer-space ray, across
+        /// every resident node. Returns the hit and the LAS point behind it.
+        ///
+        /// Each node answers over its own grid and the frontmost answer wins.
+        /// COPC puts every point in exactly one node at exactly one level, so a
+        /// surface under the cursor is generally spread across several resident
+        /// nodes — comparing `t` across them is not an optimisation, it is what
+        /// makes the answer right.
+        #[allow(dead_code)]
+        pub fn snap_nearest_ray(
+            &self,
+            origin: [f32; 3],
+            dir: [f32; 3],
+            max_dist: f32,
+        ) -> Option<(RayHit, &Point)> {
+            let mut best: Option<(RayHit, &Point)> = None;
+            for node in self.loaded_nodes.values() {
+                let z_clip = self.z_clip;
+                let positions = &node.positions;
+                let hit = node.index.nearest_ray(
+                    positions, origin, dir, max_dist,
+                    move |i: u32| z_clip.contains(positions[i as usize][2]),
+                );
+                if let Some(h) = hit
+                    && best.as_ref().is_none_or(|(b, _)| h.t < b.t) {
+                    best = Some((h, &node.points[h.idx as usize]));
+                }
+            }
+            best
+        }
+
+        /// The `pct`-th percentile of Z within `r` metres of a viewer-space XY
+        /// position, pooled over every resident node. Returns the viewer-space
+        /// position of the point realising it and the LAS point itself.
+        ///
+        /// Read [`CopcStage::lod_spacing_near`] before trusting this: at a
+        /// coarse LOD the pool is a thinned sample and the answer is quietly
+        /// wrong by decimetres.
+        #[allow(dead_code)]
+        pub fn snap_percentile_z(
+            &self,
+            x: f32, y: f32, r: f32, pct: f32,
+        ) -> Option<([f32; 3], &Point)> {
+            let mut samples: Vec<(f32, ([f32; 3], &Point))> = Vec::new();
+            let mut cands: Vec<u32> = Vec::new();
+            for node in self.loaded_nodes.values() {
+                if !node.index.circle_overlaps(x, y, r) { continue; }
+                cands.clear();
+                let z_clip = self.z_clip;
+                let positions = &node.positions;
+                node.index.points_in_radius(
+                    positions, x, y, r,
+                    move |i: u32| z_clip.contains(positions[i as usize][2]),
+                    &mut cands,
+                );
+                samples.extend(cands.iter().map(|&i| {
+                    let pos = node.positions[i as usize];
+                    (pos[2], (pos, &node.points[i as usize]))
+                }));
+            }
+            let (_, hit) = percentile_by_z(&mut samples, pct)?;
+            Some(hit)
+        }
+
+        /// Point spacing, in metres, of the finest resident node near a
+        /// viewer-space XY position — or `None` when nothing is resident there.
+        ///
+        /// This is the spacing guard. Zoomed out, the resident set is a thinned
+        /// LOD sample: "5th percentile of Z within 0.2 m" would then be taken
+        /// over whatever sparse subset happened to be loaded, and be wrong by
+        /// decimetres without anything looking wrong. Comparing this against
+        /// the snap radius is how the tool knows to refuse rather than to
+        /// guess. It is measured *near the cursor* rather than over the whole
+        /// resident set, because the finest node loaded somewhere off screen
+        /// says nothing about the data under the crosshair.
+        #[allow(dead_code)]
+        pub fn lod_spacing_near(&self, x: f32, y: f32, r: f32) -> Option<f64> {
+            let deepest = self.loaded_nodes.iter()
+                .filter(|(_, node)| node.index.circle_overlaps(x, y, r))
+                .map(|(key, _)| key.l)
+                .max()?;
+            Some(self.spacing / 2f64.powi(deepest))
+        }
+
+        /// Force-load every node whose octree cube meets a box of half-extent
+        /// `half` metres around a viewer-space XY position, so that snapping
+        /// under the cursor sees full-resolution data rather than the LOD
+        /// sample. The digitising counterpart of [`CopcStage::pin_corridor`],
+        /// and like it the sole owner of `pinned`: a call replaces whatever was
+        /// pinned before, so the two must not be in force at once.
+        ///
+        /// Returns `(node_count, point_count)`. When the box would pull in more
+        /// than [`SNAP_PIN_POINT_LIMIT`] points nothing is pinned and
+        /// `(0, point_count)` comes back, so the caller can say why rather than
+        /// letting a dense cloud page itself into memory behind a moving
+        /// cursor.
+        ///
+        /// Cheap to call every frame: the pin set is recomputed only once the
+        /// cursor has left the middle of the box it was built for. Without that
+        /// hysteresis this would rescan the whole hierarchy on every mouse
+        /// move, and re-dispatch loads for nodes that were already pinned.
+        #[allow(dead_code)]
+        pub fn pin_neighbourhood(&mut self, x: f32, y: f32, half: f64) -> (usize, i64) {
+            let cx = x as f64 + self.viewer_origin[0];
+            let cy = y as f64 + self.viewer_origin[1];
+
+            if let Some(b) = self.pin_box
+                && (b.half - half).abs() < 1e-6
+                && (cx - b.cx).abs() < half * 0.5
+                && (cy - b.cy).abs() < half * 0.5 {
+                return (self.pinned.len(), b.points);
+            }
+
+            let mut keys = Vec::new();
+            let mut points: i64 = 0;
+            for e in &self.entries {
+                if e.xmax >= cx - half && e.xmin <= cx + half
+                    && e.ymax >= cy - half && e.ymin <= cy + half {
+                    keys.push(e.key);
+                    points += e.point_count as i64;
+                }
+            }
+            if points > SNAP_PIN_POINT_LIMIT {
+                self.pinned.clear();
+                self.pin_box = None;
+                return (0, points);
+            }
+            self.pinned = keys.into_iter().collect();
+            self.pin_box = Some(PinBox { cx, cy, half, points });
+            info!(
+                "COPC {}: pinned {} nodes ({} points) for a {:.0}m snap neighbourhood",
+                self.filepath, self.pinned.len(), points, half * 2.0,
+            );
+            (self.pinned.len(), points)
         }
 
         pub fn rebuild_colors(&mut self, ctx: &mut dyn RenderingBackend, color_mode: ColorMode) {

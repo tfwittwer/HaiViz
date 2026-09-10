@@ -1,6 +1,7 @@
 # Manual vectorisation in HaiViz — implementation plan
 
-Status: **plan only, nothing implemented.** Written 2026-09-10.
+Status: **phase 0 implemented; phases 1–6 are still plan only.**
+Written 2026-09-10.
 
 Paths below are relative to the workspace root (`haicloudrs/`).
 
@@ -117,6 +118,69 @@ be silently wrong by decimetres. Both mitigations:
 
 Deliverables: `spatial.rs` with unit tests, a criterion bench on a synthetic
 10 M-point cloud, and the three backends wired up. **No user-visible change.**
+
+### Status: built
+
+`haiviz/src/spatial.rs` + `haiviz/benches/spatial.rs`. All three backends hold a
+grid: `Stage::index` (built in `Stage::new`), `LoadedTile::index` (built in
+`load_tile`), `CopcLoadedNode::index` (built in `ingest_node`). Each backend
+exposes `snap_nearest_ray` and `snap_percentile_z` wrappers that pass a
+`ZClip` filter into the grid walk; `CopcStage` also has `lod_spacing_near`
+(the spacing guard) and `pin_neighbourhood` (the pinning mitigation, guarded by
+`SNAP_PIN_POINT_LIMIT`). Nothing calls them yet, so every new item carries an
+`#[allow(dead_code)]` that phase 4 removes.
+
+Three things came out differently from the sketch above:
+
+- **Coordinates are viewer-space f32, not world f64.** That is the space all
+  three `positions` arrays, the camera ray and the existing pick code already
+  use, so nothing converts on the way in or out. A caller wanting world
+  coordinates adds the `viewer_origin` it already owns. This is the opposite
+  choice from `Polyline` in §7.1, and for the opposite reason: an index is
+  transient and cloud-local, a stored coordinate is neither.
+- **`nearest_ray` returns the frontmost hit within the tolerance**, not the one
+  closest to the ray axis, and carries `t` so hits from several tiles or COPC
+  nodes can be merged. Within the tolerance the operator means the surface
+  facing them, not what sits marginally closer to the axis behind a wall.
+- **Percentiles are nearest-rank**, so the answer is always a real point rather
+  than an interpolated Z nothing in the cloud sits at. `0` and `100` give the
+  raw extrema back, as decision 1 requires.
+
+Multi-source percentiles pool their candidates before ranking
+(`spatial::percentile_by_z`): a percentile over a union is not the union of
+percentiles, and a snap radius straddling a tile edge is the normal case.
+
+### Measured
+
+`cargo bench -p haiviz --bench spatial`, on a synthetic 10 M-point cloud over
+200 m (≈250 pts/m², 0.089 m auto cell, 2237×2237 cells). The linear-scan rows
+are what the existing `find_nearest_point` does today, and what a snap on every
+mouse move would have cost.
+
+| Query | Indexed | Linear scan |
+|---|---|---|
+| radius r=0.2 m | 85 ns | 3.83 ms |
+| radius r=0.5 m | 384 ns | — |
+| radius r=2 m | 6.97 µs | — |
+| p5 percentile r=0.2 m (sort included) | 413 ns | — |
+| nearest ray, top-down | 87 ns | 21.4 ms |
+| nearest ray, oblique 40° | 19.3 µs | 36.9 ms |
+| 40 m raster window (phase 5, per anchor) | 263 µs | — |
+
+Build is 443 ms for 10 M points and 1.35 ms for a 100 k-point COPC node. The
+first is a one-off beside a multi-second LAZ read; the second sits on the ingest
+path next to `build_chunks` and the colour pass, and is the same order as both.
+Memory works out at ~14 B/point at the default occupancy of 2 points per cell —
+100 MB of per-cell arrays plus 40 MB of indices at 10 M — against ~120 MB for
+the `positions` the grid indexes.
+
+The oblique ray is 200× the top-down one because its corridor crosses hundreds
+of columns rather than one; the Z clip against the grid extent is what keeps it
+to 19 µs, which is still a tenth of a percent of a frame.
+
+**This does not close risk 1.** The bench measures one contiguous grid. The COPC
+worry is fragmentation — many small per-node grids resident at once, each
+queried separately — and only real COPC data will show that.
 
 ---
 
@@ -441,7 +505,7 @@ what the tracer sees, tuning channel weights is guesswork.
 
 | Phase | Content | Rough size | Ships something? |
 |---|---|---|---|
-| **0** | A — spatial index, all three backends, tests + bench | ~400 | no |
+| **0** | A — spatial index, all three backends, tests + bench | ~400 | no — **done** |
 | **1** | B — class visibility: state, shader cull, all filter sites, `ClassOp` mask, Classes window UI | ~500 | **yes, standalone** |
 | **2a** | C — polyline model: f64, layers, mutability, undo, Salome writer | ~250 | marginally |
 | **2b** | C — GeoPackage read + write, EPSG detection, differential tests | ~1400 | **yes — overlay any GPKG** |

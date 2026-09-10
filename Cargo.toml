@@ -16,3 +16,13 @@ rfd = "0.15"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 env_logger = "0.11"
 log = "0.4"
+
+[dev-dependencies]
+criterion = "0.7"
+
+# Phase 0 of docs/vectorisation-plan.md: the spatial index is the one part
+# whose performance cannot be predicted by reading the code, so it is built
+# with a bench rather than benched afterwards.
+[[bench]]
+name = "spatial"
+harness = false

@@ -20,6 +20,7 @@ const LOOK_SPEED: f32 = 0.5;
 const CORRIDOR_POINT_LIMIT: i64 = 60_000_000;
 
 mod raw_miniquad;
+mod spatial;
 mod polylines;
 mod gcp;
 mod classify;
