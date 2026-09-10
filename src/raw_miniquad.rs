@@ -12,7 +12,7 @@
 
     use crate::ColorMode;
     use crate::classify::{ClassEdits, ClassMask, effective_class};
-    use crate::spatial::{Hit, RayHit, SpatialGrid, percentile_by_z};
+    use crate::spatial::{RayHit, SpatialGrid};
 
     const CHUNK_SIZE: f32 = 50.0;
 
@@ -784,11 +784,22 @@
             self.index.nearest_ray(&self.positions, origin, dir, max_dist, self.snap_filter())
         }
 
-        /// The `pct`-th percentile of Z within `r` metres of a viewer-space XY
-        /// position, and the point realising it.
+        /// Append every visible point within `r` metres of a viewer-space XY
+        /// position as `(z, position)`, for a percentile taken across backends.
+        ///
+        /// Candidates rather than an answer, deliberately: a percentile over a
+        /// union is not the union of percentiles, so the pooling has to happen
+        /// before the rank is taken. A snap radius straddling two tiles, or a
+        /// stage and a COPC file loaded together, is the normal case.
         #[allow(dead_code)]
-        pub fn snap_percentile_z(&self, x: f32, y: f32, r: f32, pct: f32) -> Option<Hit> {
-            self.index.percentile_in_radius(&self.positions, x, y, r, pct, self.snap_filter())
+        pub fn snap_z_candidates(&self, x: f32, y: f32, r: f32, out: &mut Vec<(f32, [f32; 3])>) {
+            if !self.index.circle_overlaps(x, y, r) { return; }
+            let mut buf = Vec::new();
+            self.index.points_in_radius(&self.positions, x, y, r, self.snap_filter(), &mut buf);
+            out.extend(buf.iter().map(|&i| {
+                let p = self.positions[i as usize];
+                (p[2], p)
+            }));
         }
 
         /// Every visible point within `r` metres of a viewer-space XY position,
@@ -1273,38 +1284,29 @@
             best
         }
 
-        /// The `pct`-th percentile of Z within `r` metres of a viewer-space XY
-        /// position, across every loaded tile. Returns `(tile index, point
-        /// index, z)`.
-        ///
-        /// Candidates from all tiles are pooled before the rank is taken. A
-        /// percentile of a union is not the union of percentiles, and a snap
-        /// radius straddling a tile edge is the normal case, not an edge case.
+        /// Append every visible point within `r` metres of a viewer-space XY
+        /// position as `(z, position)`. See `Stage::snap_z_candidates`.
         #[allow(dead_code)]
-        pub fn snap_percentile_z(
-            &self,
-            x: f32, y: f32, r: f32, pct: f32,
-        ) -> Option<(usize, u32, f32)> {
-            let mut samples: Vec<(f32, (usize, u32))> = Vec::new();
-            let mut cands: Vec<u32> = Vec::new();
-            for (tile_idx, loaded) in self.loaded.iter().enumerate() {
-                let Some(lt) = loaded else { continue };
-                if !lt.index.circle_overlaps(x, y, r) { continue; }
-                cands.clear();
+        pub fn snap_z_candidates(&self, x: f32, y: f32, r: f32, out: &mut Vec<(f32, [f32; 3])>) {
+            let mut buf: Vec<u32> = Vec::new();
+            for loaded in self.loaded.iter().flatten() {
+                if !loaded.index.circle_overlaps(x, y, r) { continue; }
+                buf.clear();
                 let z_clip = self.z_clip;
                 let class_vis = self.class_vis;
-                let positions = &lt.positions;
-                let points = &lt.cloud.points;
-                lt.index.points_in_radius(
+                let positions = &loaded.positions;
+                let points = &loaded.cloud.points;
+                loaded.index.points_in_radius(
                     positions, x, y, r,
                     move |i: u32| z_clip.contains(positions[i as usize][2])
                         && class_vis.contains(effective_class(&points[i as usize])),
-                    &mut cands,
+                    &mut buf,
                 );
-                samples.extend(cands.iter().map(|&i| (lt.positions[i as usize][2], (tile_idx, i))));
+                out.extend(buf.iter().map(|&i| {
+                    let p = loaded.positions[i as usize];
+                    (p[2], p)
+                }));
             }
-            let (z, (tile_idx, i)) = percentile_by_z(&mut samples, pct)?;
-            Some((tile_idx, i, z))
         }
 
         /// Append every resident point inside the XY box and Z band, in
@@ -2529,23 +2531,18 @@
             best
         }
 
-        /// The `pct`-th percentile of Z within `r` metres of a viewer-space XY
-        /// position, pooled over every resident node. Returns the viewer-space
-        /// position of the point realising it and the LAS point itself.
+        /// Append every visible point within `r` metres of a viewer-space XY
+        /// position as `(z, position)`. See `Stage::snap_z_candidates`.
         ///
-        /// Read [`CopcStage::lod_spacing_near`] before trusting this: at a
-        /// coarse LOD the pool is a thinned sample and the answer is quietly
-        /// wrong by decimetres.
+        /// Read [`CopcStage::lod_spacing_near`] before ranking these: at a
+        /// coarse LOD they are a thinned sample and any percentile over them is
+        /// quietly wrong by decimetres.
         #[allow(dead_code)]
-        pub fn snap_percentile_z(
-            &self,
-            x: f32, y: f32, r: f32, pct: f32,
-        ) -> Option<([f32; 3], &Point)> {
-            let mut samples: Vec<(f32, ([f32; 3], &Point))> = Vec::new();
-            let mut cands: Vec<u32> = Vec::new();
+        pub fn snap_z_candidates(&self, x: f32, y: f32, r: f32, out: &mut Vec<(f32, [f32; 3])>) {
+            let mut buf: Vec<u32> = Vec::new();
             for node in self.loaded_nodes.values() {
                 if !node.index.circle_overlaps(x, y, r) { continue; }
-                cands.clear();
+                buf.clear();
                 let z_clip = self.z_clip;
                 let class_vis = self.class_vis;
                 let positions = &node.positions;
@@ -2554,15 +2551,13 @@
                     positions, x, y, r,
                     move |i: u32| z_clip.contains(positions[i as usize][2])
                         && class_vis.contains(effective_class(&points[i as usize])),
-                    &mut cands,
+                    &mut buf,
                 );
-                samples.extend(cands.iter().map(|&i| {
-                    let pos = node.positions[i as usize];
-                    (pos[2], (pos, &node.points[i as usize]))
+                out.extend(buf.iter().map(|&i| {
+                    let p = node.positions[i as usize];
+                    (p[2], p)
                 }));
             }
-            let (_, hit) = percentile_by_z(&mut samples, pct)?;
-            Some(hit)
         }
 
         /// Point spacing, in metres, of the finest resident node near a

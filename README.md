@@ -261,14 +261,54 @@ before whatever the other program last wrote. Close the file there, or run
 ## Vectorisation
 
 Press `P` or use **Digitise** in the classification panel to draw polylines
-straight onto the cloud. Click to place a vertex, and it lands on the point
-under the cursor — not on a guessed plane, so the elevation is measured rather
-than invented. Shift-click places one freely instead, at the previous vertex's
-height, which is what lets you draw across a gap in the data.
+straight onto the cloud. Click to place a vertex and it is *snapped* onto real
+data — the elevation is measured, not invented. Shift-click places one freely
+instead, at the previous vertex's height, which is what lets you draw across a
+gap in the data.
 
 `Backspace` removes the last vertex, `Enter` finishes the line, `Esc` discards
 it and a second `Esc` leaves digitising. The panel shows the running vertex
 count, total length, and the last segment's length, ΔZ and slope.
+
+### Snapping
+
+`N` cycles the snap mode; **Ctrl + mouse wheel** changes the radius (the plain
+wheel keeps zooming). The radius is an absolute distance in metres, default
+**0.2 m** — absolute rather than zoom-relative because a metre means the same
+thing at every zoom level, which is what makes a snap reproducible.
+
+| Mode | What it takes | Good for |
+|------|---------------|----------|
+| **Nearest point** | The nearest real point to the cursor ray | General tracing; works from any camera angle |
+| **Low Z** | A low percentile of Z within the radius | Gutters, ditch invert, toe of slope |
+| **High Z** | A high percentile of Z within the radius | Kerb top, crest, cable, roof ridge |
+| **Same Z as previous** | The cursor's XY at the previous vertex's height | Contours, breaklines |
+| **Existing polyline** | The nearest vertex or segment of a drawn line | Closing loops, tying into neighbours |
+
+Percentiles rather than the raw minimum and maximum, because a raw extreme on
+LiDAR is usually one stray return — a single low point puts a ditch invert 30 cm
+under the ground. The default is the **5th** and **95th** percentile, both
+adjustable; setting one to 0 or 100 gives the raw behaviour back.
+
+**Class visibility is what makes this precise.** Every snap query honours the
+height band and the hidden classes, so hiding everything but ground makes "low
+Z in radius" mean the ground, and showing only class 6 makes it mean the
+building. See [Class visibility](#class-visibility).
+
+The marker under the cursor is a cross with a circle at the snap radius, drawn
+at the **snapped** height, so you can see what the percentile is being taken
+over. It turns orange and the click is refused when the snap cannot be trusted:
+
+- **nothing within the radius** — widen it, or Shift-click;
+- **the point spacing is wider than the radius** (COPC, zoomed out) — the
+  resident data is a thinned sample of the file, so a percentile over it would
+  be wrong by decimetres with nothing looking wrong. Zoom in, or widen the
+  radius.
+
+A snap never silently falls back to something you did not ask for. While
+digitising on a COPC file, haiviz also force-loads the octree nodes in a 20 m
+box around the cursor, so there is full-resolution data to snap to; if that box
+would pull in more than 5 million points it is skipped and the panel says so.
 
 **Digitising works from any camera angle**, unlike the plan-view lassos, which
 insist on a top view. That is not an oversight: a lasso drawn obliquely is
@@ -489,8 +529,10 @@ If no `classes.txt` is present, built-in default labels and colours are used.
 
 | Input | Action |
 |-------|--------|
-| Left-click | Place a vertex on the point under the cursor |
+| Left-click | Place a vertex, snapped to the data |
 | Shift + left-click | Place a vertex freely, at the previous vertex's height |
+| `N` | Cycle the snap mode |
+| Ctrl + mouse wheel | Change the snap radius |
 | `Backspace` | Remove the last vertex |
 | `Enter` | Finish the line and save |
 | `Esc` | Discard the line; again to leave digitising |

@@ -1,6 +1,6 @@
 # Manual vectorisation in HaiViz — implementation plan
 
-Status: **phases 0–3 implemented; 4–6 are still plan only.**
+Status: **phases 0–4 implemented; 5 and 6 are still plan only.**
 Written 2026-09-10.
 
 Paths below are relative to the workspace root (`haicloudrs/`).
@@ -578,6 +578,31 @@ Class visibility is what makes this precise: hide everything but ground and
 "lowest Z in radius" means the ground. Hide ground and show class 6 and it means
 the building.
 
+### Status: built (4)
+
+`SnapMode`, `SnapQuality` and `SnapHit` in `vectorise.rs`; `resolve_snap` and
+`cursor_ray` in `main.rs`, where the backends are. `N` cycles the mode,
+Ctrl + wheel sets the radius, and the marker is a cross with the radius circle
+drawn at the *snapped* Z so the operator can see what a percentile covers.
+
+The percentile modes need an XY to work from, and it comes from the **ray hit**
+rather than from a fixed plane. That is what makes "5th percentile within
+0.2 m" mean the same thing from an oblique view as from directly above.
+
+Both COPC mitigations are live: `lod_spacing_near` refuses the aggregate modes
+when the resident spacing exceeds the radius — but not `Nearest`, since a real
+point is a real point at any LOD — and `pin_neighbourhood` force-loads a 20 m
+box around the cursor, released on leaving the mode and skipped while a section
+corridor owns the pin set.
+
+**One phase-0 API turned out to be the wrong shape.** The per-backend
+`snap_percentile_z` wrappers each ranked their own points, which is exactly the
+"a percentile over a union is not the union of percentiles" mistake their own
+doc comment warned about — a snap radius straddling two tiles, or a stage and a
+COPC file loaded together, would have been quietly wrong. They are replaced by
+`snap_z_candidates`, which appends raw candidates so `resolve_snap` pools them
+and ranks once. `pick_world_point` from phase 3 is gone, superseded as planned.
+
 ## 10. Work package F — edge following
 
 Livewire / intelligent scissors, adapted to point clouds. **3D / oblique view
@@ -634,7 +659,7 @@ what the tracer sees, tuning channel weights is guesswork.
 | **2a** | C — polyline model: f64, layers, mutability, undo, Salome writer | ~250 | marginally — **done** |
 | **2b** | C — GeoPackage read + write, EPSG detection, differential tests | ~1400 | **yes — overlay any GPKG — done** |
 | **3** | D — digitising mode, free vertex placement, panel wiring | ~450 | yes — **done** |
-| **4** | E — snapping, radius control, feedback, COPC guard + pinning | ~450 | yes, the core tool |
+| **4** | E — snapping, radius control, feedback, COPC guard + pinning | ~450 | yes, the core tool — **done** |
 | **5** | F — edge following, cost channels, livewire, heatmap | ~600 | yes |
 | **6** | G — vertex editing, section-view digitising, re-drape | ~400 | yes |
 

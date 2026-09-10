@@ -834,6 +834,51 @@ pub fn pick_vertex(
     result
 }
 
+/// The nearest point on any visible polyline to `p`, in world space, within
+/// `r` metres.
+///
+/// Vertices win ties against segments at the same distance, so tying into the
+/// end of an existing line lands exactly on its endpoint rather than a
+/// millimetre along it — which is the difference between a closed network and
+/// one with hairline gaps in it.
+pub fn nearest_on_lines(
+    files: &[PolylineFile],
+    p: [f64; 3],
+    r: f64,
+) -> Option<([f64; 3], PolyRef)> {
+    let mut best: Option<(f64, [f64; 3], PolyRef)> = None;
+    let mut consider = |d: f64, at: [f64; 3], who: PolyRef| {
+        if d <= r && best.as_ref().is_none_or(|(bd, _, _)| d < *bd) {
+            best = Some((d, at, who));
+        }
+    };
+
+    for (at, pl) in visible_lines(files) {
+        for v in pl.points() {
+            consider(dist3(*v, p), *v, at);
+        }
+        // Segments are offered at a hair more than their true distance, so an
+        // endpoint at the same place always wins.
+        for (i, j) in pl.segments() {
+            let (a, b) = (pl.points()[i], pl.points()[j]);
+            let (proj, d) = closest_on_segment(a, b, p);
+            consider(d * (1.0 + 1e-9) + 1e-9, proj, at);
+        }
+    }
+    best.map(|(_, at, who)| (at, who))
+}
+
+/// Closest point on segment `a`–`b` to `p`, and its distance.
+fn closest_on_segment(a: [f64; 3], b: [f64; 3], p: [f64; 3]) -> ([f64; 3], f64) {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    if len2 <= 0.0 { return (a, dist3(a, p)); }
+    let t = (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1] + (p[2] - a[2]) * d[2]) / len2)
+        .clamp(0.0, 1.0);
+    let q = [a[0] + t * d[0], a[1] + t * d[1], a[2] + t * d[2]];
+    (q, dist3(q, p))
+}
+
 fn project(vp: &glam::Mat4, p: [f32; 3], sw: f32, sh: f32) -> (f32, f32) {
     let clip = *vp * glam::Vec4::new(p[0], p[1], p[2], 1.0);
     if clip.w.abs() < 1e-6 { return (-1e9, -1e9); }
@@ -1146,6 +1191,34 @@ mod tests {
         let losses = pf.salome_losses();
         assert!(losses.iter().any(|l| l.contains("coordinate reference system")), "{losses:?}");
         assert!(losses.iter().any(|l| l.contains("names")), "{losses:?}");
+    }
+
+    #[test]
+    fn snapping_to_an_existing_line_prefers_its_vertices() {
+        let mut pf = PolylineFile::new(tmp("snap"), VectorFormat::Salome);
+        pf.layers.push(Layer::new("l"));
+        pf.refresh_view([0.0; 3]);
+        pf.add_line(0, Polyline::from_points("a", WHITE, vec![
+            [0.0, 0.0, 0.0], [10.0, 0.0, 0.0],
+        ]));
+        let files = vec![pf];
+
+        // Mid-segment: the projection onto the line.
+        let (at, _) = nearest_on_lines(&files, [5.0, 0.3, 0.0], 1.0).expect("in range");
+        assert_eq!(at, [5.0, 0.0, 0.0]);
+
+        // Near an endpoint the vertex wins, so tying two lines together closes
+        // exactly rather than leaving a hairline gap.
+        let (at, _) = nearest_on_lines(&files, [10.05, 0.02, 0.0], 1.0).expect("in range");
+        assert_eq!(at, [10.0, 0.0, 0.0]);
+
+        // Out of range is nothing, not the nearest thing anyway.
+        assert!(nearest_on_lines(&files, [5.0, 50.0, 0.0], 1.0).is_none());
+
+        // A hidden layer is not snappable, same as it is not pickable.
+        let mut files = files;
+        files[0].layers[0].visible = false;
+        assert!(nearest_on_lines(&files, [5.0, 0.3, 0.0], 1.0).is_none());
     }
 
     #[test]

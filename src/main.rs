@@ -20,6 +20,11 @@ const LOOK_SPEED: f32 = 0.5;
 /// memory at once.
 const CORRIDOR_POINT_LIMIT: i64 = 60_000_000;
 
+/// Side of the box of COPC nodes pinned around the cursor while digitising,
+/// in metres. Widened to four snap radii when the radius is large enough to
+/// need it, so the pinned neighbourhood always covers what a snap can reach.
+const SNAP_NEIGHBOURHOOD_M: f64 = 20.0;
+
 mod raw_miniquad;
 mod spatial;
 mod polylines;
@@ -381,57 +386,148 @@ fn cloud_source_path(
         .and_then(|t| Path::new(&t.filepath).parent().map(|p| p.join("tiles").to_string_lossy().into_owned()))
 }
 
-/// The world-space point nearest the cursor in screen space, across whichever
-/// backends are loaded.
+/// The cursor as a ray in viewer space.
 ///
-/// Screen-space nearest is the rule Measure and Point Info already use, so a
-/// digitised vertex lands where the operator would expect a pick to. The three
-/// backends return different things, so each one's own answer is re-projected
-/// here to compare them on the same footing — a single-file stage and a COPC
-/// stage can both be loaded at once.
-fn pick_world_point(
+/// Under an orthographic camera the near plane sits far behind the data, so
+/// every point in front of the camera has a positive distance along this ray —
+/// which is what lets `nearest_ray` reject everything behind the operator.
+fn cursor_ray(view_proj: &glam::Mat4, mx: f32, my: f32) -> ([f32; 3], [f32; 3]) {
+    let inv = view_proj.inverse();
+    let ndc_x = mx / screen_width() * 2.0 - 1.0;
+    let ndc_y = 1.0 - my / screen_height() * 2.0;
+    let unproject = |z: f32| {
+        let p = inv * glam::Vec4::new(ndc_x, ndc_y, z, 1.0);
+        glam::Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w)
+    };
+    let near = unproject(-1.0);
+    let dir = (unproject(1.0) - near).normalize_or_zero();
+    ([near.x, near.y, near.z], [dir.x, dir.y, dir.z])
+}
+
+/// Resolve the vertex under the cursor for the active snap mode.
+///
+/// The percentile and same-Z modes need an XY to work from, and it comes from
+/// the ray hit rather than from a fixed plane: that is what makes them mean
+/// "within 0.2 m of the surface I am pointing at" from an oblique view as well
+/// as from directly above.
+#[allow(clippy::too_many_arguments)]
+fn resolve_snap(
     stages: &[Stage],
     copc_stages: &[CopcStage],
     tile_mgr: &Option<TileStageManager>,
+    poly_files: &[polylines::PolylineFile],
     view_proj: &glam::Mat4,
     mx: f32,
     my: f32,
-) -> Option<[f64; 3]> {
-    let (sw, sh) = (screen_width(), screen_height());
-    let ndc_x = mx / sw * 2.0 - 1.0;
-    let ndc_y = 1.0 - my / sh * 2.0;
-    let ndc_dist = |v: glam::Vec3| {
-        let p = *view_proj * glam::Vec4::new(v.x, v.y, v.z, 1.0);
-        let (px, py) = (p.x / p.w, p.y / p.w);
-        (px - ndc_x) * (px - ndc_x) + (py - ndc_y) * (py - ndc_y)
+    data_offset: [f64; 3],
+    dig: &vectorise::Digitise,
+) -> vectorise::SnapHit {
+    use vectorise::{SnapHit, SnapMode, SnapQuality};
+    let to_world = |v: [f32; 3]| [
+        v[0] as f64 + data_offset[0],
+        v[1] as f64 + data_offset[1],
+        v[2] as f64 + data_offset[2],
+    ];
+    let empty = |note: &str| SnapHit {
+        world: [0.0; 3], quality: SnapQuality::Empty, note: Some(note.to_string()),
     };
 
-    let mut best: Option<(f32, [f64; 3])> = None;
-    let mut consider = |d: f32, w: [f64; 3]| {
-        if best.as_ref().is_none_or(|(bd, _)| d < *bd) { best = Some((d, w)); }
-    };
+    let (origin, dir) = cursor_ray(view_proj, mx, my);
+    let r = dig.radius;
 
-    for s in stages {
-        if !s.visible { continue; }
-        if let Some(i) = s.find_nearest_point(view_proj, mx, my, sw, sh) {
-            let p = &s.cloud.points[i];
-            consider(ndc_dist(glam::Vec3::from(s.positions[i])), [p.x, p.y, p.z]);
-        }
+    // Where on the surface the cursor is pointing. Every mode except
+    // `Existing` starts from this.
+    let mut anchor: Option<[f32; 3]> = None;
+    let mut best_t = f32::INFINITY;
+    for st in stages {
+        if !st.visible { continue; }
+        if let Some(h) = st.snap_nearest_ray(origin, dir, r)
+            && h.t < best_t { best_t = h.t; anchor = Some(h.pos); }
     }
     for cs in copc_stages {
         if !cs.visible { continue; }
-        if let Some((p, vpos, dist)) = cs.find_nearest_point(view_proj, mx, my, sw, sh) {
-            consider(dist, [p.x, p.y, p.z]);
-            let _ = vpos;
-        }
+        if let Some((h, _)) = cs.snap_nearest_ray(origin, dir, r)
+            && h.t < best_t { best_t = h.t; anchor = Some(h.pos); }
     }
     if let Some(mgr) = tile_mgr
-        && let Some((ti, i)) = mgr.find_nearest_point(view_proj, mx, my, sw, sh)
-        && let Some(lt) = mgr.loaded[ti].as_ref() {
-        let p = &lt.cloud.points[i];
-        consider(ndc_dist(glam::Vec3::from(lt.positions[i])), [p.x, p.y, p.z]);
+        && let Some((_, h)) = mgr.snap_nearest_ray(origin, dir, r)
+        && h.t < best_t { anchor = Some(h.pos); }
+
+    if dig.snap_mode == SnapMode::Existing {
+        // Anchor on the cloud if there is one, so the search is around the
+        // surface; otherwise use the ray at the height band's middle.
+        let probe = match anchor {
+            Some(a) => to_world(a),
+            None => {
+                let z = origin[2] + dir[2] * 0.0;
+                to_world([origin[0], origin[1], z])
+            }
+        };
+        return match polylines::nearest_on_lines(poly_files, probe, r as f64) {
+            Some((w, _)) => SnapHit::good(w),
+            None => empty("No polyline within the snap radius."),
+        };
     }
-    best.map(|(_, w)| w)
+
+    let Some(anchor) = anchor else {
+        return empty("Nothing within the snap radius. Widen it with Ctrl + wheel,                       or Shift-click to place a vertex freely.");
+    };
+
+    // The COPC spacing guard. Zoomed out the resident set is a thinned sample,
+    // so a percentile taken here would be over whatever subset happened to be
+    // loaded and wrong by decimetres with nothing looking wrong. Refuse rather
+    // than guess — and only for the modes that actually aggregate, since the
+    // nearest point is a real point at any LOD.
+    if matches!(dig.snap_mode, SnapMode::LowZ | SnapMode::HighZ) {
+        for cs in copc_stages {
+            if !cs.visible { continue; }
+            if let Some(spacing) = cs.lod_spacing_near(anchor[0], anchor[1], r)
+                && spacing > r as f64 {
+                return SnapHit {
+                    world: to_world(anchor),
+                    quality: SnapQuality::Coarse,
+                    note: Some(format!(
+                        "Point spacing here is {spacing:.2} m, wider than the {r:.2} m                          snap radius — a percentile would be taken over whatever the                          LOD happened to load. Zoom in, or widen the radius.",
+                    )),
+                };
+            }
+        }
+    }
+
+    match dig.snap_mode {
+        SnapMode::Nearest => SnapHit::good(to_world(anchor)),
+        SnapMode::SameZ => match dig.last() {
+            // The XY the operator pointed at, the Z they already committed to.
+            Some(prev) => SnapHit::good([
+                anchor[0] as f64 + data_offset[0],
+                anchor[1] as f64 + data_offset[1],
+                prev[2],
+            ]),
+            None => SnapHit::good(to_world(anchor)),
+        },
+        SnapMode::LowZ | SnapMode::HighZ => {
+            let pct = if dig.snap_mode == SnapMode::LowZ { dig.low_pct } else { dig.high_pct };
+            // Candidates are pooled across every backend before the rank is
+            // taken: a percentile over a union is not the union of
+            // percentiles, and a snap radius straddling a tile edge is the
+            // normal case.
+            let mut zs: Vec<(f32, [f32; 3])> = Vec::new();
+            for st in stages {
+                if st.visible { st.snap_z_candidates(anchor[0], anchor[1], r, &mut zs); }
+            }
+            for cs in copc_stages {
+                if cs.visible { cs.snap_z_candidates(anchor[0], anchor[1], r, &mut zs); }
+            }
+            if let Some(mgr) = tile_mgr {
+                mgr.snap_z_candidates(anchor[0], anchor[1], r, &mut zs);
+            }
+            match crate::spatial::percentile_by_z(&mut zs, pct) {
+                Some((_, p)) => SnapHit::good(to_world(p)),
+                None => empty("Nothing within the snap radius."),
+            }
+        }
+        SnapMode::Existing => unreachable!("handled above"),
+    }
 }
 
 /// Project a world position to screen coordinates.
@@ -563,6 +659,9 @@ fn draw_3d_overlays(
     digitise_cursor: Option<[f64; 3]>,
 ) {
     vectorise::draw_3d(digitise, data_offset, digitise_cursor, app_mode == AppMode::Digitise);
+    if app_mode == AppMode::Digitise {
+        vectorise::draw_snap_marker(digitise, data_offset);
+    }
     if !ground_lasso.is_empty() {
         let pts: Vec<Vec3> = ground_lasso.iter().map(|v| vec3(v.x, v.y, mid_z)).collect();
         for w in pts.windows(2) {
@@ -2047,6 +2146,9 @@ async fn main() {
     // Set by the panel or by `P`, acted on once below rather than in each of
     // the three per-mode blocks.
     let mut digitise_request: Option<vectorise::Request> = None;
+    // Whether the COPC neighbourhood pins are currently held for digitising,
+    // so leaving the mode releases them and the LOD is free to evict again.
+    let mut digitise_pinned = false;
     let mut pending_salome: Option<(usize, String, Vec<String>)> = None;
     let mut poly_load_error: Option<String> = None;
 
@@ -3165,6 +3267,24 @@ async fn main() {
         // ---- Digitising ----
         // `P` starts and cancels, mirroring how `G` and `V` toggle the lassos.
         // Unlike them it does not require a top view: see `AppMode::Digitise`.
+        if app_mode == AppMode::Digitise && !egui_wants_keyboard_prev {
+            if is_key_pressed(KeyCode::N) {
+                digitise.snap_mode = digitise.snap_mode.next();
+                digitise.status = Some(format!("Snap: {}", digitise.snap_mode.label()));
+            }
+            // Modifier + wheel, so the plain wheel keeps zooming. A deliberate
+            // divergence from `SectionAdjustDepth`, which takes the plain
+            // wheel — this is a tool the operator sits in for minutes at a
+            // time, and losing zoom for that whole time would be worse.
+            let wheel = mouse_wheel().1;
+            if wheel != 0.0 && (is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl)) {
+                let step = if wheel > 0.0 { 1.25 } else { 1.0 / 1.25 };
+                digitise.radius = (digitise.radius * step)
+                    .clamp(vectorise::MIN_SNAP_RADIUS, vectorise::MAX_SNAP_RADIUS);
+                digitise.status = Some(format!("Snap radius {:.2} m", digitise.radius));
+            }
+        }
+
         if is_key_pressed(KeyCode::P) && !egui_wants_keyboard_prev {
             match app_mode {
                 AppMode::View3D | AppMode::PointPick => digitise_request = Some(vectorise::Request::Start),
@@ -3307,7 +3427,7 @@ async fn main() {
         if app_mode == AppMode::Digitise {
             if !egui_wants_pointer_prev && is_mouse_button_pressed(MouseButton::Left) {
                 let free = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
-                let placed = if free {
+                if free {
                     // Free placement: the cursor ray meets a horizontal plane
                     // through the previous vertex. The only well-defined answer
                     // when the operator has said they do not want the data to
@@ -3316,20 +3436,29 @@ async fn main() {
                     let z_view = digitise.last()
                         .map(|p| (p[2] - data_offset[2]) as f32)
                         .unwrap_or(mid_z);
-                    screen_to_world_xy(mx, my, &view_proj, z_view).map(|(wx, wy)| [
-                        wx as f64 + data_offset[0],
-                        wy as f64 + data_offset[1],
-                        z_view as f64 + data_offset[2],
-                    ])
+                    if let Some((wx, wy)) = screen_to_world_xy(mx, my, &view_proj, z_view) {
+                        digitise.push([
+                            wx as f64 + data_offset[0],
+                            wy as f64 + data_offset[1],
+                            z_view as f64 + data_offset[2],
+                        ]);
+                        digitise.status = None;
+                    }
                 } else {
-                    pick_world_point(&stages, &copc_stages, &tile_mgr, &view_proj, mx, my)
-                };
-                match placed {
-                    Some(v) => { digitise.push(v); digitise.status = None; }
-                    None => digitise.status = Some(
-                        "Nothing under the cursor to place a vertex on. \
-                         Shift-click to place one freely.".to_string(),
-                    ),
+                    // Whatever the marker is showing is what gets placed —
+                    // including the refusals, which is why a coarse or empty
+                    // snap reports rather than silently falling back to
+                    // something the operator did not ask for.
+                    let hit = resolve_snap(
+                        &stages, &copc_stages, &tile_mgr, &poly_files,
+                        &view_proj, mx, my, data_offset, &digitise,
+                    );
+                    if hit.is_placeable() {
+                        digitise.push(hit.world);
+                        digitise.status = None;
+                    } else {
+                        digitise.status = hit.note.clone();
+                    }
                 }
             }
             if !egui_wants_keyboard_prev {
@@ -3345,11 +3474,51 @@ async fn main() {
         // the resident points, not something to spend on every frame of
         // ordinary navigation.
         let have_cloud = !stages.is_empty() || !copc_stages.is_empty() || tile_mgr.is_some();
-        let digitise_cursor = if app_mode == AppMode::Digitise && digitise.is_drawing() {
-            pick_world_point(&stages, &copc_stages, &tile_mgr, &view_proj, mx, my)
+        digitise.hover = if app_mode == AppMode::Digitise && !egui_wants_pointer_prev {
+            Some(resolve_snap(
+                &stages, &copc_stages, &tile_mgr, &poly_files,
+                &view_proj, mx, my, data_offset, &digitise,
+            ))
         } else {
             None
         };
+        // The rubber band follows a placeable snap only, so it never draws to
+        // somewhere a click would refuse to go.
+        let digitise_cursor = digitise.hover.as_ref()
+            .filter(|h| h.is_placeable())
+            .map(|h| h.world);
+
+        // ---- COPC neighbourhood pinning ----
+        // The spacing guard alone would only ever say "no". This is the other
+        // half: force-load the octree nodes around the cursor so there is
+        // full-resolution data to snap to in the first place. Skipped while a
+        // section corridor owns the pins — the two use the same set, and the
+        // corridor is the one the operator is waiting on.
+        if app_mode == AppMode::Digitise && !copc_stages.is_empty() && !corridor_pinned {
+            let centre = digitise.hover.as_ref()
+                .map(|h| ((h.world[0] - data_offset[0]) as f32, (h.world[1] - data_offset[1]) as f32))
+                .or(cursor_world);
+            if let Some((cx, cy)) = centre {
+                let half = (4.0 * digitise.radius as f64).max(SNAP_NEIGHBOURHOOD_M) / 2.0;
+                let mut refused = 0i64;
+                for cs in copc_stages.iter_mut() {
+                    let (n, pts) = cs.pin_neighbourhood(cx, cy, half);
+                    if n == 0 && pts > 0 { refused = refused.max(pts); }
+                }
+                digitise_pinned = true;
+                if refused > 0 {
+                    digitise.status = Some(format!(
+                        "Neighbourhood holds {:.1}M points (limit {:.0}M) — not pinned; \
+                         snapping uses whatever the LOD loaded.",
+                        refused as f64 / 1e6,
+                        crate::raw_miniquad::SNAP_PIN_POINT_LIMIT as f64 / 1e6,
+                    ));
+                }
+            }
+        } else if digitise_pinned {
+            for cs in copc_stages.iter_mut() { cs.clear_pins(); }
+            digitise_pinned = false;
+        }
 
         // Measure markers and the section preview are drawn per-render-block,
         // after the cloud has been composited. See `draw_3d_overlays`.

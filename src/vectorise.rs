@@ -6,15 +6,19 @@
 //!
 //! ## Where a vertex comes from
 //!
-//! This phase places vertices on real points: the click resolves through the
-//! same screen-space pick that Measure and Point Info use, so a vertex is
-//! always something the cloud actually contains. Shift-click places one freely
-//! instead, on a horizontal plane through the previous vertex — the only
-//! well-defined answer when the operator explicitly does not want the data to
-//! decide.
+//! A vertex is pulled onto real data by a [`SnapMode`], within an absolute
+//! radius in metres — see [`DEFAULT_SNAP_RADIUS`] for why absolute. Every snap
+//! query runs through the spatial index with a filter that applies the height
+//! band *and* class visibility inside the grid walk, which is what makes class
+//! visibility the primary control over what you snap to: hide everything but
+//! ground and "lowest Z in radius" means the ground.
 //!
-//! Snap modes, the radius, and the COPC spacing guard arrive in the next
-//! phase and replace `place_from_pick` without changing anything else here.
+//! Shift-click places a vertex freely instead, on a horizontal plane through
+//! the previous one — the only well-defined answer when the operator has said
+//! the data should not decide, and what makes drawing across a gap possible.
+//!
+//! A snap never silently degrades. It is [`SnapQuality::Good`] and placeable,
+//! or it is refused and says why.
 //!
 //! ## Where a line goes
 //!
@@ -31,8 +35,8 @@
 //! currently being drawn, which is a far better trade than journalling
 //! in-progress geometry.
 
-// Phases 4-6 fill in snapping, edge following and vertex editing against this
-// same state; a few accessors here are theirs.
+// Edge following (phase 5) and vertex editing (phase 6) build on this same
+// state; a few accessors here are theirs.
 #![allow(dead_code)]
 
 use macroquad::prelude::*;
@@ -42,6 +46,90 @@ use crate::polylines::{Layer, Polyline, PolylineFile, VectorFormat};
 
 /// The sidecar a new layer lands in, beside the cloud it was drawn on.
 const VECTOR_SIDECAR_SUFFIX: &str = ".haiviz-vectors.gpkg";
+
+/// Default snap radius, in metres.
+///
+/// Absolute rather than zoom-relative: a metre means the same thing at every
+/// zoom level, which is what makes a snap reproducible. A zoom-relative radius
+/// would quietly change what a click meant every time the camera moved.
+pub const DEFAULT_SNAP_RADIUS: f32 = 0.2;
+pub const MIN_SNAP_RADIUS: f32 = 0.02;
+pub const MAX_SNAP_RADIUS: f32 = 5.0;
+
+/// What a vertex is pulled onto.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SnapMode {
+    /// The nearest real point to the cursor ray. True 3D, so it works from any
+    /// camera angle rather than only from directly above.
+    Nearest,
+    /// A low percentile of Z within the radius: gutters, ditch invert, toe of
+    /// slope. Percentile rather than the raw minimum because a raw minimum on
+    /// LiDAR is usually one stray low return.
+    LowZ,
+    /// A high percentile of Z within the radius: kerb top, crest, cable, roof
+    /// ridge.
+    HighZ,
+    /// The previous vertex's height, at the cursor's XY. Contours and
+    /// breaklines, where the elevation is the thing being held constant.
+    SameZ,
+    /// A vertex or segment of an existing polyline, for closing loops and
+    /// tying into neighbouring lines.
+    Existing,
+}
+
+impl SnapMode {
+    pub const ALL: [SnapMode; 5] =
+        [SnapMode::Nearest, SnapMode::LowZ, SnapMode::HighZ, SnapMode::SameZ, SnapMode::Existing];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SnapMode::Nearest => "Nearest point",
+            SnapMode::LowZ => "Low Z (percentile)",
+            SnapMode::HighZ => "High Z (percentile)",
+            SnapMode::SameZ => "Same Z as previous",
+            SnapMode::Existing => "Existing polyline",
+        }
+    }
+
+    pub fn next(&self) -> SnapMode {
+        let i = SnapMode::ALL.iter().position(|m| m == self).unwrap_or(0);
+        SnapMode::ALL[(i + 1) % SnapMode::ALL.len()]
+    }
+}
+
+/// How much to trust a snap.
+///
+/// There is deliberately no "fell back to something else" state. A snap that
+/// silently degrades is worse than one that refuses: the operator would keep
+/// clicking and only find out at export that half the line came from a
+/// thinned LOD sample.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SnapQuality {
+    /// Full-resolution data under the cursor; the vertex is trustworthy.
+    Good,
+    /// The resident LOD is coarser than the snap radius, so a percentile here
+    /// would be taken over whatever sparse subset happened to be loaded. The
+    /// marker says so and the click is refused.
+    Coarse,
+    /// Nothing within the radius. Also refused.
+    Empty,
+}
+
+/// A candidate vertex under the cursor.
+#[derive(Clone, Debug)]
+pub struct SnapHit {
+    pub world: [f64; 3],
+    pub quality: SnapQuality,
+    /// Why, when the quality is not `Good`.
+    pub note: Option<String>,
+}
+
+impl SnapHit {
+    pub fn good(world: [f64; 3]) -> SnapHit {
+        SnapHit { world, quality: SnapQuality::Good, note: None }
+    }
+    pub fn is_placeable(&self) -> bool { self.quality == SnapQuality::Good }
+}
 
 /// What the panel is asking `main.rs` to do. Returned rather than acted on so
 /// this module never has to know about `AppMode`.
@@ -67,6 +155,16 @@ pub struct Digitise {
     pub code: String,
     pub color: Color,
     pub status: Option<String>,
+    pub snap_mode: SnapMode,
+    /// Snap radius in metres. See [`DEFAULT_SNAP_RADIUS`].
+    pub radius: f32,
+    /// Percentile for [`SnapMode::LowZ`] / [`SnapMode::HighZ`]. `0` and `100`
+    /// give the raw minimum and maximum back, which is the escape hatch when
+    /// the data really is clean.
+    pub low_pct: f32,
+    pub high_pct: f32,
+    /// The snap under the cursor this frame, for the marker and the readout.
+    pub hover: Option<SnapHit>,
     /// Vertices placed so far this session, for the readout.
     pub committed_lines: usize,
 }
@@ -80,6 +178,11 @@ impl Default for Digitise {
             code: String::new(),
             color: Color::new(1.0, 0.85, 0.2, 1.0),
             status: None,
+            snap_mode: SnapMode::Nearest,
+            radius: DEFAULT_SNAP_RADIUS,
+            low_pct: 5.0,
+            high_pct: 95.0,
+            hover: None,
             committed_lines: 0,
         }
     }
@@ -223,6 +326,44 @@ pub fn draw_3d(dig: &Digitise, origin: [f64; 3], cursor: Option<[f64; 3]>, drawi
     }
 }
 
+/// Draw the snap marker and the radius circle at the candidate vertex.
+///
+/// A cross, like `measure_a` / `measure_b`, so it reads the same way as the
+/// other precision tools. The circle sits at the *snapped* Z rather than at the
+/// cursor's, so what it encloses is what the percentile was taken over.
+pub fn draw_snap_marker(dig: &Digitise, origin: [f64; 3]) {
+    let Some(hit) = &dig.hover else { return };
+    let p = vec3(
+        (hit.world[0] - origin[0]) as f32,
+        (hit.world[1] - origin[1]) as f32,
+        (hit.world[2] - origin[2]) as f32,
+    );
+    let color = match hit.quality {
+        SnapQuality::Good => dig.color,
+        // Visibly different, not merely dimmer: a coarse snap is a refusal,
+        // and it must not read as "nearly fine".
+        SnapQuality::Coarse => Color::new(1.0, 0.4, 0.1, 1.0),
+        SnapQuality::Empty => Color::new(0.8, 0.2, 0.2, 0.8),
+    };
+
+    let arm = (dig.radius * 0.6).max(0.05);
+    draw_line_3d(p - vec3(arm, 0.0, 0.0), p + vec3(arm, 0.0, 0.0), color);
+    draw_line_3d(p - vec3(0.0, arm, 0.0), p + vec3(0.0, arm, 0.0), color);
+    draw_line_3d(p - vec3(0.0, 0.0, arm), p + vec3(0.0, 0.0, arm), color);
+
+    // The radius the query actually used, so the operator can see what a
+    // percentile is being taken over rather than having to imagine it.
+    const SEGMENTS: usize = 32;
+    let faint = Color::new(color.r, color.g, color.b, 0.45);
+    let mut prev = vec3(p.x + dig.radius, p.y, p.z);
+    for i in 1..=SEGMENTS {
+        let a = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+        let next = vec3(p.x + dig.radius * a.cos(), p.y + dig.radius * a.sin(), p.z);
+        draw_line_3d(prev, next, faint);
+        prev = next;
+    }
+}
+
 /// The digitising panel, called from all three per-mode egui blocks.
 ///
 /// Shaped like `ground_tool_controls`: one function, three call sites, no
@@ -274,6 +415,39 @@ pub fn controls(
     });
 
     ui.horizontal(|ui| {
+        ui.label("Snap:");
+        egui::ComboBox::from_id_salt("digitise_snap")
+            .selected_text(dig.snap_mode.label())
+            .width(160.0)
+            .show_ui(ui, |ui| {
+                for m in SnapMode::ALL {
+                    ui.selectable_value(&mut dig.snap_mode, m, m.label());
+                }
+            });
+        ui.label("(N)");
+    });
+    ui.horizontal(|ui| {
+        ui.label("Radius:");
+        ui.add(egui::DragValue::new(&mut dig.radius)
+            .speed(0.01)
+            .range(MIN_SNAP_RADIUS..=MAX_SNAP_RADIUS)
+            .max_decimals(2)
+            .suffix(" m"))
+            .on_hover_text("Ctrl + mouse wheel while digitising");
+    });
+    if matches!(dig.snap_mode, SnapMode::LowZ | SnapMode::HighZ) {
+        ui.horizontal(|ui| {
+            let (label, pct) = match dig.snap_mode {
+                SnapMode::LowZ => ("Low percentile:", &mut dig.low_pct),
+                _ => ("High percentile:", &mut dig.high_pct),
+            };
+            ui.label(label);
+            ui.add(egui::Slider::new(pct, 0.0..=100.0).max_decimals(0))
+                .on_hover_text("0 and 100 give the raw minimum and maximum back");
+        });
+    }
+
+    ui.horizontal(|ui| {
         let mut c = egui::Color32::from_rgb(
             (dig.color.r * 255.0) as u8, (dig.color.g * 255.0) as u8, (dig.color.b * 255.0) as u8,
         );
@@ -295,6 +469,33 @@ pub fn controls(
                 )),
                 None => ui.label(format!("last segment {last:.3} m, vertical")),
             };
+        }
+        if let Some(hit) = &dig.hover {
+            match hit.quality {
+                SnapQuality::Good => {
+                    let z = hit.world[2];
+                    if let Some(prev) = dig.last() {
+                        let run = ((hit.world[0] - prev[0]).powi(2)
+                                 + (hit.world[1] - prev[1]).powi(2)).sqrt();
+                        let dz = z - prev[2];
+                        let d = (run * run + dz * dz).sqrt();
+                        let slope = if run > 0.0 {
+                            format!("{:+.1}%", dz / run * 100.0)
+                        } else {
+                            "vertical".to_string()
+                        };
+                        ui.label(format!("→ Z {z:.3} m, {d:.3} m away, ΔZ {dz:+.3} m, {slope}"));
+                    } else {
+                        ui.label(format!("→ Z {z:.3} m"));
+                    }
+                }
+                _ => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 140, 60),
+                        hit.note.clone().unwrap_or_else(|| "Cannot snap here.".to_string()),
+                    );
+                }
+            }
         }
         ui.label("Click to add a vertex, Shift-click to place one freely.");
         ui.label("Backspace undoes one, Enter finishes, Esc cancels.");
@@ -404,6 +605,33 @@ mod tests {
         assert!((last - 5.0).abs() < 1e-9);
         let (slope, dz) = dig.last_slope().unwrap();
         assert!(slope.abs() < 1e-9 && dz.abs() < 1e-9);
+    }
+
+    #[test]
+    fn cycling_snap_modes_visits_every_one_and_comes_back() {
+        let mut m = SnapMode::Nearest;
+        let mut seen = vec![m];
+        for _ in 0..SnapMode::ALL.len() - 1 {
+            m = m.next();
+            assert!(!seen.contains(&m), "{m:?} repeated before the cycle closed");
+            seen.push(m);
+        }
+        assert_eq!(seen.len(), SnapMode::ALL.len());
+        assert_eq!(m.next(), SnapMode::Nearest, "N must wrap, not stop");
+    }
+
+    #[test]
+    fn a_snap_that_is_not_good_is_not_placeable() {
+        // The whole point of the quality flag: a coarse snap still has a
+        // position, and drawing the marker there is what tells the operator
+        // where the problem is — but it must not be clickable.
+        let coarse = SnapHit {
+            world: [1.0, 2.0, 3.0],
+            quality: SnapQuality::Coarse,
+            note: Some("too sparse".to_string()),
+        };
+        assert!(!coarse.is_placeable());
+        assert!(SnapHit::good([1.0, 2.0, 3.0]).is_placeable());
     }
 
     #[test]
