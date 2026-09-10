@@ -398,7 +398,7 @@ mod tests {
             (b.max.y - b.min.y) + 1.0,
             vec![(a0, z_lo), (a1, z_lo), (a1, z_hi), (a0, z_hi)],
             target,
-            from,
+            from.into(),
         )
     }
 
@@ -526,7 +526,7 @@ mod tests {
                 z_max: z_hi,
             },
             7,
-            None,
+            crate::classify::ClassMask::ALL,
         );
 
         // What the op should select, computed straight from the definition.

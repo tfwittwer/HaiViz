@@ -11,7 +11,7 @@
     use miniquad::*;
 
     use crate::ColorMode;
-    use crate::classify::ClassEdits;
+    use crate::classify::{ClassEdits, ClassMask, effective_class};
     use crate::spatial::{Hit, RayHit, SpatialGrid, percentile_by_z};
 
     const CHUNK_SIZE: f32 = 50.0;
@@ -43,6 +43,40 @@
     impl Default for ZClip {
         fn default() -> Self { ZClip::OPEN }
     }
+
+    /// Which classification ids are shown.
+    ///
+    /// Not a new type: an op's `from` restriction and the visible set are the
+    /// same kind of thing and get intersected when an op is made, so one
+    /// representation keeps that a single `&`. See [`ClassMask`].
+    ///
+    /// The [`ZClip`] doctrine applies verbatim, and this is the setting it was
+    /// written for: a hidden class is not merely invisible — it cannot be
+    /// measured, inspected, lassoed, sectioned, fitted to or snapped to
+    /// either. Every site that consults `z_clip` consults this too. That is
+    /// what makes it the primary control over *what you snap to*: hide
+    /// everything but ground and "lowest Z in radius" means the ground.
+    ///
+    /// It is a **view setting**, like the height band. It is not written to
+    /// `classes.txt`, and it does **not** affect export — *Omit classes* does
+    /// that.
+    pub type ClassVis = ClassMask;
+
+    /// The colour given to a point its class filter hides.
+    ///
+    /// GLSL ES 100 has no bit operations and no vertex-stage discard, so
+    /// visibility rides in on a channel that cannot hold a real value: a
+    /// negative red. The vertex shader spots it and pushes the point past the
+    /// far plane, the same trick `ZClip` already uses. The alternative was a
+    /// `vec4` colour, which costs 4 bytes per point on the GPU — about 17% of
+    /// vertex memory — and touches `Vertex`, `build_chunks`,
+    /// `upload_split_verts` and section extraction. This costs nothing and
+    /// makes `rebuild_colors` the single update path for both colour changes
+    /// and visibility toggles.
+    ///
+    /// It overloads a channel, which is why it is named rather than written
+    /// as a bare `-1.0` at either end.
+    pub const HIDDEN_COLOR: [f32; 3] = [-1.0, 0.0, 0.0];
 
     /// Load class definitions from classes.txt in the current directory.
     /// Format: id;r;g;b;label  (one per line, # for comments)
@@ -266,6 +300,8 @@
         pub color_h_max: f32,
         /// Height band to draw; see [`ZClip`].
         pub z_clip: ZClip,
+        /// Which classes are shown; see [`ClassVis`].
+        pub class_vis: ClassVis,
         /// Manual classification ops. Unlike the COPC case all points are
         /// resident, so ops are applied directly and only kept for persistence
         /// and undo.
@@ -284,8 +320,11 @@
         point: &Point, pos_z: f32, h_color_min: f32, h_color_max: f32,
         intensity_min: u16, intensity_range: f32, time: f64, time_min: f64, time_range: f64,
         mode: ColorMode, class_defs: &Option<ClassDefs>,
-        override_rgb: Option<[f32; 3]>,
+        override_rgb: Option<[f32; 3]>, class_vis: ClassVis,
     ) -> [f32; 3] {
+        if !class_vis.contains(effective_class(point)) {
+            return HIDDEN_COLOR;
+        }
         match mode {
             ColorMode::Height => {
                 // `pos_z` is relative to the dataset minimum; the colour bar maps
@@ -588,7 +627,7 @@
                 .points
                 .iter()
                 .enumerate()
-                .map(|(i, p)| color_for_point(p, positions[i][2], 0.0, height_range, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &class_defs, None))
+                .map(|(i, p)| color_for_point(p, positions[i][2], 0.0, height_range, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &class_defs, None, ClassVis::ALL))
                 .collect();
 
             let pipeline = create_pipeline(ctx);
@@ -613,6 +652,10 @@
                 color_h_min: 0.0,
                 color_h_max: height_range,
                 z_clip: ZClip::OPEN,
+                // Starts unfiltered; `apply_class_vis` pushes the live set on
+                // the next frame, which is also how a stage loaded while a
+                // filter is in force picks it up.
+                class_vis: ClassVis::ALL,
                 edits: ClassEdits::default(),
                 index,
             };
@@ -640,6 +683,7 @@
             out: &mut Vec<(f64, f64, f64)>,
         ) {
             for p in &self.cloud.points {
+                if !self.class_vis.contains(effective_class(p)) { continue; }
                 if p.x >= min.0 && p.x <= max.0 && p.y >= min.1 && p.y <= max.1
                     && p.z >= z_min && p.z <= z_max {
                     out.push((p.x, p.y, p.z));
@@ -695,10 +739,11 @@
             let mut best_dist = f32::MAX;
 
             for (i, pos) in self.positions.iter().enumerate() {
-                // A clipped point is not merely hidden — it must not be
-                // pickable either, or Measure and Point Info would silently
-                // snap to geometry the operator cannot see.
+                // A clipped or hidden point is not merely invisible — it must
+                // not be pickable either, or Measure and Point Info would
+                // silently snap to geometry the operator cannot see.
                 if !self.z_clip.contains(pos[2]) { continue; }
+                if !self.class_vis.contains(effective_class(&self.cloud.points[i])) { continue; }
                 let p = *view_proj * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
                 let px = p.x / p.w;
                 let py = p.y / p.w;
@@ -723,7 +768,10 @@
         /// phase 1.
         #[allow(dead_code)]
         fn snap_filter(&self) -> impl Fn(u32) -> bool + '_ {
-            move |i: u32| self.z_clip.contains(self.positions[i as usize][2])
+            move |i: u32| {
+                self.z_clip.contains(self.positions[i as usize][2])
+                    && self.class_vis.contains(effective_class(&self.cloud.points[i as usize]))
+            }
         }
 
         /// Frontmost point within `max_dist` of a viewer-space ray.
@@ -765,7 +813,7 @@
                     .iter()
                     .map(|&i| {
                         let p = &self.cloud.points[i];
-                        color_for_point(p, self.positions[i][2], h_lo, h_hi, self.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.cloud.time_min, time_range, color_mode, &self.class_defs, self.rgb_override)
+                        color_for_point(p, self.positions[i][2], h_lo, h_hi, self.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.cloud.time_min, time_range, color_mode, &self.class_defs, self.rgb_override, self.class_vis)
                     })
                     .collect();
 
@@ -806,13 +854,14 @@
                 let perp = rel_x * normal.0 + rel_y * normal.1;
 
                 if along >= 0.0 && along <= len && perp.abs() <= depth
-                    && self.z_clip.contains(pos[2]) {
+                    && self.z_clip.contains(pos[2])
+                    && self.class_vis.contains(effective_class(&self.cloud.points[i])) {
                     let p = &self.cloud.points[i];
                     h_min = h_min.min(pos[2]);
                     h_max = h_max.max(pos[2]);
                     section_verts.push(Vertex {
                         pos: [along, pos[2], 0.0],
-                        color: color_for_point(p, pos[2], h_lo, h_hi, self.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.cloud.time_min, time_range, color_mode, &self.class_defs, self.rgb_override),
+                        color: color_for_point(p, pos[2], h_lo, h_hi, self.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.cloud.time_min, time_range, color_mode, &self.class_defs, self.rgb_override, self.class_vis),
                     });
                 }
             }
@@ -888,6 +937,8 @@
         pub color_h_max: f32,
         /// Height band to draw; see [`ZClip`].
         pub z_clip: ZClip,
+        /// Which classes are shown; see [`ClassVis`].
+        pub class_vis: ClassVis,
     }
 
     fn read_index(dir_path: &str) -> Vec<TileInfo> {
@@ -1007,6 +1058,7 @@
                 color_h_min: 0.0,
                 color_h_max: (global_max[2] - global_min[2]) as f32,
                 z_clip: ZClip::OPEN,
+                class_vis: ClassVis::ALL,
             }
         }
 
@@ -1066,7 +1118,7 @@
             ]).collect();
 
             let colors: Vec<[f32; 3]> = cloud.points.iter().enumerate().map(|(i, p)| {
-                color_for_point(p, positions[i][2], h_lo, h_hi, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &self.class_defs, override_rgb)
+                color_for_point(p, positions[i][2], h_lo, h_hi, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &self.class_defs, override_rgb, self.class_vis)
             }).collect();
 
             let total_points = colors.len() as i32;
@@ -1123,6 +1175,7 @@
         pub fn rebuild_colors(&mut self, ctx: &mut dyn RenderingBackend, color_mode: ColorMode) {
             let (h_lo, h_hi) = (self.color_h_min, self.color_h_max);
             let class_defs = self.class_defs.clone();
+            let class_vis = self.class_vis;
             for loaded in self.loaded.iter_mut().flatten() {
                 let intensity_range = (loaded.cloud.intensity_max - loaded.cloud.intensity_min) as f32;
                 let time_range = loaded.cloud.time_max - loaded.cloud.time_min;
@@ -1130,7 +1183,7 @@
                 for chunk in &mut loaded.chunks {
                     let chunk_colors: Vec<[f32; 3]> = chunk.point_indices.iter().map(|&i| {
                         let p = &loaded.cloud.points[i];
-                        color_for_point(p, loaded.positions[i][2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &class_defs, override_rgb)
+                        color_for_point(p, loaded.positions[i][2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &class_defs, override_rgb, class_vis)
                     }).collect();
                     ctx.buffer_update(chunk.bindings.vertex_buffers[1], BufferSource::slice(&chunk_colors));
                 }
@@ -1140,6 +1193,7 @@
         pub fn rebuild_tile_colors(&mut self, ctx: &mut dyn RenderingBackend, index: usize, color_mode: ColorMode) {
             let (h_lo, h_hi) = (self.color_h_min, self.color_h_max);
             let class_defs = self.class_defs.clone();
+            let class_vis = self.class_vis;
             if let Some(ref mut loaded) = self.loaded[index] {
                 let intensity_range = (loaded.cloud.intensity_max - loaded.cloud.intensity_min) as f32;
                 let time_range = loaded.cloud.time_max - loaded.cloud.time_min;
@@ -1147,7 +1201,7 @@
                 for chunk in &mut loaded.chunks {
                     let chunk_colors: Vec<[f32; 3]> = chunk.point_indices.iter().map(|&i| {
                         let p = &loaded.cloud.points[i];
-                        color_for_point(p, loaded.positions[i][2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &class_defs, override_rgb)
+                        color_for_point(p, loaded.positions[i][2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &class_defs, override_rgb, class_vis)
                     }).collect();
                     ctx.buffer_update(chunk.bindings.vertex_buffers[1], BufferSource::slice(&chunk_colors));
                 }
@@ -1170,6 +1224,7 @@
                 if let Some(lt) = loaded {
                     for (i, pos) in lt.positions.iter().enumerate() {
                         if !self.z_clip.contains(pos[2]) { continue; }
+                        if !self.class_vis.contains(effective_class(&lt.cloud.points[i])) { continue; }
                         let p = *view_proj * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
                         let px = p.x / p.w;
                         let py = p.y / p.w;
@@ -1202,10 +1257,13 @@
             for (tile_idx, loaded) in self.loaded.iter().enumerate() {
                 let Some(lt) = loaded else { continue };
                 let z_clip = self.z_clip;
+                let class_vis = self.class_vis;
                 let positions = &lt.positions;
+                let points = &lt.cloud.points;
                 let hit = lt.index.nearest_ray(
                     positions, origin, dir, max_dist,
-                    move |i: u32| z_clip.contains(positions[i as usize][2]),
+                    move |i: u32| z_clip.contains(positions[i as usize][2])
+                        && class_vis.contains(effective_class(&points[i as usize])),
                 );
                 if let Some(h) = hit
                     && best.as_ref().is_none_or(|(_, b)| h.t < b.t) {
@@ -1234,10 +1292,13 @@
                 if !lt.index.circle_overlaps(x, y, r) { continue; }
                 cands.clear();
                 let z_clip = self.z_clip;
+                let class_vis = self.class_vis;
                 let positions = &lt.positions;
+                let points = &lt.cloud.points;
                 lt.index.points_in_radius(
                     positions, x, y, r,
-                    move |i: u32| z_clip.contains(positions[i as usize][2]),
+                    move |i: u32| z_clip.contains(positions[i as usize][2])
+                        && class_vis.contains(effective_class(&points[i as usize])),
                     &mut cands,
                 );
                 samples.extend(cands.iter().map(|&i| (lt.positions[i as usize][2], (tile_idx, i))));
@@ -1259,6 +1320,7 @@
         ) {
             for loaded in self.loaded.iter().flatten() {
                 for p in &loaded.cloud.points {
+                    if !self.class_vis.contains(effective_class(p)) { continue; }
                     if p.x >= min.0 && p.x <= max.0 && p.y >= min.1 && p.y <= max.1
                         && p.z >= z_min && p.z <= z_max {
                         out.push((p.x, p.y, p.z));
@@ -1305,13 +1367,14 @@
                     let perp = rel_x * normal.0 + rel_y * normal.1;
 
                     if along >= 0.0 && along <= len && perp.abs() <= depth
-                        && self.z_clip.contains(pos[2]) {
+                        && self.z_clip.contains(pos[2])
+                        && self.class_vis.contains(effective_class(&loaded.cloud.points[i])) {
                         let p = &loaded.cloud.points[i];
                         h_min = h_min.min(pos[2]);
                         h_max = h_max.max(pos[2]);
                         section_verts.push(Vertex {
                             pos: [along, pos[2], 0.0],
-                            color: color_for_point(p, pos[2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &self.class_defs, loaded.rgb_override),
+                            color: color_for_point(p, pos[2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &self.class_defs, loaded.rgb_override, self.class_vis),
                         });
                     }
                 }
@@ -1632,6 +1695,10 @@
         pub color_h_max: f32,
         /// Height band to draw; see [`ZClip`].
         pub z_clip: ZClip,
+        /// Which classes are shown; see [`ClassVis`]. Applied in
+        /// `ingest_node`, so a node arriving long after a class was switched
+        /// off is coloured to match what is already on screen.
+        pub class_vis: ClassVis,
         /// Nodes dispatched to the loader thread but not yet ingested.
         in_flight: HashSet<VoxelKey>,
         /// Nodes force-loaded for the active section corridor. These are held
@@ -1924,6 +1991,7 @@
                 color_h_min: 0.0,
                 color_h_max: (global_max[2] - global_min[2]) as f32,
                 z_clip: ZClip::OPEN,
+                class_vis: ClassVis::ALL,
                 in_flight: HashSet::new(),
                 pinned: HashSet::new(),
                 pin_box: None,
@@ -2022,6 +2090,7 @@
         ) {
             for node in self.loaded_nodes.values() {
                 for p in &node.points {
+                    if !self.class_vis.contains(effective_class(p)) { continue; }
                     if p.x >= min.0 && p.x <= max.0 && p.y >= min.1 && p.y <= max.1
                         && p.z >= z_min && p.z <= z_max {
                         out.push((p.x, p.y, p.z));
@@ -2186,7 +2255,7 @@
                 color_for_point(
                     p, positions[i][2], h_lo, h_hi,
                     self.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.time_min, time_range,
-                    color_mode, &self.class_defs, self.rgb_override,
+                    color_mode, &self.class_defs, self.rgb_override, self.class_vis,
                 )
             }).collect();
 
@@ -2412,6 +2481,7 @@
             for node in self.loaded_nodes.values() {
                 for (i, pos) in node.positions.iter().enumerate() {
                     if !self.z_clip.contains(pos[2]) { continue; }
+                    if !self.class_vis.contains(effective_class(&node.points[i])) { continue; }
                     let p = *view_proj * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
                     let px = p.x / p.w;
                     let py = p.y / p.w;
@@ -2443,10 +2513,13 @@
             let mut best: Option<(RayHit, &Point)> = None;
             for node in self.loaded_nodes.values() {
                 let z_clip = self.z_clip;
+                let class_vis = self.class_vis;
                 let positions = &node.positions;
+                let points = &node.points;
                 let hit = node.index.nearest_ray(
                     positions, origin, dir, max_dist,
-                    move |i: u32| z_clip.contains(positions[i as usize][2]),
+                    move |i: u32| z_clip.contains(positions[i as usize][2])
+                        && class_vis.contains(effective_class(&points[i as usize])),
                 );
                 if let Some(h) = hit
                     && best.as_ref().is_none_or(|(b, _)| h.t < b.t) {
@@ -2474,10 +2547,13 @@
                 if !node.index.circle_overlaps(x, y, r) { continue; }
                 cands.clear();
                 let z_clip = self.z_clip;
+                let class_vis = self.class_vis;
                 let positions = &node.positions;
+                let points = &node.points;
                 node.index.points_in_radius(
                     positions, x, y, r,
-                    move |i: u32| z_clip.contains(positions[i as usize][2]),
+                    move |i: u32| z_clip.contains(positions[i as usize][2])
+                        && class_vis.contains(effective_class(&points[i as usize])),
                     &mut cands,
                 );
                 samples.extend(cands.iter().map(|&i| {
@@ -2580,7 +2656,7 @@
                         color_for_point(
                             &node.points[i], node.positions[i][2], h_lo, h_hi,
                             self.intensity_min, intensity_range, node.points[i].gps_time.unwrap_or(0.), self.time_min, time_range,
-                            color_mode, &self.class_defs, self.rgb_override,
+                            color_mode, &self.class_defs, self.rgb_override, self.class_vis,
                         )
                     }).collect();
                     ctx.buffer_update(chunk.bindings.vertex_buffers[1], BufferSource::slice(&colors));
@@ -2629,7 +2705,8 @@
                     let along = rel_x * dir.0 + rel_y * dir.1;
                     let perp = rel_x * normal.0 + rel_y * normal.1;
                     if along >= 0.0 && along <= len && perp.abs() <= depth
-                        && self.z_clip.contains(pos[2]) {
+                        && self.z_clip.contains(pos[2])
+                        && self.class_vis.contains(effective_class(&node.points[i])) {
                         h_min = h_min.min(pos[2]);
                         h_max = h_max.max(pos[2]);
                         raw.push((node.points[i].clone(), along, pos[2]));
@@ -2638,7 +2715,7 @@
                             color: color_for_point(
                                 &node.points[i], pos[2], h_lo, h_hi,
                                 self.intensity_min, intensity_range, node.points[i].gps_time.unwrap_or(0.), self.time_min, time_range,
-                                color_mode, &self.class_defs, self.rgb_override,
+                                color_mode, &self.class_defs, self.rgb_override, self.class_vis,
                             ),
                         });
                     }
@@ -2772,7 +2849,7 @@
                         color: color_for_point(
                             pt, *pos_z, cs.color_h_min, cs.color_h_max,
                             cs.intensity_min, intensity_range, pt.gps_time.unwrap_or(0.), cs.time_min, time_range,
-                            color_mode, &cs.class_defs, cs.rgb_override,
+                            color_mode, &cs.class_defs, cs.rgb_override, cs.class_vis,
                         ),
                     });
                 }
@@ -2802,7 +2879,11 @@
             varying mediump float v_depth;
 
             void main() {
-                if (pos.z < z_clip_min || pos.z > z_clip_max) {
+                // A negative red is the sentinel a hidden class is coloured
+                // with (see HIDDEN_COLOR): no real colour can be negative, so
+                // no uniform and no extra attribute are needed to carry
+                // visibility. Culled the same way as the height band.
+                if (color.r < 0.0 || pos.z < z_clip_min || pos.z > z_clip_max) {
                     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
                     gl_PointSize = 0.0;
                     v_color = color;

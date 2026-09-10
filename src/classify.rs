@@ -44,6 +44,97 @@ pub fn set_class(p: &mut Point, id: u8) {
     }
 }
 
+/// A set of classification ids: 256 bits, one per possible class.
+///
+/// One type serves two jobs that the plan kept apart, because they meet:
+/// which classes an op is allowed to touch, and which classes are visible.
+/// An op freezes the intersection of the two at the moment it is made (see
+/// [`ClassOp::from`]), so a single representation is what makes that
+/// intersection one `&`.
+///
+/// `[u64; 4]` rather than `[bool; 256]`: 32 bytes is cheap to copy into the
+/// per-point filter closures the snap queries and the pick sites run, and a
+/// membership test is a shift and a mask.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClassMask([u64; 4]);
+
+impl ClassMask {
+    /// Every class. The "no restriction" value, and the default visibility.
+    pub const ALL: ClassMask = ClassMask([u64::MAX; 4]);
+    /// No class at all. Only reachable by hiding everything, or by
+    /// intersecting a restriction with a visibility that excludes it — which
+    /// is a mistake the UI warns about rather than committing.
+    pub const NONE: ClassMask = ClassMask([0; 4]);
+
+    pub fn single(id: u8) -> ClassMask {
+        let mut m = ClassMask::NONE;
+        m.insert(id);
+        m
+    }
+
+    #[inline]
+    pub fn contains(&self, id: u8) -> bool {
+        self.0[(id >> 6) as usize] & (1u64 << (id & 63)) != 0
+    }
+
+    pub fn insert(&mut self, id: u8) {
+        self.0[(id >> 6) as usize] |= 1u64 << (id & 63);
+    }
+
+    pub fn remove(&mut self, id: u8) {
+        self.0[(id >> 6) as usize] &= !(1u64 << (id & 63));
+    }
+
+    pub fn set(&mut self, id: u8, on: bool) {
+        if on { self.insert(id) } else { self.remove(id) }
+    }
+
+    pub fn intersect(self, other: ClassMask) -> ClassMask {
+        let mut out = ClassMask::NONE;
+        for i in 0..4 { out.0[i] = self.0[i] & other.0[i]; }
+        out
+    }
+
+    pub fn inverted(self) -> ClassMask {
+        let mut out = ClassMask::NONE;
+        for i in 0..4 { out.0[i] = !self.0[i]; }
+        out
+    }
+
+    pub fn is_all(&self) -> bool { *self == ClassMask::ALL }
+    pub fn is_empty(&self) -> bool { *self == ClassMask::NONE }
+    pub fn count(&self) -> u32 { self.0.iter().map(|w| w.count_ones()).sum() }
+
+    /// The one class in the set, if there is exactly one.
+    pub fn only(&self) -> Option<u8> {
+        if self.count() != 1 { return None; }
+        (0..=255u8).find(|&c| self.contains(c))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..=255u8).filter(move |&c| self.contains(c))
+    }
+}
+
+impl Default for ClassMask {
+    fn default() -> Self { ClassMask::ALL }
+}
+
+/// The UI carries "only from class N" as an `Option<u8>`; this is the bridge.
+impl From<Option<u8>> for ClassMask {
+    fn from(o: Option<u8>) -> ClassMask {
+        match o { Some(c) => ClassMask::single(c), None => ClassMask::ALL }
+    }
+}
+
+impl std::fmt::Debug for ClassMask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_all() { return f.write_str("ClassMask(*)"); }
+        if self.is_empty() { return f.write_str("ClassMask(-)"); }
+        write!(f, "ClassMask({})", format_mask(self))
+    }
+}
+
 /// The shape an op selects. Both variants are pure geometric predicates,
 /// which is what lets the same op be replayed over a COPC node whenever it
 /// streams in and again over every node at export.
@@ -107,8 +198,16 @@ pub struct ClassOp {
     pub region: ClassRegion,
     /// Classification to assign inside the region.
     pub target_class: u8,
-    /// When set, only points that currently carry this class are changed.
-    pub from_class: Option<u8>,
+    /// The classes this op is allowed to touch, frozen when the op was made.
+    ///
+    /// Two things are folded in here: an explicit "only from class N", and the
+    /// set of classes that were visible at the time. Ops are replayed on COPC
+    /// nodes as they stream in and again on every node at export, so
+    /// *"the exported file agrees with the display by construction"* — and
+    /// that guarantee only holds if the meaning of an op is fixed when it is
+    /// drawn. If it depended on live visibility, an export an hour later with
+    /// different classes toggled would reclassify different points.
+    pub from: ClassMask,
     /// Cached world-space AABB, for cheap node rejection.
     bbox_min: [f64; 3],
     bbox_max: [f64; 3],
@@ -119,10 +218,10 @@ impl ClassOp {
         seq: u64,
         region: ClassRegion,
         target_class: u8,
-        from_class: Option<u8>,
+        from: ClassMask,
     ) -> Self {
         let mut op = ClassOp {
-            seq, region, target_class, from_class,
+            seq, region, target_class, from,
             bbox_min: [f64::MAX; 3],
             bbox_max: [f64::MIN; 3],
         };
@@ -139,13 +238,13 @@ impl ClassOp {
         depth: f64,
         polygon: Vec<(f64, f64)>,
         target_class: u8,
-        from_class: Option<u8>,
+        from: ClassMask,
     ) -> Self {
         ClassOp::new(
             seq,
             ClassRegion::Corridor { start, end, depth, polygon },
             target_class,
-            from_class,
+            from,
         )
     }
 
@@ -231,9 +330,7 @@ impl ClassOp {
 
     /// Apply to a single point. Returns true if the classification changed.
     pub fn apply_point(&self, p: &mut Point) -> bool {
-        if let Some(from) = self.from_class && effective_class(p) != from {
-            return false;
-        }
+        if !self.from.contains(effective_class(p)) { return false; }
         if effective_class(p) == self.target_class { return false; }
         if !self.contains(p.x, p.y, p.z) { return false; }
         set_class(p, self.target_class);
@@ -372,11 +469,14 @@ impl ClassEdits {
     pub fn save(&mut self, source: &str) -> std::io::Result<PathBuf> {
         let path = Self::sidecar_path(source);
         let mut out = String::new();
-        out.push_str("# haiviz manual classification ops, v1\n");
+        out.push_str("# haiviz manual classification ops, v2\n");
         out.push_str(&format!("# source: {}\n", source));
-        out.push_str("# op;seq;from(*=any);target;sx;sy;ex;ey;depth;along,z;...\n");
-        out.push_str("# gop;seq;from(*=any);target;zmin;zmax;ox;oy;a;b;c;offset;x,y;...\n");
-        out.push_str("# vop;seq;from(*=any);target;zmin;zmax;x,y;...\n");
+        out.push_str("# from: * = any class, 5 = only class 5, 2|5|6 = only those,\n");
+        out.push_str("#       !3|7 = every class except those. The set and complement\n");
+        out.push_str("#       forms are v2 and appear only when classes were hidden.\n");
+        out.push_str("# op;seq;from;target;sx;sy;ex;ey;depth;along,z;...\n");
+        out.push_str("# gop;seq;from;target;zmin;zmax;ox;oy;a;b;c;offset;x,y;...\n");
+        out.push_str("# vop;seq;from;target;zmin;zmax;x,y;...\n");
         for op in &self.ops {
             out.push_str(&format_op(op));
             out.push('\n');
@@ -388,11 +488,57 @@ impl ClassEdits {
     }
 }
 
+/// Render a class mask as the `from` token.
+///
+/// Ordinary sessions keep writing byte-identical v1 sidecars: with no
+/// visibility filter in force the mask is either everything (`*`) or the
+/// single class the operator restricted to (`5`), which is exactly what v1
+/// wrote. The set forms only appear once something was hidden, so an older
+/// haiviz — which skips lines it cannot parse — degrades only for the files
+/// that genuinely carry the new meaning.
+///
+/// Two set forms rather than one: a visible set is usually "everything except
+/// the two classes I switched off", and spelling that out as 254 ids would put
+/// a kilobyte on every line. Whichever of the set and its complement is
+/// shorter wins.
+fn format_mask(m: &ClassMask) -> String {
+    if m.is_all() { return "*".to_string(); }
+    // Not reachable from the UI, which refuses to commit an op that can never
+    // match. Written explicitly rather than as an empty token so a file that
+    // somehow contains one round-trips instead of failing to parse.
+    if m.is_empty() { return "-".to_string(); }
+    if let Some(c) = m.only() { return c.to_string(); }
+    let join = |ids: Vec<u8>| ids.iter().map(|c| c.to_string()).collect::<Vec<_>>().join("|");
+    let set: Vec<u8> = m.iter().collect();
+    if set.len() <= 128 {
+        join(set)
+    } else {
+        format!("!{}", join(m.inverted().iter().collect()))
+    }
+}
+
+fn parse_mask(token: &str) -> Option<ClassMask> {
+    let token = token.trim();
+    match token {
+        "*" => Some(ClassMask::ALL),
+        "-" => Some(ClassMask::NONE),
+        _ => {
+            let (base, body) = match token.strip_prefix('!') {
+                Some(rest) => (ClassMask::ALL, rest),
+                None => (ClassMask::NONE, token),
+            };
+            let mut m = base;
+            for part in body.split('|') {
+                let id = part.trim().parse::<u8>().ok()?;
+                if base.is_all() { m.remove(id) } else { m.insert(id) }
+            }
+            Some(m)
+        }
+    }
+}
+
 fn format_op(op: &ClassOp) -> String {
-    let from = match op.from_class {
-        Some(c) => c.to_string(),
-        None => "*".to_string(),
-    };
+    let from = format_mask(&op.from);
     match &op.region {
         ClassRegion::Corridor { start, end, depth, polygon } => {
             let mut s = format!(
@@ -435,10 +581,7 @@ fn parse_op(line: &str) -> Option<ClassOp> {
     if parts.len() < 4 { return None; }
     let kind = parts[0];
     let seq = parts[1].trim().parse::<u64>().ok()?;
-    let from_class = match parts[2].trim() {
-        "*" => None,
-        other => Some(other.parse::<u8>().ok()?),
-    };
+    let from = parse_mask(parts[2])?;
     let target_class = parts[3].trim().parse::<u8>().ok()?;
     let f = |i: usize| parts.get(i)?.trim().parse::<f64>().ok();
 
@@ -482,7 +625,7 @@ fn parse_op(line: &str) -> Option<ClassOp> {
         }
         _ => return None,
     };
-    Some(ClassOp::new(seq, region, target_class, from_class))
+    Some(ClassOp::new(seq, region, target_class, from))
 }
 
 /// A ground plane fitted to a lasso footprint.
@@ -673,6 +816,10 @@ mod tests {
 
     /// A 20 m box around a section line running due east from (100, 200).
     fn box_op(target: u8, from: Option<u8>) -> ClassOp {
+        box_op_mask(target, from.into())
+    }
+
+    fn box_op_mask(target: u8, from: ClassMask) -> ClassOp {
         ClassOp::corridor(
             0,
             (100.0, 200.0),
@@ -704,7 +851,7 @@ mod tests {
         let op = ClassOp::corridor(
             0, (0.0, 0.0), (100.0, 100.0), 2.0,
             vec![(9.0, -1.0), (11.0, -1.0), (11.0, 1.0), (9.0, 1.0)],
-            7, None,
+            7, ClassMask::ALL,
         );
         let d = (50.0f64).sqrt();
         assert!(op.contains(d, d, 0.0));
@@ -752,6 +899,126 @@ mod tests {
     }
 
     #[test]
+    fn class_mask_set_algebra() {
+        assert!(ClassMask::ALL.contains(0) && ClassMask::ALL.contains(255));
+        assert!(!ClassMask::NONE.contains(0));
+        assert_eq!(ClassMask::ALL.count(), 256);
+        assert_eq!(ClassMask::NONE.count(), 0);
+
+        let five = ClassMask::single(5);
+        assert!(five.contains(5) && !five.contains(4));
+        assert_eq!(five.only(), Some(5));
+        assert_eq!(ClassMask::ALL.only(), None);
+        assert_eq!(ClassMask::ALL.inverted(), ClassMask::NONE);
+
+        // "Only from 5" while 5 is visible keeps 5; while 5 is hidden it
+        // empties, which is the case §6.5 makes the UI refuse.
+        let mut visible = ClassMask::ALL;
+        visible.remove(3);
+        assert_eq!(five.intersect(visible), five);
+        visible.remove(5);
+        assert!(five.intersect(visible).is_empty());
+
+        assert_eq!(ClassMask::from(None::<u8>), ClassMask::ALL);
+        assert_eq!(ClassMask::from(Some(7u8)), ClassMask::single(7));
+        assert_eq!(ClassMask::default(), ClassMask::ALL);
+
+        let mut m = ClassMask::NONE;
+        for id in [2u8, 5, 6] { m.insert(id); }
+        assert_eq!(m.iter().collect::<Vec<u8>>(), vec![2, 5, 6]);
+    }
+
+    #[test]
+    fn from_token_round_trips_in_every_form() {
+        let mut set = ClassMask::NONE;
+        for id in [2u8, 5, 6] { set.insert(id); }
+        let mut complement = ClassMask::ALL;
+        for id in [3u8, 7] { complement.remove(id); }
+
+        for (mask, want) in [
+            (ClassMask::ALL, "*"),
+            (ClassMask::NONE, "-"),
+            (ClassMask::single(5), "5"),
+            (set, "2|5|6"),
+            (complement, "!3|7"),
+        ] {
+            assert_eq!(format_mask(&mask), want, "formatting {mask:?}");
+            assert_eq!(parse_mask(want), Some(mask), "parsing {want}");
+        }
+        assert_eq!(parse_mask("nonsense"), None);
+        assert_eq!(parse_mask("2|x"), None);
+    }
+
+    #[test]
+    fn a_session_without_a_visibility_filter_writes_v1_op_lines() {
+        // Risk 3: an older haiviz drops any line it cannot parse. The
+        // mitigation is that the new token only ever appears when classes were
+        // actually hidden, so an ordinary session's sidecar stays readable by
+        // older builds. That is a property of `format_mask`, so assert it on
+        // the op lines rather than trusting the reasoning.
+        let all_visible = ClassMask::ALL;
+        let no_restriction = ClassMask::from(None::<u8>).intersect(all_visible);
+        let only_five = ClassMask::from(Some(5u8)).intersect(all_visible);
+
+        let a = format_op(&box_op_mask(7, no_restriction));
+        let b = format_op(&box_op_mask(7, only_five));
+        assert_eq!(a.split(';').nth(2), Some("*"));
+        assert_eq!(b.split(';').nth(2), Some("5"));
+
+        // And with a filter in force the line does change — otherwise the
+        // freeze would not be recorded at all.
+        let mut visible = ClassMask::ALL;
+        visible.remove(3);
+        let c = format_op(&box_op_mask(7, ClassMask::from(None::<u8>).intersect(visible)));
+        assert_eq!(c.split(';').nth(2), Some("!3"));
+    }
+
+    #[test]
+    fn the_shorter_of_the_set_and_its_complement_is_written() {
+        // A visible set is usually "everything except the two I switched off".
+        // Spelling that out would put a kilobyte on every op line.
+        let mut visible = ClassMask::ALL;
+        for id in [1u8, 3, 5] { visible.remove(id); }
+        let token = format_mask(&visible);
+        assert_eq!(token, "!1|3|5");
+        assert!(token.len() < 10, "complement form must stay short: {token}");
+        assert_eq!(parse_mask(&token), Some(visible));
+    }
+
+    #[test]
+    fn the_frozen_mask_decides_which_points_an_op_touches() {
+        // Ground visible, vegetation hidden: the op reclassifies the ground
+        // under the lasso and leaves the vegetation alone, whatever the
+        // visibility is when it is replayed.
+        let mut visible = ClassMask::ALL;
+        visible.remove(5);
+        let op = box_op_mask(7, ClassMask::from(None::<u8>).intersect(visible));
+
+        let mut ground = pt(120.0, 200.0, 10.0, 2);
+        let mut veg = pt(120.0, 200.0, 10.0, 5);
+        assert!(op.apply_point(&mut ground));
+        assert_eq!(effective_class(&ground), 7);
+        assert!(!op.apply_point(&mut veg));
+        assert_eq!(effective_class(&veg), 5, "a hidden class must not be touched");
+
+        // Survives the sidecar, or the freeze would only hold for one session.
+        let reparsed = parse_op(&format_op(&op)).expect("parses");
+        let mut veg2 = pt(120.0, 200.0, 10.0, 5);
+        assert!(!reparsed.apply_point(&mut veg2));
+    }
+
+    #[test]
+    fn an_empty_mask_matches_nothing() {
+        let op = box_op_mask(7, ClassMask::NONE);
+        for class in [0u8, 2, 5, 12, 255] {
+            let mut p = pt(120.0, 200.0, 10.0, class);
+            assert!(!op.apply_point(&mut p), "class {class} must not be touched");
+        }
+        // And it round-trips rather than corrupting the file it lands in.
+        assert_eq!(parse_op(&format_op(&op)).expect("parses").from, ClassMask::NONE);
+    }
+
+    #[test]
     fn sidecar_round_trips() {
         let mut edits = ClassEdits::default();
         edits.push(box_op(7, None));
@@ -762,9 +1029,9 @@ mod tests {
 
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].target_class, 7);
-        assert_eq!(parsed[0].from_class, None);
+        assert_eq!(parsed[0].from, ClassMask::ALL);
         assert_eq!(parsed[1].target_class, 18);
-        assert_eq!(parsed[1].from_class, Some(1));
+        assert_eq!(parsed[1].from, ClassMask::single(1));
         match (&parsed[1].region, &edits.ops[1].region) {
             (
                 ClassRegion::Corridor { polygon: a, depth: da, .. },
@@ -814,7 +1081,7 @@ mod tests {
         assert!(!reloaded.dirty);
         assert_eq!(reloaded.ops[0].seq, 0);
         assert_eq!(reloaded.ops[1].seq, 1);
-        assert_eq!(reloaded.ops[1].from_class, Some(7));
+        assert_eq!(reloaded.ops[1].from, ClassMask::single(7));
 
         // ...and they still select and reclassify the same points.
         let mut pts = vec![pt(120.0, 200.0, 10.0, 1), pt(0.0, 0.0, 0.0, 1)];
@@ -969,7 +1236,7 @@ mod tests {
                 z_max: 100.0,
             },
             7,
-            None,
+            ClassMask::ALL,
         );
         let g = |x: f64| 0.05 * x + 10.0;
         // On the ground: untouched, including on the sloped far side.
@@ -999,11 +1266,11 @@ mod tests {
                 z_max: 40.0,
             },
             18,
-            Some(1),
+            ClassMask::single(1),
         );
         let parsed = parse_op(&format_op(&op)).expect("parses");
         assert_eq!(parsed.target_class, 18);
-        assert_eq!(parsed.from_class, Some(1));
+        assert_eq!(parsed.from, ClassMask::single(1));
         match parsed.region {
             ClassRegion::AboveGround { origin, plane, offset, z_min, z_max, ref polygon } => {
                 assert_eq!(origin, (20.0, 30.0));
@@ -1033,7 +1300,7 @@ mod tests {
                 z_max: 30.0,
             },
             7,
-            None,
+            ClassMask::ALL,
         );
         // Inside the footprint and inside the band: selected, at any height —
         // this is the whole difference from `AboveGround`, which would leave
@@ -1058,13 +1325,13 @@ mod tests {
                 z_max: 40.0,
             },
             18,
-            Some(1),
+            ClassMask::single(1),
         );
         let line = format_op(&op);
         assert!(line.starts_with("vop;"));
         let parsed = parse_op(&line).expect("parses");
         assert_eq!(parsed.target_class, 18);
-        assert_eq!(parsed.from_class, Some(1));
+        assert_eq!(parsed.from, ClassMask::single(1));
         match parsed.region {
             ClassRegion::Volume { z_min, z_max, ref polygon } => {
                 assert_eq!((z_min, z_max), (1.0, 40.0));
@@ -1095,7 +1362,7 @@ mod tests {
                 z_max: 50.0,
             },
             2,
-            None,
+            ClassMask::ALL,
         ));
         let text: Vec<String> = edits.ops.iter().map(format_op).collect();
         assert!(text[0].starts_with("op;"));

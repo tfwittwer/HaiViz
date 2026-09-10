@@ -149,6 +149,38 @@ The band applies everywhere, not just to the display:
 **Full range** resets it to the whole dataset. The filter is a view setting — it
 does not affect what an export writes. Use the **Omit classes** list for that.
 
+## Class visibility
+
+Each row of the **Classes** window has a checkbox. Clear it and that class is
+switched off; **only** beside a row isolates it, and **All** / **None** /
+**Invert** act on every listed class at once.
+
+Like the height filter, this is not only a display setting. A hidden class:
+
+- is not drawn,
+- is excluded from cross sections,
+- cannot be picked by **Measure** or **Point Info**,
+- is ignored by the classification lassos,
+- is left out of the ground-plane fit.
+
+That last one is a real gain rather than a restriction: hide everything except
+class 2 and the **Above ground** lasso fits its plane to actual ground instead
+of to whatever minima it found under the vegetation.
+
+Two things worth knowing:
+
+- **Visibility does not affect export.** Same as the height filter — use
+  **Omit classes** for that. Hiding a class and exporting still writes it.
+- **A hidden class is invisible in more ways than one.** While any class is
+  hidden the classification panel says so, because a lasso that catches nothing
+  is otherwise very confusing.
+
+If you set **Only from: 5** while class 5 is hidden, the two exclude each other
+and the lasso is refused with an explanation rather than silently doing nothing.
+
+Visibility is a view setting and is **not** written to `classes.txt` — that file
+keeps its documented `id;r;g;b;label` format.
+
 ## Cross sections
 
 Cross sections cut a vertical slice through the cloud along a line you draw:
@@ -286,6 +318,26 @@ the time, and the exported file agrees with the display by construction.
 Because ops are geometric and stored in absolute world coordinates, a sidecar
 stays valid if the source is later recompressed or re-tiled.
 
+The set of classes an op may touch is frozen into it the same way, for the same
+reason: it is the **Only from** restriction and the classes that were visible at
+the time, intersected. If it followed live visibility instead, an export an hour
+later with different classes toggled would reclassify a different set of points
+and the guarantee above would not hold.
+
+That set is the `from` field, the third value on each line:
+
+```
+op;7;*;18;...        any class
+op;8;5;18;...        only class 5
+op;9;2|5|6;18;...    only those three
+op;10;!3|7;18;...    every class except 3 and 7
+```
+
+The first two forms are what haiviz has always written, and they are still all
+a session writes if no class was hidden. The last two are new in sidecar v2 and
+appear only when a visibility filter was actually in force — versions of haiviz
+older than that skip the lines carrying them, with a warning.
+
 **Undo last op** removes the most recent op and re-derives the affected clouds
 from disk — an op records what it assigns, not what it overwrote, so there is
 no shortcut back. For COPC that means the corridor streams in again.
@@ -334,6 +386,10 @@ defaults and **Save classes.txt** writes a fresh file there. The format is:
 
 - **Save classes.txt** writes the current definitions to disk.
 - **Reload** re-reads `classes.txt`, discarding unsaved edits.
+
+The per-row visibility checkboxes are covered under
+[Class visibility](#class-visibility); they are a view setting and are not
+saved to `classes.txt`.
 
 If no `classes.txt` is present, built-in default labels and colours are used.
 

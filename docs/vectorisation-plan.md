@@ -1,6 +1,6 @@
 # Manual vectorisation in HaiViz — implementation plan
 
-Status: **phase 0 implemented; phases 1–6 are still plan only.**
+Status: **phases 0 and 1 implemented; phases 2–6 are still plan only.**
 Written 2026-09-10.
 
 Paths below are relative to the workspace root (`haicloudrs/`).
@@ -236,6 +236,25 @@ same rule, which means every one of these sites gains the check:
 The ground fit is a real bonus: hide everything but class 2 and the plane is
 fitted to actual ground instead of to whatever minima the grid found.
 
+### Status: built
+
+`ClassVis` is a type alias for `ClassMask`, not a separate `[bool; 256]`. The
+plan kept the visible set and an op's `from` restriction apart, but §6.4 then
+intersects them — so one representation (`[u64; 4]`, 32 bytes, cheap to copy
+into a per-point filter closure) makes that intersection a single `&`.
+
+Filter sites carrying the check: the vertex shader (via the sentinel), the
+three `find_nearest_point`s, `pick_section_point`, the three
+`collect_points_in_bbox`es, `Stage`/`TileStageManager`/`CopcStage` section
+extraction, and the four phase-0 snap closures.
+
+The colour rebuild is triggered **once**, right after `apply_class_vis`, rather
+than in each of the three per-mode blocks — see §4. It is unconditional rather
+than gated on Classification mode, because the sentinel rides in the colour
+buffer whatever the colour mode is. `apply_class_vis` reports "did any backend
+change" rather than "did the operator toggle", which is also how a file loaded
+while a filter is already on gets repainted.
+
 ### 6.4 Ops must freeze the visible set
 
 Ops are replayed on COPC nodes as they stream in and again on every node at
@@ -269,6 +288,15 @@ sessions keep writing byte-identical old-format sidecars. Bump the header
 comment to `v2` and document the new token in the comment block
 `ClassEdits::save` already writes.
 
+**As built, there is a fourth form:** `!3|7`, everything except those. A visible
+set is usually "all but the two I switched off", and writing that out as 254 ids
+would put a kilobyte on every op line. `format_mask` picks whichever of the set
+and its complement is shorter. Downgrade behaviour is identical — an older build
+skips either new form — and the v1 guarantee is unchanged and now tested
+(`a_session_without_a_visibility_filter_writes_v1_op_lines`). An empty mask
+serialises as `-`; the UI refuses to make one, but a file carrying one
+round-trips rather than failing to parse.
+
 ### 6.5 UI
 
 In the Classes window (`main.rs:1030`): a checkbox per row, plus **All**,
@@ -285,6 +313,11 @@ Two things that must be loud, because both are foot-guns:
 Also: if *Only from: 5* is set while class 5 is hidden, the intersection is
 empty and the op would do nothing. Warn at that point rather than applying a
 no-op.
+
+As built, All / None / Invert / Isolate act on the **listed** ids only. Isolate
+via `ClassMask::single` would also switch off the 200-odd ids the window never
+shows, and "N classes hidden" would stop being a number the operator could
+reconcile with what is on screen.
 
 ---
 
@@ -506,7 +539,7 @@ what the tracer sees, tuning channel weights is guesswork.
 | Phase | Content | Rough size | Ships something? |
 |---|---|---|---|
 | **0** | A — spatial index, all three backends, tests + bench | ~400 | no — **done** |
-| **1** | B — class visibility: state, shader cull, all filter sites, `ClassOp` mask, Classes window UI | ~500 | **yes, standalone** |
+| **1** | B — class visibility: state, shader cull, all filter sites, `ClassOp` mask, Classes window UI | ~500 | **yes, standalone — done** |
 | **2a** | C — polyline model: f64, layers, mutability, undo, Salome writer | ~250 | marginally |
 | **2b** | C — GeoPackage read + write, EPSG detection, differential tests | ~1400 | **yes — overlay any GPKG** |
 | **3** | D — digitising mode, free vertex placement, panel wiring | ~450 | yes |

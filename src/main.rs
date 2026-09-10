@@ -7,7 +7,8 @@ use crate::glam::vec3;
 
 use macroquad::prelude::*;
 
-use crate::raw_miniquad::{ClassDefs, CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, build_section_from_raw_stages, build_section_from_stages, classification_color, default_class_label, load_class_defs, make_section_data, save_class_defs, scan_dir_for_copc};
+use crate::raw_miniquad::{ClassDefs, ClassVis, CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, build_section_from_raw_stages, build_section_from_stages, classification_color, default_class_label, load_class_defs, make_section_data, save_class_defs, scan_dir_for_copc};
+use crate::classify::{ClassMask, effective_class};
 use las::Point as LasPoint;
 
 const MOVE_SPEED: f32 = 0.5;
@@ -621,6 +622,61 @@ fn apply_z_clip(
     if let Some(mgr) = tile_mgr.as_mut() { mgr.z_clip = z_clip; }
 }
 
+/// The class set an op made right now is allowed to touch: the explicit
+/// "only from class N" restriction intersected with what is currently visible.
+///
+/// The visible set is *frozen into the op* rather than consulted at replay
+/// time. Ops are replayed on COPC nodes as they stream in and again on every
+/// node at export, which is what makes the exported file agree with the
+/// display by construction — and that only holds if an op's meaning is fixed
+/// when it is drawn. If it followed live visibility, an export an hour later
+/// with different classes toggled would reclassify a different set of points.
+///
+/// An empty result means the restriction and the visibility exclude each
+/// other — "only from class 5" while class 5 is hidden. The op would match
+/// nothing, so the callers refuse it and say so rather than committing a
+/// no-op that looks like a failure later.
+fn op_from_mask(classify_from: Option<u8>, class_vis: ClassVis) -> ClassMask {
+    ClassMask::from(classify_from).intersect(class_vis)
+}
+
+/// Explain an empty `op_from_mask`, for the status line.
+fn empty_from_mask_reason(classify_from: Option<u8>) -> String {
+    match classify_from {
+        Some(c) => format!(
+            "Nothing to do: \"only from class {c}\" is set, but class {c} is hidden. \
+             Show it in the Classes window, or clear the restriction.",
+        ),
+        None => "Nothing to do: every class is hidden. \
+                 Show at least one in the Classes window.".to_string(),
+    }
+}
+
+/// Push the visible class set onto every loaded data source, and report
+/// whether any of them changed.
+///
+/// The return value is what drives the colour rebuild, and it is deliberately
+/// "did any backend's value change" rather than "did the operator just toggle
+/// something": a stage or tile loaded while a filter is already in force
+/// arrives unfiltered, and this is what notices and repaints it.
+fn apply_class_vis(
+    stages: &mut [Stage],
+    copc_stages: &mut [CopcStage],
+    tile_mgr: &mut Option<TileStageManager>,
+    class_vis: ClassVis,
+) -> bool {
+    let mut changed = false;
+    for s in stages.iter_mut() {
+        if s.class_vis != class_vis { s.class_vis = class_vis; changed = true; }
+    }
+    for cs in copc_stages.iter_mut() {
+        if cs.class_vis != class_vis { cs.class_vis = class_vis; changed = true; }
+    }
+    if let Some(mgr) = tile_mgr.as_mut()
+        && mgr.class_vis != class_vis { mgr.class_vis = class_vis; changed = true; }
+    changed
+}
+
 /// Push the height colour-bar endpoints onto every loaded data source so the
 /// next colour rebuild uses them.
 fn apply_height_color(
@@ -756,6 +812,7 @@ fn pick_section_point(
     end: (f32, f32),
     depth: f32,
     z_clip: crate::raw_miniquad::ZClip,
+    class_vis: ClassVis,
     wx: f32,
     wy: f32,
 ) -> Option<(LasPoint, glam::Vec2)> {
@@ -772,6 +829,9 @@ fn pick_section_point(
     let mut best_dist = f32::MAX;
     let mut consider = |p: &LasPoint, along: f32, z: f32| {
         if !z_clip.contains(z) { return; }
+        // A hidden class is unpickable in the section view too — the same rule
+        // the 3D pick, the lasso and the ground fit follow.
+        if !class_vis.contains(effective_class(p)) { return; }
         let d = (along - wx).powi(2) + (z - wy).powi(2);
         if d < best_dist {
             best_dist = d;
@@ -1031,6 +1091,7 @@ fn gcp_window(
 fn classes_window(
     egui_ctx: &egui_macroquad::egui::Context,
     class_defs: &mut Option<ClassDefs>,
+    class_vis: &mut ClassVis,
     max_class: u8,
     save_status: &mut Option<String>,
 ) -> bool {
@@ -1049,22 +1110,70 @@ fn classes_window(
                 let mut extra: Vec<u8> = defs.keys().copied().filter(|id| *id > max_class).collect();
                 extra.sort();
                 ids.extend(extra);
+                // All / None / Invert act on the listed ids only. An id that is
+                // not listed cannot be switched off in this window, so leaving
+                // it alone is what keeps "N classes hidden" a number the
+                // operator can reconcile with what is on screen.
+                ui.horizontal(|ui| {
+                    ui.label("Show:");
+                    if ui.button("All").clicked() {
+                        for &id in &ids { class_vis.insert(id); }
+                    }
+                    if ui.button("None").clicked() {
+                        for &id in &ids { class_vis.remove(id); }
+                    }
+                    if ui.button("Invert").clicked() {
+                        for &id in &ids { let v = class_vis.contains(id); class_vis.set(id, !v); }
+                    }
+                });
+                let mut isolate: Option<u8> = None;
                 egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
-                    for id in ids {
+                    for id in ids.iter().copied() {
                         let entry = defs.entry(id).or_insert_with(|| {
                             (default_class_label(id), classification_color(id))
                         });
                         ui.horizontal(|ui| {
+                            let mut shown = class_vis.contains(id);
+                            if ui.checkbox(&mut shown, "")
+                                .on_hover_text("Show this class")
+                                .changed() {
+                                class_vis.set(id, shown);
+                            }
                             ui.label(format!("{:3}", id));
                             let mut c32 = rgb_arr_to_egui(entry.1);
                             if ui.color_edit_button_srgba(&mut c32).changed() {
                                 entry.1 = egui_to_rgb_arr(c32);
                                 colors_changed = true;
                             }
-                            ui.add(egui::TextEdit::singleline(&mut entry.0).desired_width(160.0));
+                            ui.add(egui::TextEdit::singleline(&mut entry.0).desired_width(140.0));
+                            if ui.small_button("only")
+                                .on_hover_text("Isolate: show only this class")
+                                .clicked() {
+                                // Over the listed ids only, like All/None/Invert:
+                                // ClassVis::single would also switch off the 200-odd
+                                // ids this window never shows, and the "N classes
+                                // hidden" indicator would stop meaning anything.
+                                isolate = Some(id);
+                            }
                         });
                     }
                 });
+                if let Some(keep) = isolate {
+                    for &id in &ids { class_vis.set(id, id == keep); }
+                }
+                ui.separator();
+                // Both of these are foot-guns, so they are said here rather
+                // than only in the README.
+                let hidden = ids.iter().filter(|&&id| !class_vis.contains(id)).count();
+                if hidden > 0 {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 180, 60),
+                        format!("{hidden} class{} hidden. Hidden classes cannot be picked, \
+                                 measured, sectioned, lassoed or fitted to either.",
+                                if hidden == 1 { "" } else { "es" }),
+                    );
+                }
+                ui.label("Visibility does not affect export — use Omit classes for that.");
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Save classes.txt").clicked() {
@@ -1133,6 +1242,7 @@ fn ground_tool_controls(
     offset: &mut f32,
     max_class: u8,
     class_defs: &Option<ClassDefs>,
+    hidden_classes: usize,
     status: &Option<String>,
     apply: &mut bool,
     cancel: &mut bool,
@@ -1142,6 +1252,17 @@ fn ground_tool_controls(
     let mut start = None;
     ui.separator();
     ui.label("Classify in plan view:");
+    // A view setting that silently changes what a destructive tool does needs
+    // to be visible from the tool, not only from the window that set it —
+    // otherwise the first report is "why did my lasso catch nothing?".
+    if hidden_classes > 0 {
+        ui.colored_label(
+            egui::Color32::from_rgb(255, 180, 60),
+            format!("{hidden_classes} class{} hidden — the lasso ignores {}.",
+                    if hidden_classes == 1 { "" } else { "es" },
+                    if hidden_classes == 1 { "it" } else { "them" }),
+        );
+    }
     ui.horizontal(|ui| {
         ui.label("To:");
         class_picker(ui, "ground_to", target, max_class, class_defs);
@@ -1537,6 +1658,10 @@ async fn main() {
     let mut z_clip_enabled = false;
     let mut z_clip_lo: f32 = 0.0;
     let mut z_clip_hi: f32 = height_range;
+    // Which classes are shown. A view setting like the height band: not saved
+    // to classes.txt, and deliberately not applied to export — see the note in
+    // the Classes window.
+    let mut class_vis = ClassVis::ALL;
 
     let mut tile_rgb_overrides: Vec<Option<[f32; 3]>> = if let Some(ref mgr) = tile_mgr {
         vec![None; mgr.tiles.len()]
@@ -1868,6 +1993,23 @@ async fn main() {
             crate::raw_miniquad::ZClip::OPEN
         };
         apply_z_clip(&mut stages, &mut copc_stages, &mut tile_mgr, z_clip);
+        // Same treatment for the visible class set. Unlike the height band this
+        // is baked into the colour buffers, so a change — including a file
+        // arriving unfiltered while a filter is on — has to force a rebuild.
+        let class_vis_changed = apply_class_vis(&mut stages, &mut copc_stages, &mut tile_mgr, class_vis);
+        // Rebuilt here rather than in each of the three per-mode blocks below,
+        // and unconditionally rather than only in Classification mode: the
+        // hidden-class sentinel rides in the colour buffer whatever the colour
+        // mode is, so every mode has to be repainted. One toggle therefore
+        // costs one colour rebuild — the same cost as changing colour mode,
+        // which is already accepted as interactive.
+        if class_vis_changed {
+            let mut gl = unsafe { get_internal_gl() };
+            gl.flush();
+            for st in stages.iter_mut() { st.rebuild_colors(&mut *gl.quad_context, color_mode); }
+            for cs in copc_stages.iter_mut() { cs.rebuild_colors(&mut *gl.quad_context, color_mode); }
+            if let Some(mgr) = tile_mgr.as_mut() { mgr.rebuild_colors(&mut *gl.quad_context, color_mode); }
+        }
 
         if !section_trash.is_empty() {
             let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
@@ -2200,7 +2342,7 @@ async fn main() {
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_sec_pointer = egui_ctx.is_pointer_over_area();
                 egui_wants_sec_keyboard = egui_ctx.wants_keyboard_input();
-                class_colors_changed = classes_window(egui_ctx, &mut class_defs, max_class, &mut classes_save_status);
+                class_colors_changed = classes_window(egui_ctx, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
@@ -2446,6 +2588,11 @@ async fn main() {
 
             // ---- Apply a classification op ----
             if do_apply_lasso && lasso.len() >= 3
+                && op_from_mask(classify_from, class_vis).is_empty() {
+                    classify_status = Some(empty_from_mask_reason(classify_from));
+                    lasso.clear();
+                    app_mode = AppMode::SectionView;
+            } else if do_apply_lasso && lasso.len() >= 3
                 && let (Some(start), Some(end)) = (section_start, section_end) {
                     // The op is stored in absolute world coordinates so it stays
                     // meaningful independently of the viewer origin, and of which
@@ -2457,7 +2604,7 @@ async fn main() {
                         section_depth as f64,
                         lasso.iter().map(|v| (v.x as f64, v.y as f64 + data_offset[2])).collect(),
                         classify_target,
-                        classify_from,
+                        op_from_mask(classify_from, class_vis),
                     );
 
                     let mut changed = 0usize;
@@ -2641,7 +2788,7 @@ async fn main() {
                         if let (Some(start), Some(end)) = (section_start, section_end) {
                             sec_picked_point = pick_section_point(
                                 &stages, &copc_section_raw, &tile_mgr,
-                                start, end, section_depth, z_clip, wx, wy,
+                                start, end, section_depth, z_clip, class_vis, wx, wy,
                             );
                         }
                     }
@@ -2664,7 +2811,7 @@ async fn main() {
             // the band that was in force at the time. Widening the band cannot
             // be served from that cache, so re-cut from the pinned corridor —
             // which is still resident, so this stays a memory operation.
-            if z_clip_changed && !copc_stages.is_empty()
+            if (z_clip_changed || class_vis_changed) && !copc_stages.is_empty()
                 && let (Some(start), Some(end)) = (section_start, section_end) {
                     let mut per_stage_raw: Vec<Vec<(LasPoint, f32, f32)>> = Vec::new();
                     let (mut h_min, mut h_max) = (f32::MAX, f32::MIN);
@@ -2686,7 +2833,8 @@ async fn main() {
                 section_color_mode_pinned = true;
             }
 
-            let class_rebuild = class_colors_changed && section_color_mode == ColorMode::Classification;
+            let class_rebuild = (class_colors_changed && section_color_mode == ColorMode::Classification)
+                || class_vis_changed;
             // Storing the ramp bounds is cheap; re-uploading every colour is
             // not. Only Height mode reads the ramp, so in any other mode the
             // new bounds are recorded and the upload waits until the view is
@@ -2970,7 +3118,7 @@ async fn main() {
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_pointer = egui_ctx.is_pointer_over_area();
                 egui_wants_keyboard = egui_ctx.wants_keyboard_input();
-                class_colors_changed = classes_window(egui_ctx, &mut class_defs, max_class, &mut classes_save_status);
+                class_colors_changed = classes_window(egui_ctx, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
@@ -3068,7 +3216,7 @@ async fn main() {
                             ui, &mut app_mode, ground_lasso.len(), lasso_kind,
                             is_top_view(pitch),
                             &mut classify_target, &mut classify_from, &mut ground_offset,
-                            max_class, &class_defs, &ground_status,
+                            max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                             &mut apply_ground_lasso, &mut cancel_ground_lasso,
                         ) { start_ground_lasso = Some(kind); }
                         if color_mode == ColorMode::Rgb {
@@ -3295,7 +3443,8 @@ async fn main() {
             if class_colors_changed {
                 apply_class_defs(&mut stages, &mut copc_stages, &mut tile_mgr, &class_defs);
             }
-            let class_rebuild = class_colors_changed && color_mode == ColorMode::Classification;
+            let class_rebuild = (class_colors_changed && color_mode == ColorMode::Classification)
+                || class_vis_changed;
             // Storing the ramp bounds is cheap; re-uploading every colour is
             // not. Only Height mode reads the ramp, so in any other mode the
             // new bounds are recorded and the upload waits until the view is
@@ -3407,7 +3556,7 @@ async fn main() {
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_pointer = egui_ctx.is_pointer_over_area();
                 egui_wants_keyboard = egui_ctx.wants_keyboard_input();
-                class_colors_changed = classes_window(egui_ctx, &mut class_defs, max_class, &mut classes_save_status);
+                class_colors_changed = classes_window(egui_ctx, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
@@ -3499,7 +3648,7 @@ async fn main() {
                             ui, &mut app_mode, ground_lasso.len(), lasso_kind,
                             is_top_view(pitch),
                             &mut classify_target, &mut classify_from, &mut ground_offset,
-                            max_class, &class_defs, &ground_status,
+                            max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                             &mut apply_ground_lasso, &mut cancel_ground_lasso,
                         ) { start_ground_lasso = Some(kind); }
                         if color_mode == ColorMode::Rgb {
@@ -3742,7 +3891,8 @@ async fn main() {
             if class_colors_changed {
                 apply_class_defs(&mut stages, &mut copc_stages, &mut tile_mgr, &class_defs);
             }
-            let class_rebuild = class_colors_changed && color_mode == ColorMode::Classification;
+            let class_rebuild = (class_colors_changed && color_mode == ColorMode::Classification)
+                || class_vis_changed;
             // Storing the ramp bounds is cheap; re-uploading every colour is
             // not. Only Height mode reads the ramp, so in any other mode the
             // new bounds are recorded and the upload waits until the view is
@@ -3887,7 +4037,7 @@ async fn main() {
             egui_macroquad::ui(|egui_ctx| {
                 egui_wants_pointer = egui_ctx.is_pointer_over_area();
                 egui_wants_keyboard = egui_ctx.wants_keyboard_input();
-                class_colors_changed = classes_window(egui_ctx, &mut class_defs, max_class, &mut classes_save_status);
+                class_colors_changed = classes_window(egui_ctx, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
                 egui_macroquad::egui::Window::new("Controls")
                     .default_pos([10.0, 10.0])
                     .show(egui_ctx, |ui| {
@@ -3991,7 +4141,7 @@ async fn main() {
                             ui, &mut app_mode, ground_lasso.len(), lasso_kind,
                             is_top_view(pitch),
                             &mut classify_target, &mut classify_from, &mut ground_offset,
-                            max_class, &class_defs, &ground_status,
+                            max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                             &mut apply_ground_lasso, &mut cancel_ground_lasso,
                         ) { start_ground_lasso = Some(kind); }
                         ui.label(format!(
@@ -4217,7 +4367,8 @@ async fn main() {
             if class_colors_changed {
                 apply_class_defs(&mut stages, &mut copc_stages, &mut tile_mgr, &class_defs);
             }
-            let class_rebuild = class_colors_changed && color_mode == ColorMode::Classification;
+            let class_rebuild = (class_colors_changed && color_mode == ColorMode::Classification)
+                || class_vis_changed;
             // Storing the ramp bounds is cheap; re-uploading every colour is
             // not. Only Height mode reads the ramp, so in any other mode the
             // new bounds are recorded and the upload waits until the view is
@@ -4293,7 +4444,12 @@ async fn main() {
             app_mode = AppMode::View3D;
         }
 
-        if apply_ground_lasso && ground_lasso.len() >= 3 {
+        if apply_ground_lasso && ground_lasso.len() >= 3
+            && op_from_mask(classify_from, class_vis).is_empty() {
+            ground_status = Some(empty_from_mask_reason(classify_from));
+            ground_lasso.clear();
+            app_mode = AppMode::View3D;
+        } else if apply_ground_lasso && ground_lasso.len() >= 3 {
             // Footprint and band in absolute world coordinates, so the op means
             // the same thing at export as it does on screen.
             let polygon: Vec<(f64, f64)> = ground_lasso.iter()
@@ -4365,7 +4521,7 @@ async fn main() {
                     0,
                     region,
                     classify_target,
-                    classify_from,
+                    op_from_mask(classify_from, class_vis),
                 );
 
                 let mut changed = 0usize;
