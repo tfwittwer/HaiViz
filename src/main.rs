@@ -23,6 +23,7 @@ const CORRIDOR_POINT_LIMIT: i64 = 60_000_000;
 mod raw_miniquad;
 mod spatial;
 mod polylines;
+mod gpkg;
 mod gcp;
 mod classify;
 mod export;
@@ -873,11 +874,16 @@ fn pick_section_point(
     best
 }
 
+#[allow(clippy::too_many_arguments)]
 fn polylines_window(
     egui_ctx: &egui_macroquad::egui::Context,
     poly_files: &mut Vec<polylines::PolylineFile>,
     selected_poly: &mut Option<polylines::PolyRef>,
     poly_load_error: &mut Option<String>,
+    poly_save_status: &mut Option<String>,
+    // A Salome save that would drop something, waiting for the operator to
+    // say yes: (file index, target path, what would be lost).
+    pending_salome: &mut Option<(usize, String, Vec<String>)>,
     data_offset: [f64; 3],
     background: Color,
 ) {
@@ -895,7 +901,9 @@ fn polylines_window(
             let default_color = if luma > 0.5 { BLACK } else { WHITE };
             if ui.button("Load Polyline File...").clicked() &&
                 let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Polyline", &["txt", "xyz", "poly", "dat", ""])
+                    .add_filter("Vectors", &["gpkg", "txt", "xyz", "poly", "dat", ""])
+                    .add_filter("GeoPackage", &["gpkg"])
+                    .add_filter("Salome ASCII", &["txt", "xyz", "poly", "dat", ""])
                     .pick_file()
                 {
                     match polylines::load(path.to_str().unwrap_or(""), data_offset, default_color) {
@@ -909,6 +917,8 @@ fn polylines_window(
             }
             ui.separator();
             let mut to_remove: Option<usize> = None;
+            // `(file, Some(new path))` is Save As; `(file, None)` is Save.
+            let mut save_request: Option<(usize, Option<String>)> = None;
             // File → layer → line. A GeoPackage is a container of named feature
             // tables, so the panel is a tree even when a Salome file gives it
             // only one layer to show.
@@ -923,11 +933,35 @@ fn polylines_window(
                             if selected_poly.map(|r| r.file) == Some(fi) { *selected_poly = None; }
                         }
                     });
+                    ui.horizontal(|ui| {
+                        // Save writes back in the format the file came from;
+                        // Save As is where the format can change, and where
+                        // the cost of changing it is stated first.
+                        if ui.add_enabled(pf.dirty, egui_macroquad::egui::Button::new("Save"))
+                            .clicked() {
+                            save_request = Some((fi, None));
+                        }
+                        if ui.button("Save As…").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("GeoPackage", &["gpkg"])
+                                .add_filter("Salome ASCII", &["txt", "xyz", "poly"])
+                                .set_file_name(pf.file_name())
+                                .save_file() {
+                            save_request = Some((fi, Some(path.to_string_lossy().into_owned())));
+                        }
+                    });
                     for (li, layer) in pf.layers.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut layer.visible, "")
                                 .on_hover_text("Show this layer");
                             ui.label(format!("{} ({})", layer.name, layer.polylines.len()));
+                            // Detected from the file when there was one to
+                            // detect; editable because a layer haiviz created
+                            // has no way to know what the cloud is in.
+                            ui.label("EPSG:");
+                            ui.add(egui_macroquad::egui::DragValue::new(&mut layer.srs_id)
+                                .range(0..=1_000_000))
+                                .on_hover_text("Coordinate reference system written to GeoPackage");
                         });
                         ui.indent(("poly_layer", fi, li), |ui| {
                             for (pi, pl) in layer.polylines.iter_mut().enumerate() {
@@ -949,7 +983,93 @@ fn polylines_window(
                 });
             }
             if let Some(fi) = to_remove { poly_files.remove(fi); }
+
+            if let Some((fi, target)) = save_request {
+                *poly_save_status = save_polylines(&mut poly_files[fi], fi, target, pending_salome);
+            }
+
+            // Salome carries no attributes, no layers and no CRS, so a
+            // GeoPackage saved as one loses things. Say what, and make the
+            // operator agree, rather than just doing it.
+            if let Some((fi, path, losses)) = pending_salome.clone() {
+                ui.separator();
+                ui.colored_label(
+                    egui_macroquad::egui::Color32::from_rgb(255, 180, 60),
+                    "Saving as Salome ASCII would lose:",
+                );
+                for l in &losses { ui.label(format!("  • {l}")); }
+                ui.horizontal(|ui| {
+                    if ui.button("Write anyway").clicked() {
+                        let pf = &mut poly_files[fi];
+                        pf.path = path.clone();
+                        pf.format = polylines::VectorFormat::Salome;
+                        pf.mtime = None;
+                        *poly_save_status = Some(match pf.save() {
+                            Ok(()) => format!("Saved {}", pf.file_name()),
+                            Err(e) => format!("Save failed: {e}"),
+                        });
+                        *pending_salome = None;
+                    }
+                    if ui.button("Cancel").clicked() { *pending_salome = None; }
+                });
+            }
+
+            if let Some(msg) = poly_save_status {
+                ui.label(msg.as_str());
+            }
         });
+}
+
+/// Perform a Save or Save As, returning the status line.
+///
+/// Save As decides the format from the chosen extension rather than from a
+/// dropdown, which keeps it consistent with loading — where the format comes
+/// from the file's magic bytes, not its name.
+fn save_polylines(
+    pf: &mut polylines::PolylineFile,
+    fi: usize,
+    target: Option<String>,
+    pending_salome: &mut Option<(usize, String, Vec<String>)>,
+) -> Option<String> {
+    use polylines::VectorFormat;
+    match target {
+        None => {
+            // Auto-save and manual save share this check: we always rewrite the
+            // whole file, so an unnoticed external edit would be destroyed
+            // rather than merely conflicted with.
+            if pf.changed_on_disk() {
+                return Some(format!(
+                    "{} changed on disk since it was loaded. Saving would overwrite                      those changes — use Save As to write somewhere else.",
+                    pf.file_name(),
+                ));
+            }
+            Some(match pf.save() {
+                Ok(()) => format!("Saved {}", pf.file_name()),
+                Err(e) => format!("Save failed: {e}"),
+            })
+        }
+        Some(path) => {
+            let ext = std::path::Path::new(&path)
+                .extension().and_then(|e| e.to_str()).unwrap_or("")
+                .to_ascii_lowercase();
+            let format = if ext == "gpkg" { VectorFormat::GeoPackage } else { VectorFormat::Salome };
+            if format == VectorFormat::Salome {
+                let losses = pf.salome_losses();
+                if !losses.is_empty() {
+                    *pending_salome = Some((fi, path, losses));
+                    return None;
+                }
+            }
+            pf.path = path;
+            pf.format = format;
+            // A new destination has no history to conflict with.
+            pf.mtime = None;
+            Some(match pf.save() {
+                Ok(()) => format!("Saved {}", pf.file_name()),
+                Err(e) => format!("Save failed: {e}"),
+            })
+        }
+    }
 }
 
 /// Ground control point overlay: load text tables, review/override the detected
@@ -1835,6 +1955,8 @@ async fn main() {
 
     let mut poly_files: Vec<polylines::PolylineFile> = Vec::new();
     let mut selected_poly: Option<polylines::PolyRef> = None;
+    let mut poly_save_status: Option<String> = None;
+    let mut pending_salome: Option<(usize, String, Vec<String>)> = None;
     let mut poly_load_error: Option<String> = None;
 
     let mut gcp_files: Vec<gcp::GcpFile> = Vec::new();
@@ -2528,7 +2650,7 @@ async fn main() {
                     &mut export_job, &mut export_status, &export_sources,
                     max_class, &class_defs,
                 );
-                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
+                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
                 gcp_window(egui_ctx, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
             });
 
@@ -3337,7 +3459,7 @@ async fn main() {
                     &mut export_job, &mut export_status, &export_sources,
                     max_class, &class_defs,
                 );
-                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
+                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
                 gcp_window(egui_ctx, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
             });
 
@@ -3766,7 +3888,7 @@ async fn main() {
                     &mut export_job, &mut export_status, &export_sources,
                     max_class, &class_defs,
                 );
-                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
+                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
                 gcp_window(egui_ctx, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
             });
 
@@ -4245,7 +4367,7 @@ async fn main() {
                     &mut export_job, &mut export_status, &export_sources,
                     max_class, &class_defs,
                 );
-                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, data_offset, background);
+                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
                 gcp_window(egui_ctx, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
             });
 

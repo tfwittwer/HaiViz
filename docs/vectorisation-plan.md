@@ -1,6 +1,6 @@
 # Manual vectorisation in HaiViz — implementation plan
 
-Status: **phases 0, 1 and 2a implemented; 2b–6 are still plan only.**
+Status: **phases 0, 1, 2a and 2b implemented; 3–6 are still plan only.**
 Written 2026-09-10.
 
 Paths below are relative to the workspace root (`haicloudrs/`).
@@ -427,6 +427,45 @@ Fallback if reading real-world files proves hairier than expected:
 `sqlite-parser-nom` (pure Rust, read-only b-tree/record parser) for the read
 half, hand-rolled writer for the other. Adds one small dependency.
 
+### Status: built (2b)
+
+`haiviz/src/gpkg.rs`, ~1450 lines including tests, no new dependencies. The
+fallback was not needed.
+
+One thing the plan did not account for: the GeoPackage metadata tables declare
+TEXT primary keys and unique constraints, and SQLite expects a matching
+`sqlite_autoindex_*` b-tree for each. Dropping the constraints would have
+avoided writing index b-trees but would have produced files that do not match
+the spec, so **index b-trees are implemented too** — leaf and interior, with
+dividers promoted out of the leaves rather than copied up, which is where index
+b-trees differ from table ones.
+
+Other details that only showed up against real files:
+
+- The text-encoding field at offset 56 is a 4-byte big-endian integer, not a
+  byte. Reading it as a byte rejects every file GDAL writes.
+- A closed ring in a `LINESTRING` layer is written with a repeated first vertex
+  and read back as `closed` with the repeat dropped. Nothing in the format
+  distinguishes that from an open line returning to its start, so there is no
+  information to lose — and it is what makes a ring survive a round trip.
+- `fid` is an `INTEGER PRIMARY KEY`, so it is a rowid alias: the record stores
+  NULL and the value is the cell key. Reading it out of the record gives NULL
+  for every feature in the file.
+- Feature ids are renumbered from 1 on write rather than carried over. A
+  feature read from one file has no claim on its id in another, and a duplicate
+  would silently drop a row.
+
+**Validation was indeed the real cost.** Five differential tests, skipped
+rather than failed when the tools are absent:
+
+| Test | Checks |
+|---|---|
+| `sqlite3_agrees_that_the_file_is_sound` | `integrity_check` + `foreign_key_check` on 300 features × 500 vertices, then indexed lookups |
+| `sqlite3_agrees_when_the_indexes_outgrow_one_page` | 300 layers, so the index b-tree splits; asserts the root really is an interior page |
+| `ogr_reads_the_layer_as_a_3d_line_string` | GDAL sees 3D Line String, the right feature count, and the EPSG resolves |
+| `a_file_written_by_gdal_reads_back_correctly` | reads a real GDAL file, rtree tables and triggers and all |
+| `a_gdal_file_round_trips_back_through_gdal` | GDAL → us → GDAL, with sub-millimetre coordinates intact |
+
 ### 7.3 Format handling
 
 - **Detect on load by magic bytes** (`SQLite format 3\0`), not extension —
@@ -565,7 +604,7 @@ what the tracer sees, tuning channel weights is guesswork.
 | **0** | A — spatial index, all three backends, tests + bench | ~400 | no — **done** |
 | **1** | B — class visibility: state, shader cull, all filter sites, `ClassOp` mask, Classes window UI | ~500 | **yes, standalone — done** |
 | **2a** | C — polyline model: f64, layers, mutability, undo, Salome writer | ~250 | marginally — **done** |
-| **2b** | C — GeoPackage read + write, EPSG detection, differential tests | ~1400 | **yes — overlay any GPKG** |
+| **2b** | C — GeoPackage read + write, EPSG detection, differential tests | ~1400 | **yes — overlay any GPKG — done** |
 | **3** | D — digitising mode, free vertex placement, panel wiring | ~450 | yes |
 | **4** | E — snapping, radius control, feedback, COPC guard + pinning | ~450 | yes, the core tool |
 | **5** | F — edge following, cost channels, livewire, heatmap | ~600 | yes |

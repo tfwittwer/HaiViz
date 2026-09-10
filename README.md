@@ -205,21 +205,57 @@ Click **Back to 3D** to return.
 ## Polylines
 
 Open the **Polylines** window and **Load Polyline File…** to overlay vector
-lines on the cloud. The format is Salome Hydro polyline ASCII: one `x y z` per
-line, with blank lines separating individual polylines. Coordinates are
-interpreted in the same CRS as the cloud (the viewer subtracts the data origin
-automatically).
+lines on the cloud. Two formats are read and written:
 
-Each loaded file is listed with its polylines, where you can:
+- **GeoPackage** (`.gpkg`) — the OGC container QGIS and GDAL use. Every line
+  and polygon feature table in the file becomes a layer. 3D geometry
+  (`LineStringZ`, `MultiLineStringZ`, `PolygonZ`) keeps its elevations; a 2D
+  layer loads with `z = 0`, which is what the file actually said.
+- **Salome Hydro polyline ASCII** — one `x y z` per line, with blank lines
+  separating individual polylines. No attributes, no layers, no CRS.
 
+The format is detected from the file's **contents**, not its extension, so a
+GeoPackage named `.db` and a Salome file named `.txt` both load correctly.
+Coordinates are interpreted in the same CRS as the cloud (the viewer subtracts
+the data origin automatically) and are held in full double precision, so an
+external GeoPackage round-trips without its coordinates being quantised.
+
+Each loaded file is listed as a tree — file, then layer, then line — where you
+can:
+
+- toggle a **layer**'s visibility and set its **EPSG** code,
 - select a polyline,
 - change its **colour**,
 - adjust its **radius** (line thickness, in metres — this sets how wide it draws
-  in the section view), and
+  in the section view),
+- **Save** (writes back in the format it came from) or **Save As…** (the
+  extension you choose decides the format), and
 - **Remove file** to unload it.
 
 Polylines are drawn both in the 3D view and, where they intersect the corridor,
 in cross-section view.
+
+### Saving
+
+Saves are atomic: the new file is written beside the target and renamed over it,
+so a crash mid-write cannot destroy the version that was already there. If the
+file changed on disk since it was loaded — someone editing the same GeoPackage
+in QGIS — the save stops and says so rather than overwriting their work.
+
+Salome ASCII carries no attributes, no layers and no CRS, so saving a
+GeoPackage as one loses things. haiviz lists exactly what would go and waits for
+you to confirm.
+
+Attribute columns are preserved. A GeoPackage from QGIS is written back with the
+columns it arrived with, values and all — only `name`, `n_vertices` and
+`length_3d` are refreshed, because after an edit the stored ones are simply
+wrong. A layer haiviz creates gets `fid, geom, name, code, n_vertices,
+length_3d, created`.
+
+**A `-wal` sidecar is refused.** A write-ahead log means committed rows live
+outside the main file, so reading it alone would quietly give you the state
+before whatever the other program last wrote. Close the file there, or run
+`sqlite3 <file> "PRAGMA wal_checkpoint(TRUNCATE);"` first.
 
 ## GCP Overlay
 

@@ -38,6 +38,7 @@
 #![allow(dead_code)]
 
 use macroquad::prelude::*;
+use crate::gpkg;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -173,11 +174,27 @@ pub struct Layer {
     pub polylines: Vec<Polyline>,
     /// Whether the layer is drawn. Purely a view setting.
     pub visible: bool,
+    /// EPSG code the coordinates are in, `0` when the file did not say.
+    /// Salome carries no CRS at all, which is one of the things a GeoPackage →
+    /// Salome conversion drops.
+    pub srs_id: i32,
+    /// The geometry column's name, so a file from QGIS keeps it.
+    pub geom_column: String,
+    /// Non-geometry columns as declared, in table order. Empty means "a layer
+    /// haiviz made", which gets the default set from §7.2 on the way out.
+    pub columns: Vec<(String, String)>,
 }
 
 impl Layer {
     pub fn new(name: impl Into<String>) -> Layer {
-        Layer { name: name.into(), polylines: Vec::new(), visible: true }
+        Layer {
+            name: name.into(),
+            polylines: Vec::new(),
+            visible: true,
+            srs_id: 0,
+            geom_column: "geom".to_string(),
+            columns: Vec::new(),
+        }
     }
 }
 
@@ -417,7 +434,10 @@ impl PolylineFile {
                 atomic_write(&self.path, body.as_bytes())?;
             }
             VectorFormat::GeoPackage => {
-                return Err("GeoPackage writing is not implemented yet".to_string());
+                let layers: Vec<gpkg::GpkgLayer> =
+                    self.layers.iter().map(to_gpkg_layer).collect();
+                let bytes = gpkg::encode(&layers)?;
+                atomic_write(&self.path, &bytes)?;
             }
         }
         self.mtime = fs::metadata(&self.path).and_then(|m| m.modified()).ok();
@@ -429,6 +449,9 @@ impl PolylineFile {
     /// §7.3. Empty means the conversion is lossless.
     pub fn salome_losses(&self) -> Vec<String> {
         let mut out = Vec::new();
+        if self.layers.iter().any(|l| l.srs_id != 0) {
+            out.push("the coordinate reference system is not recorded".to_string());
+        }
         if self.layers.len() > 1 {
             out.push(format!(
                 "{} layers are flattened into one file", self.layers.len(),
@@ -519,12 +542,7 @@ pub fn detect_format(path: &str) -> VectorFormat {
 pub fn load(path: &str, origin: [f64; 3], default_color: Color) -> Result<PolylineFile, String> {
     let mut pf = match detect_format(path) {
         VectorFormat::Salome => load_salome(path, default_color)?,
-        VectorFormat::GeoPackage => {
-            return Err(format!(
-                "{}: GeoPackage reading is not implemented yet",
-                Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path),
-            ));
-        }
+        VectorFormat::GeoPackage => load_gpkg(path, default_color)?,
     };
     pf.mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
     pf.refresh_view(origin);
@@ -560,6 +578,71 @@ fn load_salome(path: &str, default_color: Color) -> Result<PolylineFile, String>
 
     pf.layers.push(layer);
     Ok(pf)
+}
+
+/// Read a GeoPackage: one `Layer` per feature table, one `Polyline` per part.
+///
+/// A multi-linestring row becomes several lines sharing the row's attributes,
+/// so nothing is dropped and nothing is invented.
+fn load_gpkg(path: &str, default_color: Color) -> Result<PolylineFile, String> {
+    let mut pf = PolylineFile::new(path, VectorFormat::GeoPackage);
+    for gl in gpkg::read(path)? {
+        let mut layer = Layer::new(&gl.name);
+        layer.srs_id = gl.srs_id;
+        layer.geom_column = gl.geom_column.clone();
+        layer.columns = gl.columns.clone();
+        for f in gl.features {
+            // A `name` column is what the panel shows; anything else keeps its
+            // place in `attrs` and is written back untouched.
+            let name = f.attrs.get("name")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("Polyline {}", layer.polylines.len() + 1));
+            let mut pl = Polyline::from_points(name, default_color, f.points);
+            pl.closed = f.closed;
+            pl.attrs = f.attrs;
+            layer.polylines.push(pl);
+        }
+        pf.layers.push(layer);
+    }
+    if pf.layers.is_empty() {
+        return Err(format!(
+            "{}: no line or polygon layers in this GeoPackage",
+            Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path),
+        ));
+    }
+    Ok(pf)
+}
+
+fn to_gpkg_layer(layer: &Layer) -> gpkg::GpkgLayer {
+    let mut gl = gpkg::GpkgLayer::new(&layer.name, layer.srs_id);
+    gl.geom_column = layer.geom_column.clone();
+    // A layer read from a file keeps the columns it arrived with; one haiviz
+    // created gets the default set.
+    if !layer.columns.is_empty() { gl.columns = layer.columns.clone(); }
+
+    let has = |c: &str| gl.columns.iter().any(|(n, _)| n == c);
+    for pl in &layer.polylines {
+        // Start from what came out of the file, so columns haiviz knows nothing
+        // about survive the round trip verbatim.
+        let mut attrs = pl.attrs.clone();
+        // The derived ones are refreshed rather than preserved: after an edit
+        // the stored vertex count and length are simply wrong, and a stale
+        // number is worse than none.
+        if has("name") { attrs.insert("name".into(), pl.name.clone()); }
+        if has("n_vertices") { attrs.insert("n_vertices".into(), pl.len().to_string()); }
+        if has("length_3d") { attrs.insert("length_3d".into(), format!("{:.4}", pl.length_3d())); }
+        if has("created") { attrs.entry("created".into()).or_insert_with(gpkg::iso8601_now); }
+        attrs.retain(|k, _| has(k));
+
+        gl.features.push(gpkg::Feature {
+            fid: 0,
+            points: pl.points.clone(),
+            closed: pl.closed,
+            attrs,
+        });
+    }
+    gl
 }
 
 fn flush(current: &mut Vec<[f64; 3]>, polylines: &mut Vec<Polyline>, color: Color) {
@@ -981,6 +1064,88 @@ mod tests {
         let vp = glam::Mat4::IDENTITY;
         assert_eq!(pick(&files, &vp, 0.0, 0.0, 100.0, 100.0, 1e6), None);
         assert_eq!(pick_vertex(&files, &vp, 0.0, 0.0, 100.0, 100.0, 1e6), None);
+    }
+
+    #[test]
+    fn a_geopackage_round_trips_through_the_model() {
+        let path = tmp("model.gpkg");
+        let mut pf = PolylineFile::new(&path, VectorFormat::GeoPackage);
+        let mut layer = Layer::new("kerbs");
+        layer.srs_id = 28992;
+        pf.layers.push(layer);
+        pf.refresh_view([0.0; 3]);
+
+        let a = pf.add_line(0, Polyline::from_points("left kerb", WHITE, vec![
+            [208_802.001, 373_320.002, 12.003],
+            [208_812.5, 373_320.0, 12.25],
+            [208_820.0, 373_325.0, 13.0],
+        ])).unwrap();
+        let b = pf.add_line(0, Polyline::from_points("island", WHITE, vec![
+            [208_830.0, 373_310.0, 14.0], [208_840.0, 373_310.0, 14.0], [208_840.0, 373_320.0, 14.0],
+        ])).unwrap();
+        pf.set_closed(b, true);
+        pf.save().expect("saves");
+        assert!(!pf.dirty);
+
+        let back = load(&path, [208_800.0, 373_300.0, 0.0], WHITE).expect("loads");
+        assert_eq!(back.format, VectorFormat::GeoPackage);
+        assert_eq!(back.layers.len(), 1);
+        assert_eq!(back.layers[0].name, "kerbs");
+        assert_eq!(back.layers[0].srs_id, 28992);
+
+        let lines = &back.layers[0].polylines;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].name, "left kerb", "the name column drives the panel label");
+        assert_eq!(lines[0].points(), pf.get(a).unwrap().points(),
+                   "world coordinates must be bit-exact through the file");
+        assert!(lines[1].closed, "a ring must not come back as an open line");
+        assert_eq!(lines[1].points().len(), 3, "and not with a repeated vertex either");
+        // Derived attributes are refreshed on write, not carried over stale.
+        assert_eq!(lines[0].attrs.get("n_vertices").map(String::as_str), Some("3"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn columns_haiviz_knows_nothing_about_survive_a_rewrite() {
+        // The point of keeping `attrs` verbatim: a file from QGIS carrying its
+        // own columns must not lose them just because haiviz opened it.
+        let path = tmp("extra.gpkg");
+        let mut pf = PolylineFile::new(&path, VectorFormat::GeoPackage);
+        let mut layer = Layer::new("survey");
+        layer.srs_id = 28992;
+        layer.columns = vec![
+            ("name".to_string(), "TEXT".to_string()),
+            ("surveyor".to_string(), "TEXT".to_string()),
+            ("epoch".to_string(), "INTEGER".to_string()),
+        ];
+        pf.layers.push(layer);
+        pf.refresh_view([0.0; 3]);
+        let mut line = Polyline::from_points("a", WHITE, vec![[0.0; 3], [1.0, 1.0, 1.0]]);
+        line.attrs.insert("surveyor".to_string(), "TW".to_string());
+        line.attrs.insert("epoch".to_string(), "2026".to_string());
+        pf.add_line(0, line);
+        pf.save().expect("saves");
+
+        let back = load(&path, [0.0; 3], WHITE).expect("loads");
+        let pl = &back.layers[0].polylines[0];
+        assert_eq!(pl.attrs.get("surveyor").map(String::as_str), Some("TW"));
+        assert_eq!(pl.attrs.get("epoch").map(String::as_str), Some("2026"));
+        assert!(!back.layers[0].columns.iter().any(|(n, _)| n == "code"),
+                "haiviz must not graft its own columns onto someone else's table");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_geopackage_says_what_a_salome_save_would_cost() {
+        let mut pf = PolylineFile::new(tmp("cost.gpkg"), VectorFormat::GeoPackage);
+        let mut layer = Layer::new("kerbs");
+        layer.srs_id = 28992;
+        pf.layers.push(layer);
+        pf.refresh_view([0.0; 3]);
+        pf.add_line(0, Polyline::from_points("a", WHITE, vec![[0.0; 3], [1.0, 1.0, 1.0]]));
+        let losses = pf.salome_losses();
+        assert!(losses.iter().any(|l| l.contains("coordinate reference system")), "{losses:?}");
+        assert!(losses.iter().any(|l| l.contains("names")), "{losses:?}");
     }
 
     #[test]
