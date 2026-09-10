@@ -454,16 +454,16 @@ fn resolve_snap(
         && h.t < best_t { anchor = Some(h.pos); }
 
     if dig.snap_mode == SnapMode::Existing {
-        // Anchor on the cloud if there is one, so the search is around the
-        // surface; otherwise use the ray at the height band's middle.
-        let probe = match anchor {
-            Some(a) => to_world(a),
-            None => {
-                let z = origin[2] + dir[2] * 0.0;
-                to_world([origin[0], origin[1], z])
-            }
-        };
-        return match polylines::nearest_on_lines(poly_files, probe, r as f64) {
+        // Against the ray, not against a point on the surface: the cursor may
+        // be over a gap in the cloud, and tying into an existing line is
+        // exactly what one does there.
+        let o = [
+            origin[0] as f64 + data_offset[0],
+            origin[1] as f64 + data_offset[1],
+            origin[2] as f64 + data_offset[2],
+        ];
+        let d = [dir[0] as f64, dir[1] as f64, dir[2] as f64];
+        return match polylines::nearest_on_lines_to_ray(poly_files, o, d, r as f64) {
             Some((w, _)) => SnapHit::good(w),
             None => empty("No polyline within the snap radius."),
         };

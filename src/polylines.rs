@@ -868,6 +868,87 @@ pub fn nearest_on_lines(
     best.map(|(_, at, who)| (at, who))
 }
 
+/// The nearest point on any visible polyline to a ray, within `r` metres of it.
+///
+/// The ray form rather than a point form, because there is no sensible point to
+/// search around when the cursor is over a gap in the cloud — which is exactly
+/// when tying into an existing line matters most. Under an orthographic camera
+/// the ray origin sits far behind the data, so distances along it are large and
+/// positive; only the perpendicular distance is compared.
+pub fn nearest_on_lines_to_ray(
+    files: &[PolylineFile],
+    origin: [f64; 3],
+    dir: [f64; 3],
+    r: f64,
+) -> Option<([f64; 3], PolyRef)> {
+    let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    // NaN as well as zero: normalising by either poisons every comparison below.
+    if len <= 0.0 || len.is_nan() { return None; }
+    let d = [dir[0] / len, dir[1] / len, dir[2] / len];
+
+    let mut best: Option<(f64, f64, [f64; 3], PolyRef)> = None;
+    let mut consider = |perp: f64, along: f64, at: [f64; 3], who: PolyRef| {
+        if perp > r || along < 0.0 { return; }
+        // Frontmost wins, like the point-cloud ray pick: within the tolerance
+        // the operator means the line facing them.
+        if best.as_ref().is_none_or(|(_, ba, _, _)| along < *ba) {
+            best = Some((perp, along, at, who));
+        }
+    };
+
+    for (at, pl) in visible_lines(files) {
+        for v in pl.points() {
+            let (perp, along) = ray_distance_to_point(origin, d, *v);
+            consider(perp, along, *v, at);
+        }
+        for (i, j) in pl.segments() {
+            let (a, b) = (pl.points()[i], pl.points()[j]);
+            if let Some((q, perp, along)) = ray_closest_on_segment(origin, d, a, b) {
+                // A hair worse than a vertex at the same place, so tying to an
+                // endpoint lands exactly on it.
+                consider(perp * (1.0 + 1e-9) + 1e-9, along, q, at);
+            }
+        }
+    }
+    best.map(|(_, _, at, who)| (at, who))
+}
+
+/// Perpendicular distance from a normalised ray to a point, and how far along
+/// the ray the foot of that perpendicular lies.
+fn ray_distance_to_point(o: [f64; 3], d: [f64; 3], p: [f64; 3]) -> (f64, f64) {
+    let v = [p[0] - o[0], p[1] - o[1], p[2] - o[2]];
+    let t = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
+    let perp = [v[0] - t * d[0], v[1] - t * d[1], v[2] - t * d[2]];
+    ((perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]).sqrt(), t)
+}
+
+/// Closest approach between a ray and a segment: the point on the segment, its
+/// distance to the ray, and how far along the ray that happens.
+fn ray_closest_on_segment(
+    o: [f64; 3], d: [f64; 3], a: [f64; 3], b: [f64; 3],
+) -> Option<([f64; 3], f64, f64)> {
+    let e = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ee = e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
+    if ee <= 0.0 { return None; }
+    let w = [a[0] - o[0], a[1] - o[1], a[2] - o[2]];
+    let de = d[0] * e[0] + d[1] * e[1] + d[2] * e[2];
+    let dw = d[0] * w[0] + d[1] * w[1] + d[2] * w[2];
+    let ew = e[0] * w[0] + e[1] * w[1] + e[2] * w[2];
+
+    // `d` is normalised, so the usual denominator |d|²|e|² - (d·e)² is
+    // ee - de².
+    let denom = ee - de * de;
+    let s = if denom.abs() < 1e-12 {
+        // Parallel: any point will do, so take the segment's start.
+        0.0
+    } else {
+        ((de * dw - ew) / denom).clamp(0.0, 1.0)
+    };
+    let q = [a[0] + s * e[0], a[1] + s * e[1], a[2] + s * e[2]];
+    let (perp, along) = ray_distance_to_point(o, d, q);
+    Some((q, perp, along))
+}
+
 /// Closest point on segment `a`–`b` to `p`, and its distance.
 fn closest_on_segment(a: [f64; 3], b: [f64; 3], p: [f64; 3]) -> ([f64; 3], f64) {
     let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
@@ -1219,6 +1300,41 @@ mod tests {
         let mut files = files;
         files[0].layers[0].visible = false;
         assert!(nearest_on_lines(&files, [5.0, 0.3, 0.0], 1.0).is_none());
+    }
+
+    #[test]
+    fn snapping_to_a_line_works_from_a_ray_with_no_cloud_under_it() {
+        // The case the point form could not serve: the cursor is over a gap,
+        // so there is no surface point to search around — which is exactly
+        // when tying into an existing line matters.
+        let mut pf = PolylineFile::new(tmp("rayline"), VectorFormat::Salome);
+        pf.layers.push(Layer::new("l"));
+        pf.refresh_view([0.0; 3]);
+        pf.add_line(0, Polyline::from_points("a", WHITE, vec![
+            [0.0, 0.0, 5.0], [10.0, 0.0, 5.0],
+        ]));
+        let files = vec![pf];
+
+        // Straight down onto the middle of the segment.
+        let (at, _) = nearest_on_lines_to_ray(&files, [5.0, 0.0, 100.0], [0.0, 0.0, -1.0], 0.5)
+            .expect("hits");
+        assert_eq!(at, [5.0, 0.0, 5.0]);
+
+        // Straight down near the endpoint: the vertex wins.
+        let (at, _) = nearest_on_lines_to_ray(&files, [10.02, 0.0, 100.0], [0.0, 0.0, -1.0], 0.5)
+            .expect("hits");
+        assert_eq!(at, [10.0, 0.0, 5.0]);
+
+        // Oblique, which the point form could not do at all.
+        let (at, _) = nearest_on_lines_to_ray(&files, [5.0, -50.0, 55.0], [0.0, 1.0, -1.0], 0.5)
+            .expect("hits");
+        assert!((at[0] - 5.0).abs() < 1e-6 && (at[2] - 5.0).abs() < 1e-6, "{at:?}");
+
+        // Too far off the line, and pointing away, both give nothing.
+        assert!(nearest_on_lines_to_ray(&files, [5.0, 20.0, 100.0], [0.0, 0.0, -1.0], 0.5).is_none());
+        assert!(nearest_on_lines_to_ray(&files, [5.0, 0.0, 100.0], [0.0, 0.0, 1.0], 0.5).is_none());
+        // A degenerate direction is refused rather than dividing by zero.
+        assert!(nearest_on_lines_to_ray(&files, [5.0, 0.0, 100.0], [0.0; 3], 0.5).is_none());
     }
 
     #[test]
