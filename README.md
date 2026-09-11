@@ -357,27 +357,47 @@ is snapped at full resolution as it is placed; if any of them has nothing within
 the radius the click is refused and says why, rather than committing a route
 with invented heights. `Backspace` takes back the whole traced click.
 
-Around each new vertex, the points in a square window (40 m by default) are
-binned into a grid of cells holding about four points each, at most 512 × 512.
-Five channels are measured per cell and combined into an edge strength, with a
-weight each in the panel:
+**How it works.** When you place a vertex, haiviz looks at the points in a
+square around it — the **Window**, 40 m by default — and gives every small patch
+a score for how much it looks like an edge. The path from that vertex to the
+cursor then takes the route with the highest scores, the way water finds a
+channel, instead of the straight line. So nothing is traced until the first
+vertex is down, and the cursor has to be inside the window.
 
-| Channel | Finds |
-|---------|-------|
-| **Height step** | Kerbs, breaklines, ditch edges, embankment tops |
-| **Height spread** | Walls, building footprints — anything vertical |
-| **Intensity** | Painted road markings |
-| **Class change** | Vegetation or buildings against ground |
-| **Data edge** | Where the points stop: the cloud's boundary, roof outlines |
+**Follow** chooses what counts as an edge:
 
-The cheapest route from the vertex to every cell in the window is worked out
-once, so following the cursor afterwards costs nothing.
+| Follow | Traces |
+|--------|--------|
+| **Balanced** (default) | A bit of everything; height steps and markings count most |
+| **Kerbs & breaklines** | Sudden changes in ground height, and little else |
+| **Road markings** | Paint on the road — changes in intensity |
+| **Walls & buildings** | Vertical faces, boundaries between classes, and where the points stop |
 
-The **edge heatmap** (`H`) draws that strength over the window: nothing where
-there is no edge, violet through orange to yellow as it strengthens. Use it to
-tune the weights — if the kerb you want is not bright, the tracer cannot see it
-either. Hidden classes and the height band are left out of the grid entirely, so
-hiding vegetation is often the quickest way to make a kerb stand out.
+The **heatmap** (`H`) shows the scores, laid on the ground: nothing where there
+is no edge, violet through orange to yellow as it strengthens. Bright is where
+the path wants to go — if what you want to trace is not bright, the tracer
+cannot see it. **showing** switches the heatmap to one ingredient of the score
+at a time, to see what each picks up, and the panel says for the spot under the
+cursor how strong the edge is and which ingredient makes it.
+
+**When the path takes a wrong turn:** click closer, since a shorter hop leaves
+it less room to wander; hide the classes that distract it — vegetation, cars —
+which leaves them out entirely; pick a different **Follow**; or press `E` for a
+straight segment.
+
+**Fine-tune** (folded away in the panel) holds the numbers behind the presets.
+The weights are relative: only how they compare matters.
+
+| Setting | Raise it to |
+|---------|-------------|
+| **Height step** | Follow kerbs, breaklines and ditch edges more strongly |
+| **Height spread** | Follow walls, poles and building edges more strongly |
+| **Intensity** | Follow painted markings and changes of surface more strongly |
+| **Class change** | Follow boundaries between classes more strongly |
+| **Data edge** | Follow the edge of the scanned area more strongly |
+| **Full step at** | Need a taller step before it counts as a full edge — lower it for low kerbs, raise it if small bumps pull the path off course |
+| **Full spread at** | Need more vertical extent before a cell counts as a wall |
+| **Window** | Look further ahead from the last vertex — slower to trace, and more room to wander |
 
 Edge following is a 3D-view tool. Shift-click still places a free, straight
 vertex, and with the cursor outside the window the rubber band is straight

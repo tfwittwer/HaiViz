@@ -1728,6 +1728,154 @@
         }
     }
 
+    // ---- Edge-following heatmap ----
+
+    /// Draws the edge-following heatmap: a mesh draped on the ground, with the
+    /// edge scores as its texture. GPU side only — the geometry and colours
+    /// come from `edge_follow::Trace`.
+    ///
+    /// The mesh stays on the GPU and is replaced only for a new raster; a new
+    /// field (a weight changed, or another channel shown) only rewrites the
+    /// texture. At the 512 × 512 cap that is the difference between re-sending
+    /// a quarter of a million vertices and a megabyte of colour.
+    pub struct HeatmapRenderer {
+        pipeline: Pipeline,
+        loaded: Option<HeatmapMesh>,
+    }
+
+    struct HeatmapMesh {
+        bindings: Bindings,
+        texture: TextureId,
+        index_count: i32,
+        size: (usize, usize),
+        geometry_key: u64,
+        colour_key: (u64, u8),
+    }
+
+    impl HeatmapRenderer {
+        pub fn new(ctx: &mut dyn RenderingBackend) -> Self {
+            let shader = ctx.new_shader(
+                ShaderSource::Glsl { vertex: heatmap_shader::VERTEX, fragment: heatmap_shader::FRAGMENT },
+                heatmap_shader::meta(),
+            ).unwrap();
+            let pipeline = ctx.new_pipeline(
+                &[BufferLayout::default()],
+                &[
+                    VertexAttribute::new("pos", VertexFormat::Float3),
+                    VertexAttribute::new("uv", VertexFormat::Float2),
+                ],
+                shader,
+                PipelineParams {
+                    // No depth test: the mesh lies at the ground's lowest
+                    // returns, among points that would cover nearly all of it.
+                    depth_test: Comparison::Always,
+                    depth_write: false,
+                    color_blend: Some(BlendState::new(
+                        Equation::Add,
+                        BlendFactor::Value(BlendValue::SourceAlpha),
+                        BlendFactor::OneMinusValue(BlendValue::SourceAlpha),
+                    )),
+                    ..Default::default()
+                },
+            );
+            HeatmapRenderer { pipeline, loaded: None }
+        }
+
+        pub fn is_loaded(&self) -> bool { self.loaded.is_some() }
+
+        /// Make the GPU copy match a trace. `geometry` is only called for a new
+        /// raster, and `colours` only when the field or the channel shown has
+        /// changed — both are expensive to produce at full size.
+        pub fn sync(
+            &mut self,
+            ctx: &mut dyn RenderingBackend,
+            geometry_key: u64,
+            colour_key: (u64, u8),
+            size: (usize, usize),
+            geometry: impl FnOnce() -> (Vec<[f32; 5]>, Vec<u32>),
+            colours: impl FnOnce() -> Vec<u8>,
+        ) {
+            let same_mesh = self.loaded.as_ref()
+                .is_some_and(|m| m.geometry_key == geometry_key && m.size == size);
+            if !same_mesh {
+                self.release(ctx);
+                let (vertices, indices) = geometry();
+                let rgba = colours();
+                let vbuf = ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Immutable, BufferSource::slice(&vertices));
+                let ibuf = ctx.new_buffer(BufferType::IndexBuffer, BufferUsage::Immutable, BufferSource::slice(&indices));
+                let texture = ctx.new_texture_from_rgba8(size.0 as u16, size.1 as u16, &rgba);
+                ctx.texture_set_filter(texture, FilterMode::Nearest, MipmapFilterMode::None);
+                self.loaded = Some(HeatmapMesh {
+                    bindings: Bindings { vertex_buffers: vec![vbuf], index_buffer: ibuf, images: vec![texture] },
+                    texture,
+                    index_count: indices.len() as i32,
+                    size,
+                    geometry_key,
+                    colour_key,
+                });
+            } else if let Some(m) = self.loaded.as_mut()
+                && m.colour_key != colour_key {
+                ctx.texture_update(m.texture, &colours());
+                m.colour_key = colour_key;
+            }
+        }
+
+        /// Draw into `viewport` of the default framebuffer.
+        pub fn draw(&self, ctx: &mut dyn RenderingBackend, mvp: &glam::Mat4, viewport: (i32, i32, i32, i32)) {
+            let Some(m) = &self.loaded else { return };
+            ctx.begin_default_pass(PassAction::Nothing);
+            ctx.apply_viewport(viewport.0, viewport.1, viewport.2, viewport.3);
+            ctx.apply_pipeline(&self.pipeline);
+            ctx.apply_bindings(&m.bindings);
+            ctx.apply_uniforms(UniformsSource::table(&heatmap_shader::Uniforms { mvp: *mvp }));
+            ctx.draw(0, m.index_count, 1);
+            ctx.end_render_pass();
+        }
+
+        pub fn release(&mut self, ctx: &mut dyn RenderingBackend) {
+            if let Some(m) = self.loaded.take() {
+                for vb in m.bindings.vertex_buffers { ctx.delete_buffer(vb); }
+                ctx.delete_buffer(m.bindings.index_buffer);
+                ctx.delete_texture(m.texture);
+            }
+        }
+    }
+
+    pub mod heatmap_shader {
+        use miniquad::*;
+
+        pub const VERTEX: &str = r#"#version 100
+            attribute vec3 pos;
+            attribute vec2 uv;
+            uniform mat4 mvp;
+            varying mediump vec2 v_uv;
+            void main() {
+                gl_Position = mvp * vec4(pos, 1.0);
+                v_uv = uv;
+            }"#;
+
+        pub const FRAGMENT: &str = r#"#version 100
+            uniform sampler2D tex;
+            varying mediump vec2 v_uv;
+            void main() {
+                gl_FragColor = texture2D(tex, v_uv);
+            }"#;
+
+        pub fn meta() -> ShaderMeta {
+            ShaderMeta {
+                images: vec!["tex".to_string()],
+                uniforms: UniformBlockLayout {
+                    uniforms: vec![UniformDesc::new("mvp", UniformType::Mat4)],
+                },
+            }
+        }
+
+        #[repr(C)]
+        pub struct Uniforms {
+            pub mvp: glam::Mat4,
+        }
+    }
+
     // ---- COPC Stage ----
 
     /// Upper bound on the points a snap neighbourhood pin may hold.

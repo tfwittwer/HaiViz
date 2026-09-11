@@ -701,9 +701,19 @@ Where it differs from the sketch above:
   both reach it.
 - **Backspace takes back a whole traced click**, not one vertex of it
   (`Digitise::clicks`).
-- **The heatmap is a flat translucent quad above the window's highest point**,
-  drawn after every other overlay so its depth hides nothing. Draping it on
-  z_min would take 262 k quads.
+- **The heatmap is draped on the ground**: a vertex at every cell corner at the
+  local z_min, drawn through its own pipeline (`HeatmapRenderer`) with no depth
+  test, since the ground points it lies among would hide it. The mesh uploads
+  once per raster; a weight change or a different channel only re-uploads the
+  texture. It first shipped as a flat quad above the window's highest point,
+  which lines up only from straight above — from an angle the edges showed
+  beside where they were.
+- **The panel leads with presets** — Balanced, Kerbs & breaklines, Road
+  markings, Walls & buildings — with the raw weights folded under "Fine-tune",
+  each saying what raising it does. The heatmap can show any single channel,
+  and a readout names the channels making the edge under the cursor. The first
+  version showed five bare weights and two thresholds, which did not explain
+  themselves.
 - On COPC the pinned neighbourhood widens to the window while tracing — centred
   on the cursor, not the anchor.
 - **Step 5, the corridor constraint, is not built.**

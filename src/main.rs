@@ -7,7 +7,7 @@ use crate::glam::vec3;
 
 use macroquad::prelude::*;
 
-use crate::raw_miniquad::{ClassDefs, ClassVis, CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, build_section_from_raw_stages, build_section_from_stages, classification_color, default_class_label, load_class_defs, load_class_defs_from, make_section_data, save_class_defs_to, scan_dir_for_copc, DEFAULT_CLASS_FILE};
+use crate::raw_miniquad::{ClassDefs, ClassVis, CopcStage, EdlRenderer, HeatmapRenderer, SectionData, Stage, TileStageManager, build_section_from_raw_stages, build_section_from_stages, classification_color, default_class_label, load_class_defs, load_class_defs_from, make_section_data, save_class_defs_to, scan_dir_for_copc, DEFAULT_CLASS_FILE};
 use crate::classify::{ClassMask, effective_class};
 use las::Point as LasPoint;
 
@@ -1023,14 +1023,14 @@ fn finish_digitised_line(
 }
 
 /// Everything vector-shaped drawn under the 3D camera: the loaded lines, the
-/// line being digitised with its traced route, a vertex drag in progress, and
-/// the edge-following heatmap. Before `set_default_camera()`, so all of it is
-/// depth-tested against the cloud and still composites beneath the panel.
+/// line being digitised with its traced route, and a vertex drag in progress.
+/// Before `set_default_camera()`, so all of it is depth-tested against the
+/// cloud and still composites beneath the panel.
 #[allow(clippy::too_many_arguments)]
 fn draw_vector_overlays_3d(
     poly_files: &[polylines::PolylineFile],
     selected: Option<polylines::PolyRef>,
-    digitise: &mut vectorise::Digitise,
+    digitise: &vectorise::Digitise,
     editor: &vector_edit::Editor,
     app_mode: AppMode,
     data_offset: [f64; 3],
@@ -1054,12 +1054,44 @@ fn draw_vector_overlays_3d(
         );
         vectorise::draw_snap_marker(digitise, data_offset);
     }
-    // Last: it covers the whole window, and its depth must not hide the lines
-    // already drawn beneath it — they show through, since it is translucent.
-    if app_mode == AppMode::Digitise && digitise.edge.enabled && digitise.edge.show_heatmap
-        && let Some(trace) = digitise.edge.trace.as_mut() {
-        let z = trace.top() + 0.05;
-        trace.draw_heatmap(z);
+}
+
+/// The edge-following heatmap, draped on the ground under the trace window.
+///
+/// Through its own pipeline rather than macroquad's: with no depth test, since
+/// it lies among the ground points and they would hide it, and from one mesh
+/// uploaded per trace rather than a quarter of a million vertices re-sent every
+/// frame. Whatever macroquad has queued is flushed first, so the lines drawn so
+/// far show through it.
+fn draw_edge_heatmap(
+    renderer: &mut HeatmapRenderer,
+    digitise: &vectorise::Digitise,
+    app_mode: AppMode,
+    view_proj: &glam::Mat4,
+    view: ViewRect,
+) {
+    let ef = &digitise.edge;
+    let wanted = app_mode == AppMode::Digitise && ef.enabled && ef.show_heatmap;
+    match ef.trace.as_ref().filter(|_| wanted) {
+        Some(trace) => {
+            let mut gl = unsafe { get_internal_gl() };
+            gl.flush();
+            let layer = ef.heat_layer.map_or(0, |c| c as u8 + 1);
+            renderer.sync(
+                &mut *gl.quad_context,
+                ef.raster_gen,
+                (ef.field_gen, layer),
+                (trace.raster.nx, trace.raster.ny),
+                || trace.heat_geometry(),
+                || trace.heat_colours(ef.heat_layer),
+            );
+            renderer.draw(&mut *gl.quad_context, view_proj, view.gl());
+        }
+        None if renderer.is_loaded() => {
+            let gl = unsafe { get_internal_gl() };
+            renderer.release(&mut *gl.quad_context);
+        }
+        None => {}
     }
 }
 
@@ -2802,6 +2834,10 @@ async fn main() {
         let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
         EdlRenderer::new(ctx, screen_width() as u32, screen_height() as u32)
     };
+    let mut heatmap_renderer = {
+        let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+        HeatmapRenderer::new(ctx)
+    };
 
     // Pinned viewer origin for drag-and-drop. Seeded from whatever was loaded at
     // startup; if nothing was loaded and the user drops a file, it's set from
@@ -4529,6 +4565,7 @@ async fn main() {
                     samples
                 });
                 let z = edge_z_source(&digitise);
+                digitise.edge.probe = digitise_cursor.and_then(|target| digitise.edge.trace.as_ref()?.probe(target));
                 digitise_cursor.and_then(|target| digitise.edge.trace.as_ref()?.route(target, z))
             }
             _ => {
@@ -4624,9 +4661,10 @@ async fn main() {
             // line actually sits. Drawn here, under the 3D camera and before
             // the panel composites.
             draw_vector_overlays_3d(
-                &poly_files, selected_poly, &mut digitise, &editor, app_mode,
+                &poly_files, selected_poly, &digitise, &editor, app_mode,
                 data_offset, front, metres_per_pixel, digitise_cursor, edge_route.as_deref(),
             );
+            draw_edge_heatmap(&mut heatmap_renderer, &digitise, app_mode, &view_proj, view_rect);
 
             set_default_camera();
 
@@ -5112,9 +5150,10 @@ async fn main() {
             // line actually sits. Drawn here, under the 3D camera and before
             // the panel composites.
             draw_vector_overlays_3d(
-                &poly_files, selected_poly, &mut digitise, &editor, app_mode,
+                &poly_files, selected_poly, &digitise, &editor, app_mode,
                 data_offset, front, metres_per_pixel, digitise_cursor, edge_route.as_deref(),
             );
+            draw_edge_heatmap(&mut heatmap_renderer, &digitise, app_mode, &view_proj, view_rect);
 
             set_default_camera();
 
@@ -5623,9 +5662,10 @@ async fn main() {
             // line actually sits. Drawn here, under the 3D camera and before
             // the panel composites.
             draw_vector_overlays_3d(
-                &poly_files, selected_poly, &mut digitise, &editor, app_mode,
+                &poly_files, selected_poly, &digitise, &editor, app_mode,
                 data_offset, front, metres_per_pixel, digitise_cursor, edge_route.as_deref(),
             );
+            draw_edge_heatmap(&mut heatmap_renderer, &digitise, app_mode, &view_proj, view_rect);
 
             set_default_camera();
 
