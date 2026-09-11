@@ -37,7 +37,7 @@ the precision work:
 | 3 | Both COPC mitigations | Refuse the snap when LOD spacing exceeds the radius, *and* pin the octree nodes under the cursor. |
 | 4 | GeoPackage read + write, hand-rolled, pure Rust | No new dependencies; see §7.2. |
 | 5 | Salome ASCII stays | Read and write, alongside GeoPackage. |
-| 6 | Digitising works from oblique views | Ray-snapped vertices come from real points and are unambiguous from any angle. Explicit exception to the `TOP_VIEW_HINT` rule. |
+| 6 | Digitising works from oblique views | Ray-snapped vertices come from real points and are unambiguous from any angle. Was an explicit exception to the `TOP_VIEW_HINT` rule; the classification lassos have since dropped that rule too (§15). |
 | 7 | `haiviz/src/gpkg.rs`, not a shared crate | Duplicates a little of `hqmatcher/src/gpkg.rs`; accepted. |
 | 8 | Edge following in the 3D/oblique view only | Not offered in the section view. Section-view digitising still gets plain placement and snapping. |
 | 9 | Digitised layers **auto-save** | Granularity is the completed line, not the vertex; see §8.2. |
@@ -945,6 +945,14 @@ doubtful for road markings. Driving it should answer, in order:
 
 ### Things worth knowing before touching this again
 
+- **The ground and inside lassos work in screen space, from any angle.** The
+  camera is orthographic, so an outline on screen is a prism along the view
+  direction; the op records the view plane it was drawn in (`ViewPlane`,
+  `gvop` / `vvop` sidecar lines, v3) and fits the ground over the points the
+  prism catches. From exactly top view it is still written as the old
+  `gop` / `vop`, which older builds can read. `TOP_VIEW_HINT` is gone. An
+  outline selects through the whole depth of the view, hidden points
+  included — the height band and class visibility bound it, as before.
 - **Eye-dome lighting used to break overlay depth testing.** EDL composites
   through an offscreen target whose depth the default framebuffer never gets,
   so with EDL on every overlay drew over the cloud. Fixed by replaying the cloud

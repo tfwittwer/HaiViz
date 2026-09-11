@@ -519,6 +519,7 @@ mod tests {
             0,
             crate::classify::ClassRegion::AboveGround {
                 polygon: polygon.clone(),
+                view: None,
                 origin: fit.origin,
                 plane: fit.plane,
                 offset,

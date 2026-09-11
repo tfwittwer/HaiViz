@@ -384,10 +384,8 @@ vertex, and with the cursor outside the window the rubber band is straight
 again. On a COPC file the force-loaded neighbourhood widens to the window while
 tracing, and the grid is rebuilt as full-resolution nodes arrive.
 
-**Digitising works from any camera angle**, unlike the plan-view lassos, which
-insist on a top view. That is not an oversight: a lasso drawn obliquely is
-ambiguous because a screen polygon says nothing about depth, whereas a digitised
-vertex comes from a real point and means the same thing from anywhere.
+**Digitising works from any camera angle**: a digitised vertex comes from a
+real point, and means the same thing from anywhere.
 
 ### Where lines go
 
@@ -486,9 +484,10 @@ Open the **Ground Control Points** section and **Load GCP File...**. Column sepa
 Two tools, both lasso-driven and both recorded the same way.
 
 **In the section view**, you lasso points directly in a slice — precise, and the
-right tool for picking out something specific. **In plan view**, you outline an
-area and everything standing above the local ground inside it is reclassified —
-much faster for clearing vegetation or clutter over a surface.
+right tool for picking out something specific. **In the 3D view**, you outline an
+area on screen, from any angle, and everything standing above the local ground
+inside it — or simply everything inside it — is reclassified: much faster for
+clearing vegetation or clutter over a surface.
 
 ### Section lasso
 
@@ -503,22 +502,33 @@ looking straight at a slice of the cloud.
 4. Click around the points you want. **Backspace** removes the last vertex,
    **Enter** or **Apply** commits, **Esc** cancels.
 
-### Ground lasso (plan view)
+### Ground lasso (3D view)
 
-The second classification tool works from above, and is aimed at clearing
+The second classification tool works in the 3D view, and is aimed at clearing
 everything standing on a surface — vegetation over a track bed, clutter on a
 roof, furniture on a floor.
 
-1. Press `G`, or click **Ground lasso** in the 3D panel. The view snaps to
-   top-down, because the footprint is unprojected onto a horizontal plane and
-   would come out sheared if drawn from an oblique angle.
-2. Click around the area you want.
-3. Set **To:** and **Height above ground**, then press `Enter` or **Apply**.
-   `Backspace` removes the last point, `Esc` cancels.
+1. Press `G` for the **above-ground lasso**, or `V` for the **inside lasso**, or
+   use the buttons in the Classification panel. Any camera angle works.
+2. Click around the area you want, on screen.
+3. Set **To:** and, for `G`, **Height above ground**, then press `Enter` or
+   **Apply**. `Backspace` removes the last point, `Esc` cancels.
 
-haiviz fits a ground plane inside the footprint and assigns your class to every
+**What an outline selects.** The 3D camera is orthographic, so an outline drawn
+on screen is a prism: the outline swept straight into the screen through the
+whole depth of the scene, bounded only by the height filter. Everything that
+projects inside it is a candidate — **including points hidden behind what you
+can see**. From straight above, that is a column over the footprint; from an
+angle it is a slanted prism, which is what lets you outline a hedge or a façade
+from the side. The height filter and class visibility are how to keep what lies
+behind out of it.
+
+The inside lasso takes everything in the prism within the height filter, ground
+included. The above-ground lasso fits the ground first:
+
+haiviz fits a ground plane inside the outline and assigns your class to every
 point standing more than the offset above it. The fit uses the *lowest* point in
-each grid cell rather than everything in the footprint — an area picked for
+each grid cell rather than everything in the outline — an area picked for
 classification is mostly the stuff standing on the ground, so an ordinary fit
 would be dragged up into the canopy. Two rejection passes then discard cells
 sitting far off the plane, in both directions: vegetation the grid never saw
@@ -536,7 +546,7 @@ find a real surface, and **Undo last op** puts it back.
 
 The plane is fitted from the points currently loaded. That is deliberate: a
 plane is a low-order fit and the ground is dense, so the streamed sample defines
-it perfectly well, and force-loading a whole plan-view footprint would pull in
+it perfectly well, and force-loading everything an outline reaches would pull in
 far more data than the fit needs. If the view is zoomed a long way out, zoom in
 before lassoing so the fit has real detail to work with — the tool refuses
 outright when it cannot find enough.
@@ -558,8 +568,9 @@ rather than loaded; shorten the section line or reduce the depth.
 ### How edits are stored
 
 An edit is saved as a *region operation* — for the section lasso, the polygon
-and the section line it was drawn on; for the ground lasso, the footprint plus
-the fitted plane and offset — not as a list of point ids. The ground plane is
+and the section line it was drawn on; for the ground lasso, the outline and the
+view it was drawn through, plus the fitted plane and offset — not as a list of
+point ids. The ground plane is
 frozen into the operation when it is made, so it stays a pure geometric test
 rather than something re-derived from whatever happens to be loaded later. Ops
 are
@@ -593,6 +604,11 @@ The first two forms are what haiviz has always written, and they are still all
 a session writes if no class was hidden. The last two are new in sidecar v2 and
 appear only when a visibility filter was actually in force — versions of haiviz
 older than that skip the lines carrying them, with a warning.
+
+A ground or inside lasso drawn from straight above is written as it always was,
+a `gop` or `vop` line holding the footprint. One drawn from any other angle
+records the view plane it was drawn in, as a `gvop` or `vvop` line — new in
+sidecar v3, and skipped with a warning by older versions.
 
 **Undo last op** removes the most recent op and re-derives the affected clouds
 from disk — an op records what it assigns, not what it overwrote, so there is
@@ -717,14 +733,14 @@ If no `classes.txt` is present, built-in default labels and colours are used.
 | **Point Info** → click | Inspect a point's attributes |
 | **Back to 3D** | Leave the section view |
 
-**Ground lasso** (3D view, `G`)
+**Ground lasso** (3D view, any angle — `G` above ground, `V` inside)
 
 | Input | Action |
 |-------|--------|
-| Left-click | Add a footprint vertex |
+| Left-click | Add an outline vertex |
 | `Backspace` | Remove the last vertex |
-| `Enter` | Close the footprint, fit the ground and apply |
-| `Esc` | Clear the footprint, then leave the tool |
+| `Enter` | Close the outline and apply (fitting the ground, for `G`) |
+| `Esc` | Clear the outline, then leave the tool |
 
 **Section lasso** (start from **Lasso classify** in the section view)
 

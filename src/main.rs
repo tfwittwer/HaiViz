@@ -283,17 +283,13 @@ enum AppMode {
     SectionCorridorLoad,
     /// Drawing a lasso in the section view to reclassify the points inside it.
     SectionLasso,
-    /// Drawing a plan-view lasso to reclassify what falls inside it. What
-    /// "inside" means is `LassoKind`, kept separate so both flavours share
-    /// one drawing mode.
+    /// Drawing a lasso on screen, from any camera angle, to reclassify what
+    /// projects inside it. What "inside" means is `LassoKind`, kept separate so
+    /// both flavours share one drawing mode.
     GroundLasso,
-    /// Drawing a polyline onto the cloud, vertex by vertex.
-    ///
-    /// Unlike the lassos this works from any camera angle — an explicit
-    /// exception to the `TOP_VIEW_HINT` rule. A lasso in an oblique view is
-    /// ambiguous because a screen polygon says nothing about depth; a
-    /// digitised vertex comes from a real point and is unambiguous from
-    /// anywhere.
+    /// Drawing a polyline onto the cloud, vertex by vertex, from any camera
+    /// angle: a digitised vertex comes from a real point and means the same
+    /// thing from anywhere.
     Digitise,
     /// Editing existing polylines: dragging vertices, pulling new ones out of
     /// segments, deleting. From any camera angle, for the same reason as
@@ -341,19 +337,18 @@ enum LassoKind {
 
 /// How far off straight-down the camera may sit and still count as top view.
 ///
-/// The footprint is unprojected onto one horizontal plane, so any tilt shears
-/// it in proportion to a point's height above that plane — at one degree a
-/// point 20 m up already lands a third of a metre from where it was clicked.
-/// The snaps (`T`, or the cube's top face) land exactly on zero, so this is a
-/// tolerance for floating point, not an invitation to eyeball it.
-const TOP_VIEW_TOL: f32 = std::f32::consts::PI / 180.0;
+/// This no longer decides whether a lasso is allowed — outlines work from any
+/// angle — only how one is recorded. From straight above, a screen outline and
+/// a plan footprint select exactly the same points, and the plan form is what
+/// older haiviz builds can read, so that is the one written. It has to be
+/// *exactly* straight above for that to hold: at one degree of tilt, a point
+/// 20 m up is a third of a metre from where a plan footprint would put it. The
+/// snaps (`T`, or the cube's top face) land on zero, so this is a tolerance for
+/// floating point only.
+const TOP_VIEW_TOL: f32 = std::f32::consts::PI / 1800.0;
 
-/// Shown wherever a plan-view lasso is refused for want of the top view.
-const TOP_VIEW_HINT: &str = "Top view only — press T or click the cube's Top face.";
-
-/// True when the camera is looking straight down, which is the only attitude
-/// the plan-view lassos are meaningful from. Yaw does not matter: the view
-/// direction is vertical whatever it is.
+/// True when the camera is looking straight down. Yaw does not matter: the
+/// view direction is vertical whatever it is.
 fn is_top_view(pitch: f32) -> bool {
     (pitch - view_cube::VIEW_TOP.1).abs() <= TOP_VIEW_TOL
 }
@@ -485,6 +480,65 @@ fn cursor_ray(view_proj: &glam::Mat4, mx: f32, my: f32, view: ViewRect) -> ([f32
     let near = unproject(-1.0);
     let dir = (unproject(1.0) - near).normalize_or_zero();
     ([near.x, near.y, near.z], [dir.x, dir.y, dir.z])
+}
+
+/// Screen right and screen up, as unit vectors in viewer space.
+fn view_axes(view_proj: &glam::Mat4) -> (Vec3, Vec3) {
+    let inv = view_proj.inverse();
+    let at = |x: f32, y: f32| {
+        let p = inv * glam::Vec4::new(x, y, 0.0, 1.0);
+        glam::Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w)
+    };
+    let c = at(0.0, 0.0);
+    ((at(1.0, 0.0) - c).normalize_or_zero(), (at(0.0, 1.0) - c).normalize_or_zero())
+}
+
+/// The view plane a screen lasso is recorded in: through `origin`, along the
+/// camera's screen axes, made exactly orthonormal in double precision — the
+/// axes come out of an f32 matrix inverse, and the op keeps them for good.
+fn view_plane(origin: [f64; 3], right: Vec3, up: Vec3) -> crate::classify::ViewPlane {
+    let unit = |v: [f64; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-12);
+        v.map(|c| c / l)
+    };
+    let r = unit([right.x as f64, right.y as f64, right.z as f64]);
+    let u0 = [up.x as f64, up.y as f64, up.z as f64];
+    let k = u0[0] * r[0] + u0[1] * r[1] + u0[2] * r[2];
+    let u = unit([u0[0] - k * r[0], u0[1] - k * r[1], u0[2] - k * r[2]]);
+    crate::classify::ViewPlane { origin, right: r, up: u }
+}
+
+/// The classification lasso, in screen space.
+///
+/// Its vertices live on a view plane in the world, so projecting them each
+/// frame keeps the outline exactly where it was drawn through a pan or a zoom —
+/// and drawn in screen space, nothing in the cloud can hide it.
+fn draw_screen_lasso(
+    points: &[Vec3],
+    drawing: bool,
+    view_proj: &glam::Mat4,
+    view: ViewRect,
+    cursor: (f32, f32),
+    color: Color,
+) {
+    if points.is_empty() { return; }
+    let pts: Vec<(f32, f32)> = points.iter().map(|p| world_to_screen(*p, view_proj, view)).collect();
+    for w in pts.windows(2) {
+        draw_line(w[0].0, w[0].1, w[1].0, w[1].1, 2.0, color);
+    }
+    let (first, last) = (pts[0], pts[pts.len() - 1]);
+    if drawing {
+        draw_line(last.0, last.1, cursor.0, cursor.1, 1.5, color);
+    }
+    // The closing edge, faint, so the polygon that will be applied is visible
+    // before committing to it.
+    if pts.len() >= 2 {
+        let end = if drawing { cursor } else { last };
+        draw_line(end.0, end.1, first.0, first.1, 1.0, Color::new(color.r, color.g, color.b, 0.4));
+    }
+    for (x, y) in &pts {
+        draw_circle_lines(*x, *y, 4.0, 1.5, color);
+    }
 }
 
 /// Resolve the vertex under the cursor for the active snap mode.
@@ -1127,37 +1181,7 @@ fn draw_3d_overlays(
     mid_z: f32,
     height_range: f32,
     ortho_scale: f32,
-    ground_lasso: &[glam::Vec2],
-    ground_color: Color,
 ) {
-    if !ground_lasso.is_empty() {
-        let pts: Vec<Vec3> = ground_lasso.iter().map(|v| vec3(v.x, v.y, mid_z)).collect();
-        for w in pts.windows(2) {
-            draw_line_3d(w[0], w[1], ground_color);
-        }
-        if let Some(&last) = pts.last() {
-            if app_mode == AppMode::GroundLasso
-                && let Some((wx, wy)) = cursor_world {
-                    draw_line_3d(last, vec3(wx, wy, mid_z), ground_color);
-            }
-            if pts.len() >= 2 {
-                let faint = Color::new(ground_color.r, ground_color.g, ground_color.b, 0.4);
-                let end = if app_mode == AppMode::GroundLasso {
-                    cursor_world.map(|(x, y)| vec3(x, y, mid_z)).unwrap_or(last)
-                } else {
-                    last
-                };
-                draw_line_3d(end, pts[0], faint);
-            }
-        }
-        // A short vertical tick at each vertex, so the footprint stays legible
-        // once the view is tilted off top-down.
-        let tick = height_range * 0.03;
-        for p in &pts {
-            draw_line_3d(*p, vec3(p.x, p.y, p.z + tick), ground_color);
-        }
-    }
-
     let cross_size = ortho_scale * 0.015;
     if let Some(a) = measure_a {
         draw_line_3d(vec3(a.x - cross_size, a.y, a.z), vec3(a.x + cross_size, a.y, a.z), YELLOW);
@@ -2045,7 +2069,6 @@ fn ground_tool_controls(
     app_mode: &mut AppMode,
     lasso_len: usize,
     kind: LassoKind,
-    top_view: bool,
     target: &mut u8,
     from: &mut Option<u8>,
     offset: &mut f32,
@@ -2060,7 +2083,7 @@ fn ground_tool_controls(
     let drawing = *app_mode == AppMode::GroundLasso;
     let mut start = None;
     ui.separator();
-    ui.label("Classify in plan view:");
+    ui.label("Classify by outline:");
     // A view setting that silently changes what a destructive tool does needs
     // to be visible from the tool, not only from the window that set it —
     // otherwise the first report is "why did my lasso catch nothing?".
@@ -2111,22 +2134,19 @@ fn ground_tool_controls(
         });
         ui.label("Enter applies, Backspace removes a point, Esc cancels.");
     } else {
-        // Both tools unproject the outline onto a horizontal plane, so they are
-        // offered only from straight above — anywhere else the polygon would
-        // mean something other than what was drawn.
-        ui.add_enabled_ui(top_view, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Above-ground lasso (G)").clicked() {
-                    start = Some(LassoKind::AboveGround);
-                }
-                if ui.button("Inside lasso (V)").clicked() {
-                    start = Some(LassoKind::Inside);
-                }
-            });
+        ui.horizontal(|ui| {
+            if ui.button("Above-ground lasso (G)").clicked() {
+                start = Some(LassoKind::AboveGround);
+            }
+            if ui.button("Inside lasso (V)").clicked() {
+                start = Some(LassoKind::Inside);
+            }
         });
-        if !top_view {
-            ui.label(TOP_VIEW_HINT);
-        }
+        // From any angle — but an outline selects through the whole depth of
+        // the view, which is worth saying before someone expects it to take
+        // only the surface they can see.
+        ui.label("An outline selects everything behind it, through the whole");
+        ui.label("depth of the view, within the height filter.");
     }
     if let Some(msg) = status {
         ui.label(msg.as_str());
@@ -2586,7 +2606,12 @@ async fn main() {
     let mut classify_status: Option<String> = None;
     // Plan-view ground tool: lasso footprint in viewer-space XY, and how far
     // above the fitted ground a point must stand to be selected.
-    let mut ground_lasso: Vec<glam::Vec2> = Vec::new();
+    let mut ground_lasso: Vec<glam::Vec3> = Vec::new();
+    // The camera the lasso is being drawn through — screen axes, and whether it
+    // is exactly top-down — taken at the first vertex. The camera cannot rotate
+    // while the lasso tool is up, but the op must describe the view the outline
+    // was drawn in, not whatever the view is when Enter is pressed.
+    let mut ground_lasso_view: Option<((Vec3, Vec3), bool)> = None;
     let mut ground_offset: f32 = 0.20;
     let mut ground_status: Option<String> = None;
     // Which flavour of plan-view lasso is being drawn.
@@ -3944,13 +3969,7 @@ async fn main() {
         ] {
             if !is_key_pressed(key) || egui_wants_keyboard_prev { continue; }
             match app_mode {
-                AppMode::View3D | AppMode::PointPick => {
-                    if is_top_view(pitch) {
-                        start_ground_lasso = Some(kind);
-                    } else {
-                        ground_status = Some(TOP_VIEW_HINT.to_string());
-                    }
-                }
+                AppMode::View3D | AppMode::PointPick => start_ground_lasso = Some(kind),
                 AppMode::GroundLasso => {
                     ground_lasso.clear();
                     app_mode = AppMode::View3D;
@@ -4166,9 +4185,16 @@ async fn main() {
         let metres_per_pixel = ortho_scale * 2.0 / view_rect.h.max(1.0);
 
         if app_mode == AppMode::GroundLasso {
-            if !ui_has_pointer && is_mouse_button_pressed(MouseButton::Left)
-                && let Some((wx, wy)) = cursor_world {
-                    ground_lasso.push(glam::Vec2::new(wx, wy));
+            if !ui_has_pointer && is_mouse_button_pressed(MouseButton::Left) {
+                // On the view plane through the orbit pivot. Any depth along
+                // the line of sight would select the same prism; this one keeps
+                // the vertex under the cursor through a pan or a zoom.
+                let (o, d) = cursor_ray(&view_proj, mx, my, view_rect);
+                let (o, d) = (Vec3::from(o), Vec3::from(d));
+                if ground_lasso.is_empty() {
+                    ground_lasso_view = Some((view_axes(&view_proj), is_top_view(pitch)));
+                }
+                ground_lasso.push(o + d * (orbit_pivot - o).dot(d));
             }
             if !egui_wants_keyboard_prev {
                 if is_key_pressed(KeyCode::Backspace) { ground_lasso.pop(); }
@@ -4480,7 +4506,6 @@ async fn main() {
             draw_3d_overlays(
                 app_mode, measure_a, measure_b, section_start, section_end,
                 cursor_world, section_depth, mid_z, height_range, ortho_scale,
-                &ground_lasso, class_color_mq(classify_target, &class_defs),
             );
             // Vector overlays are real 3D geometry, so they are occluded by the
             // points in front of them — which is the only way to judge where a
@@ -4713,7 +4738,6 @@ async fn main() {
                 panel_section(ui, "Classification", false, |ui| {
                     if let Some(kind) = ground_tool_controls(
                         ui, &mut app_mode, ground_lasso.len(), lasso_kind,
-                        is_top_view(pitch),
                         &mut classify_target, &mut classify_from, &mut ground_offset,
                         max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                         &mut apply_ground_lasso, &mut cancel_ground_lasso,
@@ -4775,6 +4799,10 @@ async fn main() {
                     (view_rect.x, view_rect.y, view_rect.w, view_rect.h),
                 );
             }
+            draw_screen_lasso(
+                &ground_lasso, app_mode == AppMode::GroundLasso, &view_proj, view_rect,
+                (mx, my), class_color_mq(classify_target, &class_defs),
+            );
             draw_vector_overlays_2d(
                 &poly_files, selected_poly, &digitise, &editor, app_mode,
                 &view_proj, view_rect, mx, my, ui_has_pointer,
@@ -4966,7 +4994,6 @@ async fn main() {
             draw_3d_overlays(
                 app_mode, measure_a, measure_b, section_start, section_end,
                 cursor_world, section_depth, mid_z, height_range, ortho_scale,
-                &ground_lasso, class_color_mq(classify_target, &class_defs),
             );
             // Vector overlays are real 3D geometry, so they are occluded by the
             // points in front of them — which is the only way to judge where a
@@ -5186,7 +5213,6 @@ async fn main() {
                 panel_section(ui, "Classification", false, |ui| {
                     if let Some(kind) = ground_tool_controls(
                         ui, &mut app_mode, ground_lasso.len(), lasso_kind,
-                        is_top_view(pitch),
                         &mut classify_target, &mut classify_from, &mut ground_offset,
                         max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                         &mut apply_ground_lasso, &mut cancel_ground_lasso,
@@ -5248,6 +5274,10 @@ async fn main() {
                     (view_rect.x, view_rect.y, view_rect.w, view_rect.h),
                 );
             }
+            draw_screen_lasso(
+                &ground_lasso, app_mode == AppMode::GroundLasso, &view_proj, view_rect,
+                (mx, my), class_color_mq(classify_target, &class_defs),
+            );
             draw_vector_overlays_2d(
                 &poly_files, selected_poly, &digitise, &editor, app_mode,
                 &view_proj, view_rect, mx, my, ui_has_pointer,
@@ -5475,7 +5505,6 @@ async fn main() {
             draw_3d_overlays(
                 app_mode, measure_a, measure_b, section_start, section_end,
                 cursor_world, section_depth, mid_z, height_range, ortho_scale,
-                &ground_lasso, class_color_mq(classify_target, &class_defs),
             );
             // Vector overlays are real 3D geometry, so they are occluded by the
             // points in front of them — which is the only way to judge where a
@@ -5711,7 +5740,6 @@ async fn main() {
                 panel_section(ui, "Classification", false, |ui| {
                     if let Some(kind) = ground_tool_controls(
                         ui, &mut app_mode, ground_lasso.len(), lasso_kind,
-                        is_top_view(pitch),
                         &mut classify_target, &mut classify_from, &mut ground_offset,
                         max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                         &mut apply_ground_lasso, &mut cancel_ground_lasso,
@@ -5773,6 +5801,10 @@ async fn main() {
                     (view_rect.x, view_rect.y, view_rect.w, view_rect.h),
                 );
             }
+            draw_screen_lasso(
+                &ground_lasso, app_mode == AppMode::GroundLasso, &view_proj, view_rect,
+                (mx, my), class_color_mq(classify_target, &class_defs),
+            );
             draw_vector_overlays_2d(
                 &poly_files, selected_poly, &digitise, &editor, app_mode,
                 &view_proj, view_rect, mx, my, ui_has_pointer,
@@ -6078,8 +6110,6 @@ async fn main() {
             ground_lasso.clear();
             ground_status = None;
             lasso_kind = kind;
-            // The camera is left exactly where it is: the tools are only
-            // offered from the top view, so there is nothing to correct for.
             app_mode = AppMode::GroundLasso;
         }
         if cancel_ground_lasso {
@@ -6093,11 +6123,24 @@ async fn main() {
             ground_lasso.clear();
             app_mode = AppMode::View3D;
         } else if apply_ground_lasso && ground_lasso.len() >= 3 {
-            // Footprint and band in absolute world coordinates, so the op means
+            // Outline and band in absolute world coordinates, so the op means
             // the same thing at export as it does on screen.
-            let polygon: Vec<(f64, f64)> = ground_lasso.iter()
-                .map(|v| (v.x as f64 + data_offset[0], v.y as f64 + data_offset[1]))
-                .collect();
+            let world = |p: Vec3| [
+                p.x as f64 + data_offset[0], p.y as f64 + data_offset[1], p.z as f64 + data_offset[2],
+            ];
+            let ((right, up), top) = ground_lasso_view
+                .unwrap_or_else(|| (view_axes(&view_proj), is_top_view(pitch)));
+            let (polygon, view): (Vec<(f64, f64)>, Option<crate::classify::ViewPlane>) = if top {
+                // From straight above, a screen outline *is* a plan footprint,
+                // and written as one it stays readable by older builds.
+                (ground_lasso.iter().map(|p| { let w = world(*p); (w[0], w[1]) }).collect(), None)
+            } else {
+                let plane = view_plane(world(ground_lasso[0]), right, up);
+                let outline = ground_lasso.iter()
+                    .map(|p| { let w = world(*p); plane.project(w[0], w[1], w[2]) })
+                    .collect();
+                (outline, Some(plane))
+            };
             let (z_lo, z_hi) = if z_clip_enabled {
                 (z_clip_lo as f64 + data_offset[2], z_clip_hi as f64 + data_offset[2])
             } else {
@@ -6111,12 +6154,10 @@ async fn main() {
                 if lo > hi { (f64::MIN, f64::MAX) } else { (lo, hi) }
             };
 
-            let (mut bx0, mut by0) = (f64::MAX, f64::MAX);
-            let (mut bx1, mut by1) = (f64::MIN, f64::MIN);
-            for &(x, y) in &polygon {
-                bx0 = bx0.min(x); bx1 = bx1.max(x);
-                by0 = by0.min(y); by1 = by1.max(y);
-            }
+            // What the outline can reach inside the band: its own bounds from
+            // above, its lines of sight cut by the band from anywhere else.
+            let ((bx0, by0), (bx1, by1)) =
+                crate::classify::outline_xy_bounds(&polygon, view.as_ref(), z_lo, z_hi);
 
             // The inside lasso is a plain prism: no samples to gather and no
             // plane to fit, so it cannot fail the way the ground tool can.
@@ -6124,6 +6165,7 @@ async fn main() {
                 LassoKind::Inside => Some((
                     crate::classify::ClassRegion::Volume {
                         polygon: polygon.clone(),
+                        view,
                         z_min: z_lo,
                         z_max: z_hi,
                     },
@@ -6135,7 +6177,7 @@ async fn main() {
                     for cs in &copc_stages { cs.collect_points_in_bbox((bx0, by0), (bx1, by1), z_lo, z_hi, &mut samples); }
                     if let Some(mgr) = tile_mgr.as_ref() { mgr.collect_points_in_bbox((bx0, by0), (bx1, by1), z_lo, z_hi, &mut samples); }
 
-                    match crate::classify::fit_ground_plane(&samples, &polygon, z_lo, z_hi) {
+                    match crate::classify::fit_ground_plane_in(&samples, &polygon, view.as_ref(), z_lo, z_hi) {
                         None => {
                             ground_status = Some(format!(
                                 "Not enough ground in view to fit a plane ({} points found). \
@@ -6147,6 +6189,7 @@ async fn main() {
                         Some(fit) => Some((
                             crate::classify::ClassRegion::AboveGround {
                                 polygon: polygon.clone(),
+                                view,
                                 origin: fit.origin,
                                 plane: fit.plane,
                                 offset: ground_offset as f64,
@@ -6200,15 +6243,14 @@ async fn main() {
 
                 match &fit {
                     Some(fit) => {
-                        let centre = (
-                            (bx0 + bx1) * 0.5,
-                            (by0 + by1) * 0.5,
-                        );
+                        // At the fit's own origin: a screen outline's bounds can
+                        // be unlimited, so their centre is not a place.
                         info!(
-                            "Ground fit: {} cells from {} points, {:.2}m at footprint centre, \
-                             slope {:.2}°, rms {:.3}m; {} points reclassified",
+                            "Ground fit: {} cells from {} points, {:.2}m at its centre, \
+                             slope {:.2}°, rms {:.3}m; {} points reclassified{}",
                             fit.cells_used, fit.points_considered,
-                            fit.height_at(centre.0, centre.1), fit.slope_degrees(), fit.rms, changed,
+                            fit.height_at(fit.origin.0, fit.origin.1), fit.slope_degrees(), fit.rms, changed,
+                            if view.is_some() { " (screen outline)" } else { "" },
                         );
                     }
                     None => info!(
@@ -6218,7 +6260,7 @@ async fn main() {
                 }
                 ground_status = Some(match (save_err, touched) {
                     (Some(e), _) => format!("{changed} points reclassified — SAVE FAILED: {e}"),
-                    (None, 0) => "Footprint did not overlap any loaded file".to_string(),
+                    (None, 0) => "The outline did not reach any loaded file".to_string(),
                     (None, _) => match &fit {
                         Some(fit) => format!(
                             "{changed} points → class {classify_target}  (ground rms {:.2} m, slope {:.1}°)",
@@ -6233,5 +6275,86 @@ async fn main() {
         }
 
         next_frame().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classify::{ClassOp, ClassRegion};
+
+    /// Draw a rectangular lasso on screen through the same chain the tool uses
+    /// — cursor ray, vertex on the view plane through the pivot, `view_axes`,
+    /// `view_plane` — and check that the op selects exactly what projects
+    /// inside the rectangle. `plan` records it as a plan footprint instead, as
+    /// the tool does from straight above.
+    fn outline_selects_what_is_inside_on_screen(eye: Vec3, up: Vec3, plan: bool) {
+        let view = ViewRect { x: 100.0, y: 0.0, w: 800.0, h: 600.0 };
+        let pivot = Vec3::ZERO;
+        let view_proj = glam::Mat4::orthographic_rh_gl(-20.0, 20.0, -15.0, 15.0, -1.0e5, 1.0e5)
+            * glam::Mat4::look_at_rh(eye, pivot, up);
+        let (x0, y0, x1, y1) = (400.0, 200.0, 650.0, 420.0);
+        let lasso: Vec<Vec3> = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].iter().map(|&(mx, my)| {
+            let (o, d) = cursor_ray(&view_proj, mx, my, view);
+            let (o, d) = (Vec3::from(o), Vec3::from(d));
+            o + d * (pivot - o).dot(d)
+        }).collect();
+
+        // A survey-sized viewer origin, so the f32 → f64 step is exercised.
+        let offset = [208_000.0, 373_000.0, 5.0];
+        let world = |p: Vec3| [p.x as f64 + offset[0], p.y as f64 + offset[1], p.z as f64 + offset[2]];
+        let (polygon, plane) = if plan {
+            (lasso.iter().map(|p| { let w = world(*p); (w[0], w[1]) }).collect(), None)
+        } else {
+            let (right, screen_up) = view_axes(&view_proj);
+            let plane = view_plane(world(lasso[0]), right, screen_up);
+            let outline = lasso.iter().map(|p| { let w = world(*p); plane.project(w[0], w[1], w[2]) }).collect();
+            (outline, Some(plane))
+        };
+        let op = ClassOp::new(
+            0,
+            ClassRegion::Volume { polygon, view: plane, z_min: -1.0e3, z_max: 1.0e3 },
+            7,
+            ClassMask::ALL,
+        );
+
+        let (mut inside, mut outside) = (0, 0);
+        for i in -20..=20 {
+            for j in -20..=20 {
+                for k in -4..=4 {
+                    let p = Vec3::new(i as f32, j as f32, k as f32 * 2.5);
+                    let (sx, sy) = world_to_screen(p, &view_proj, view);
+                    // Points within half a pixel of an edge could honestly land
+                    // either side after f32 projection; judge only the clear ones.
+                    let m = 0.5;
+                    let clearly_in = sx > x0 + m && sx < x1 - m && sy > y0 + m && sy < y1 - m;
+                    let clearly_out = sx < x0 - m || sx > x1 + m || sy < y0 - m || sy > y1 + m;
+                    let w = world(p);
+                    let selected = op.contains(w[0], w[1], w[2]);
+                    if clearly_in {
+                        assert!(selected, "{p} is inside the outline on screen at ({sx}, {sy}) but not selected");
+                        inside += 1;
+                    }
+                    if clearly_out {
+                        assert!(!selected, "{p} is outside the outline on screen at ({sx}, {sy}) but selected");
+                        outside += 1;
+                    }
+                }
+            }
+        }
+        assert!(inside > 50 && outside > 50, "the probes must land on both sides: {inside} in, {outside} out");
+    }
+
+    #[test]
+    fn a_screen_lasso_selects_what_it_encloses_from_any_angle() {
+        // Oblique, looking north.
+        outline_selects_what_is_inside_on_screen(Vec3::new(0.0, -50.0, 50.0), Vec3::Z, false);
+        // Steep, from an arbitrary yaw.
+        outline_selects_what_is_inside_on_screen(Vec3::new(30.0, 20.0, 40.0), Vec3::Z, false);
+        // Level, from the side.
+        outline_selects_what_is_inside_on_screen(Vec3::new(-50.0, 0.0, 0.0), Vec3::Z, false);
+        // Straight down, recorded either way.
+        outline_selects_what_is_inside_on_screen(Vec3::new(0.0, 0.0, 50.0), Vec3::Y, false);
+        outline_selects_what_is_inside_on_screen(Vec3::new(0.0, 0.0, 50.0), Vec3::Y, true);
     }
 }

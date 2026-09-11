@@ -135,7 +135,98 @@ impl std::fmt::Debug for ClassMask {
     }
 }
 
-/// The shape an op selects. Both variants are pure geometric predicates,
+/// The camera a lasso was drawn through, frozen into the op.
+///
+/// haiviz's 3D camera is orthographic, so every pixel looks in the same
+/// direction and an outline drawn on screen selects a prism: the outline laid
+/// in the view plane and swept along the view direction through the whole depth
+/// of the scene. `origin`, `right` and `up` place that plane; a point is inside
+/// when its coordinates along `right` and `up` fall inside the outline. That is
+/// exactly "projects inside what was drawn", and it is still a pure geometric
+/// predicate, so it replays at export like every other region.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewPlane {
+    /// A point on the plane, absolute world coordinates.
+    pub origin: [f64; 3],
+    /// Unit screen-right and screen-up, in world space; perpendicular.
+    pub right: [f64; 3],
+    pub up: [f64; 3],
+}
+
+impl ViewPlane {
+    /// A world point's coordinates in the plane: `(along right, along up)`.
+    pub fn project(&self, x: f64, y: f64, z: f64) -> (f64, f64) {
+        let d = [x - self.origin[0], y - self.origin[1], z - self.origin[2]];
+        (dot3(d, self.right), dot3(d, self.up))
+    }
+
+    /// The world point at plane coordinates `(u, v)`.
+    pub fn point(&self, u: f64, v: f64) -> [f64; 3] {
+        [0, 1, 2].map(|i| self.origin[i] + u * self.right[i] + v * self.up[i])
+    }
+
+    /// The direction the prism extends in. Its sign does not matter: the prism
+    /// runs both ways.
+    pub fn depth_dir(&self) -> [f64; 3] {
+        let (r, u) = (self.right, self.up);
+        [r[1] * u[2] - r[2] * u[1], r[2] * u[0] - r[0] * u[2], r[0] * u[1] - r[1] * u[0]]
+    }
+}
+
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Is a world point inside a lasso outline? In world XY for a plan outline
+/// (`view` is `None`), in the view plane for a screen outline.
+fn outline_contains(polygon: &[(f64, f64)], view: Option<&ViewPlane>, x: f64, y: f64, z: f64) -> bool {
+    match view {
+        None => point_in_polygon(polygon, x, y),
+        Some(v) => {
+            let (u, w) = v.project(x, y, z);
+            point_in_polygon(polygon, u, w)
+        }
+    }
+}
+
+/// World-XY bounds of what a lasso outline can select inside a height band.
+///
+/// For a plan outline, the outline's own bounds. For a screen outline, each
+/// corner's line of sight cut at the band's floor and ceiling. Looking
+/// horizontally a line of sight never leaves the band, and the bounds are
+/// unlimited — conservative, since they only ever reject.
+pub fn outline_xy_bounds(
+    polygon: &[(f64, f64)],
+    view: Option<&ViewPlane>,
+    z_min: f64,
+    z_max: f64,
+) -> ((f64, f64), (f64, f64)) {
+    const UNBOUNDED: ((f64, f64), (f64, f64)) = ((f64::MIN, f64::MIN), (f64::MAX, f64::MAX));
+    let (mut lo, mut hi) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
+    let mut include = |x: f64, y: f64| {
+        lo = (lo.0.min(x), lo.1.min(y));
+        hi = (hi.0.max(x), hi.1.max(y));
+    };
+    match view {
+        None => for &(x, y) in polygon { include(x, y); },
+        Some(v) => {
+            let d = v.depth_dir();
+            if d[2].abs() < 1e-9 { return UNBOUNDED; }
+            for &(u, w) in polygon {
+                let p = v.point(u, w);
+                for z in [z_min, z_max] {
+                    let t = (z - p[2]) / d[2];
+                    let (x, y) = (p[0] + t * d[0], p[1] + t * d[1]);
+                    if !(x.is_finite() && y.is_finite()) { return UNBOUNDED; }
+                    include(x, y);
+                }
+            }
+        }
+    }
+    (lo, hi)
+}
+
+/// The shape an op selects. Every variant is a pure geometric predicate,
 /// which is what lets the same op be replayed over a COPC node whenever it
 /// streams in and again over every node at export.
 #[derive(Clone, Debug)]
@@ -152,14 +243,17 @@ pub enum ClassRegion {
         /// Lasso polygon in section space: `(metres along the line, absolute Z)`.
         polygon: Vec<(f64, f64)>,
     },
-    /// Everything standing above the local ground inside a plan-view footprint.
+    /// Everything standing above the local ground inside a lasso outline.
     ///
     /// The ground is a plane fitted once, when the op is made, and then frozen
     /// into the op — so it stays a predicate rather than something that has to
     /// be re-derived from whatever points happen to be loaded later.
     AboveGround {
-        /// Lasso footprint in absolute world XY.
+        /// Lasso outline: absolute world XY when `view` is `None`, view-plane
+        /// coordinates when the outline was drawn away from top view.
         polygon: Vec<(f64, f64)>,
+        /// The camera a screen outline was drawn through; see [`ViewPlane`].
+        view: Option<ViewPlane>,
         /// Local origin the plane is expressed against. Fitting against raw
         /// survey coordinates (hundreds of thousands of metres) loses most of
         /// the available precision in the normal equations.
@@ -173,7 +267,7 @@ pub enum ClassRegion {
         z_min: f64,
         z_max: f64,
     },
-    /// Everything inside a plan-view footprint, between two absolute heights.
+    /// Everything inside a lasso outline, between two absolute heights.
     ///
     /// The ground-free counterpart to `AboveGround`: nothing is fitted and
     /// nothing is excluded from below, so the height band is the only vertical
@@ -181,8 +275,9 @@ pub enum ClassRegion {
     /// on a bridge deck, or wherever the thing to be reclassified sits on top
     /// of something that must not be swept up with it.
     Volume {
-        /// Lasso footprint in absolute world XY.
+        /// Lasso outline, as for `AboveGround`.
         polygon: Vec<(f64, f64)>,
+        view: Option<ViewPlane>,
         /// Height band in force when the op was made, in absolute Z.
         z_min: f64,
         z_max: f64,
@@ -282,17 +377,12 @@ impl ClassOp {
                 self.bbox_min = [xmin, ymin, z0];
                 self.bbox_max = [xmax, ymax, z1];
             }
-            ClassRegion::AboveGround { polygon, z_min, z_max, .. }
-            | ClassRegion::Volume { polygon, z_min, z_max } => {
+            ClassRegion::AboveGround { polygon, view, z_min, z_max, .. }
+            | ClassRegion::Volume { polygon, view, z_min, z_max } => {
                 if polygon.is_empty() { return; }
-                let (mut xmin, mut ymin) = (f64::MAX, f64::MAX);
-                let (mut xmax, mut ymax) = (f64::MIN, f64::MIN);
-                for &(x, y) in polygon {
-                    xmin = xmin.min(x); xmax = xmax.max(x);
-                    ymin = ymin.min(y); ymax = ymax.max(y);
-                }
-                self.bbox_min = [xmin, ymin, *z_min];
-                self.bbox_max = [xmax, ymax, *z_max];
+                let (lo, hi) = outline_xy_bounds(polygon, view.as_ref(), *z_min, *z_max);
+                self.bbox_min = [lo.0, lo.1, *z_min];
+                self.bbox_max = [hi.0, hi.1, *z_max];
             }
         }
     }
@@ -315,15 +405,15 @@ impl ClassOp {
                 let along = rx * dir.0 + ry * dir.1;
                 point_in_polygon(polygon, along, z)
             }
-            ClassRegion::AboveGround { polygon, origin, plane, offset, z_min, z_max } => {
+            ClassRegion::AboveGround { polygon, view, origin, plane, offset, z_min, z_max } => {
                 if z < *z_min || z > *z_max { return false; }
                 let ground = plane.0 * (x - origin.0) + plane.1 * (y - origin.1) + plane.2;
                 if z < ground + *offset { return false; }
-                point_in_polygon(polygon, x, y)
+                outline_contains(polygon, view.as_ref(), x, y, z)
             }
-            ClassRegion::Volume { polygon, z_min, z_max } => {
+            ClassRegion::Volume { polygon, view, z_min, z_max } => {
                 if z < *z_min || z > *z_max { return false; }
-                point_in_polygon(polygon, x, y)
+                outline_contains(polygon, view.as_ref(), x, y, z)
             }
         }
     }
@@ -469,7 +559,7 @@ impl ClassEdits {
     pub fn save(&mut self, source: &str) -> std::io::Result<PathBuf> {
         let path = Self::sidecar_path(source);
         let mut out = String::new();
-        out.push_str("# haiviz manual classification ops, v2\n");
+        out.push_str("# haiviz manual classification ops, v3\n");
         out.push_str(&format!("# source: {}\n", source));
         out.push_str("# from: * = any class, 5 = only class 5, 2|5|6 = only those,\n");
         out.push_str("#       !3|7 = every class except those. The set and complement\n");
@@ -477,6 +567,10 @@ impl ClassEdits {
         out.push_str("# op;seq;from;target;sx;sy;ex;ey;depth;along,z;...\n");
         out.push_str("# gop;seq;from;target;zmin;zmax;ox;oy;a;b;c;offset;x,y;...\n");
         out.push_str("# vop;seq;from;target;zmin;zmax;x,y;...\n");
+        out.push_str("# v3, only for outlines drawn away from top view: the outline is in\n");
+        out.push_str("# the view plane at o, along unit vectors r (right) and u (up).\n");
+        out.push_str("# gvop;seq;from;target;zmin;zmax;ox;oy;oz;rx;ry;rz;ux;uy;uz;gx;gy;a;b;c;offset;u,v;...\n");
+        out.push_str("# vvop;seq;from;target;zmin;zmax;ox;oy;oz;rx;ry;rz;ux;uy;uz;u,v;...\n");
         for op in &self.ops {
             out.push_str(&format_op(op));
             out.push('\n');
@@ -537,9 +631,35 @@ fn parse_mask(token: &str) -> Option<ClassMask> {
     }
 }
 
+/// `;ox;oy;oz;rx;ry;rz;ux;uy;uz` for a view plane.
+fn format_view(v: &ViewPlane) -> String {
+    let [o, r, u] = [v.origin, v.right, v.up];
+    format!(";{};{};{};{};{};{};{};{};{}", o[0], o[1], o[2], r[0], r[1], r[2], u[0], u[1], u[2])
+}
+
 fn format_op(op: &ClassOp) -> String {
     let from = format_mask(&op.from);
+    let outline = |polygon: &[(f64, f64)]| -> String {
+        polygon.iter().map(|(a, b)| format!(";{a},{b}")).collect()
+    };
     match &op.region {
+        // A screen outline gets its own line kinds. A plan outline — anything
+        // drawn from straight above — keeps writing gop/vop exactly as before,
+        // so an ordinary session's sidecar stays readable by older builds,
+        // which skip line kinds they do not know.
+        ClassRegion::AboveGround { polygon, view: Some(v), origin, plane, offset, z_min, z_max } => {
+            format!(
+                "gvop;{};{};{};{};{}{};{};{};{};{};{};{}{}",
+                op.seq, from, op.target_class, z_min, z_max, format_view(v),
+                origin.0, origin.1, plane.0, plane.1, plane.2, offset, outline(polygon),
+            )
+        }
+        ClassRegion::Volume { polygon, view: Some(v), z_min, z_max } => {
+            format!(
+                "vvop;{};{};{};{};{}{}{}",
+                op.seq, from, op.target_class, z_min, z_max, format_view(v), outline(polygon),
+            )
+        }
         ClassRegion::Corridor { start, end, depth, polygon } => {
             let mut s = format!(
                 "op;{};{};{};{};{};{};{};{}",
@@ -551,7 +671,7 @@ fn format_op(op: &ClassOp) -> String {
             }
             s
         }
-        ClassRegion::AboveGround { polygon, origin, plane, offset, z_min, z_max } => {
+        ClassRegion::AboveGround { polygon, view: None, origin, plane, offset, z_min, z_max } => {
             let mut s = format!(
                 "gop;{};{};{};{};{};{};{};{};{};{};{}",
                 op.seq, from, op.target_class,
@@ -563,7 +683,7 @@ fn format_op(op: &ClassOp) -> String {
             }
             s
         }
-        ClassRegion::Volume { polygon, z_min, z_max } => {
+        ClassRegion::Volume { polygon, view: None, z_min, z_max } => {
             let mut s = format!(
                 "vop;{};{};{};{};{}",
                 op.seq, from, op.target_class, z_min, z_max,
@@ -613,6 +733,7 @@ fn parse_op(line: &str) -> Option<ClassOp> {
                 plane: (f(8)?, f(9)?, f(10)?),
                 offset: f(11)?,
                 polygon: read_polygon(12)?,
+                view: None,
             }
         }
         "vop" => {
@@ -621,6 +742,27 @@ fn parse_op(line: &str) -> Option<ClassOp> {
                 z_min: f(4)?,
                 z_max: f(5)?,
                 polygon: read_polygon(6)?,
+                view: None,
+            }
+        }
+        "gvop" | "vvop" => {
+            let view = ViewPlane {
+                origin: [f(6)?, f(7)?, f(8)?],
+                right: [f(9)?, f(10)?, f(11)?],
+                up: [f(12)?, f(13)?, f(14)?],
+            };
+            if kind == "vvop" {
+                ClassRegion::Volume { z_min: f(4)?, z_max: f(5)?, polygon: read_polygon(15)?, view: Some(view) }
+            } else {
+                ClassRegion::AboveGround {
+                    z_min: f(4)?,
+                    z_max: f(5)?,
+                    origin: (f(15)?, f(16)?),
+                    plane: (f(17)?, f(18)?, f(19)?),
+                    offset: f(20)?,
+                    polygon: read_polygon(21)?,
+                    view: Some(view),
+                }
             }
         }
         _ => return None,
@@ -715,13 +857,47 @@ pub fn fit_ground_plane(
     z_max: f64,
 ) -> Option<GroundFit> {
     if polygon.len() < 3 { return None; }
+    let (lo, hi) = outline_xy_bounds(polygon, None, z_min, z_max);
+    fit_ground_cells(points, &|x, y, _| point_in_polygon(polygon, x, y), lo, hi, z_min, z_max)
+}
 
-    let (mut xmin, mut ymin) = (f64::MAX, f64::MAX);
-    let (mut xmax, mut ymax) = (f64::MIN, f64::MIN);
-    for &(x, y) in polygon {
-        xmin = xmin.min(x); xmax = xmax.max(x);
-        ymin = ymin.min(y); ymax = ymax.max(y);
+/// [`fit_ground_plane`] for any lasso outline, plan or screen.
+///
+/// A screen outline's footprint on the ground is not the outline — from an
+/// oblique view it is the stretch of ground the prism crosses inside the band —
+/// so the fitting grid is laid over the points the prism actually caught
+/// rather than over the outline's bounds.
+pub fn fit_ground_plane_in(
+    points: &[(f64, f64, f64)],
+    polygon: &[(f64, f64)],
+    view: Option<&ViewPlane>,
+    z_min: f64,
+    z_max: f64,
+) -> Option<GroundFit> {
+    let Some(v) = view else { return fit_ground_plane(points, polygon, z_min, z_max) };
+    if polygon.len() < 3 { return None; }
+    let inside = |x: f64, y: f64, z: f64| outline_contains(polygon, Some(v), x, y, z);
+    let (mut lo, mut hi) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
+    for &(x, y, z) in points {
+        if z < z_min || z > z_max || !inside(x, y, z) { continue; }
+        lo = (lo.0.min(x), lo.1.min(y));
+        hi = (hi.0.max(x), hi.1.max(y));
     }
+    if lo.0 > hi.0 { return None; }
+    fit_ground_cells(points, &inside, lo, hi, z_min, z_max)
+}
+
+/// The fit itself, over the points `inside` accepts, gridded over the XY box
+/// `lo`..`hi`.
+fn fit_ground_cells(
+    points: &[(f64, f64, f64)],
+    inside: &dyn Fn(f64, f64, f64) -> bool,
+    lo: (f64, f64),
+    hi: (f64, f64),
+    z_min: f64,
+    z_max: f64,
+) -> Option<GroundFit> {
+    let ((xmin, ymin), (xmax, ymax)) = (lo, hi);
     let origin = ((xmin + xmax) * 0.5, (ymin + ymax) * 0.5);
 
     // Aim for roughly a 40x40 grid over the footprint, but never so fine that
@@ -733,7 +909,7 @@ pub fn fit_ground_plane(
     let mut considered = 0usize;
     for &(x, y, z) in points {
         if z < z_min || z > z_max { continue; }
-        if !point_in_polygon(polygon, x, y) { continue; }
+        if !inside(x, y, z) { continue; }
         considered += 1;
         let key = (((x - origin.0) / cell).floor() as i64, ((y - origin.1) / cell).floor() as i64);
         let e = minima.entry(key).or_insert((x - origin.0, y - origin.1, z));
@@ -1229,6 +1405,7 @@ mod tests {
             0,
             ClassRegion::AboveGround {
                 polygon: square(20.0),
+                view: None,
                 origin: fit.origin,
                 plane: fit.plane,
                 offset: 0.5,
@@ -1259,6 +1436,7 @@ mod tests {
             0,
             ClassRegion::AboveGround {
                 polygon: vec![(10.0, 20.0), (30.0, 20.0), (30.0, 40.0), (10.0, 40.0)],
+                view: None,
                 origin: (20.0, 30.0),
                 plane: (0.01, -0.02, 5.5),
                 offset: 0.25,
@@ -1272,7 +1450,8 @@ mod tests {
         assert_eq!(parsed.target_class, 18);
         assert_eq!(parsed.from, ClassMask::single(1));
         match parsed.region {
-            ClassRegion::AboveGround { origin, plane, offset, z_min, z_max, ref polygon } => {
+            ClassRegion::AboveGround { origin, plane, offset, z_min, z_max, ref polygon, view } => {
+                assert_eq!(view, None, "a plan footprint stays a plan footprint");
                 assert_eq!(origin, (20.0, 30.0));
                 assert_eq!(plane, (0.01, -0.02, 5.5));
                 assert_eq!(offset, 0.25);
@@ -1296,6 +1475,7 @@ mod tests {
             0,
             ClassRegion::Volume {
                 polygon: square(20.0),
+                view: None,
                 z_min: 5.0,
                 z_max: 30.0,
             },
@@ -1321,6 +1501,7 @@ mod tests {
             0,
             ClassRegion::Volume {
                 polygon: vec![(10.0, 20.0), (30.0, 20.0), (30.0, 40.0), (10.0, 40.0)],
+                view: None,
                 z_min: 1.0,
                 z_max: 40.0,
             },
@@ -1333,9 +1514,10 @@ mod tests {
         assert_eq!(parsed.target_class, 18);
         assert_eq!(parsed.from, ClassMask::single(1));
         match parsed.region {
-            ClassRegion::Volume { z_min, z_max, ref polygon } => {
+            ClassRegion::Volume { z_min, z_max, ref polygon, view } => {
                 assert_eq!((z_min, z_max), (1.0, 40.0));
                 assert_eq!(polygon.len(), 4);
+                assert_eq!(view, None);
             }
             _ => panic!("wrong region kind"),
         }
@@ -1355,6 +1537,7 @@ mod tests {
             0,
             ClassRegion::AboveGround {
                 polygon: vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)],
+                view: None,
                 origin: (5.0, 5.0),
                 plane: (0.0, 0.0, 1.0),
                 offset: 0.2,
@@ -1371,6 +1554,145 @@ mod tests {
         assert!(matches!(back[0].region, ClassRegion::Corridor { .. }));
         assert!(matches!(back[1].region, ClassRegion::AboveGround { .. }));
         assert_eq!(back[1].seq, 1);
+    }
+
+    /// Looking north and 45° down, from anywhere: right is east, up is north
+    /// and up in equal measure.
+    fn looking_north_45() -> ViewPlane {
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        ViewPlane { origin: [0.0, 0.0, 0.0], right: [1.0, 0.0, 0.0], up: [0.0, s, s] }
+    }
+
+    #[test]
+    fn a_screen_outline_selects_what_projects_inside_it() {
+        let op = ClassOp::new(
+            0,
+            ClassRegion::Volume {
+                polygon: square(1.0),
+                view: Some(looking_north_45()),
+                z_min: -50.0,
+                z_max: 50.0,
+            },
+            7,
+            ClassMask::ALL,
+        );
+        // Straight down the line of sight, however far along it.
+        assert!(op.contains(0.0, 0.0, 0.0));
+        assert!(op.contains(0.5, 20.0, -20.0));
+        assert!(op.contains(-0.5, -30.0, 30.0));
+        // Beside it, or above it on screen.
+        assert!(!op.contains(2.0, 20.0, -20.0));
+        assert!(!op.contains(0.0, 0.0, 3.0));
+        // The column a top-view outline of the same square would take is not
+        // what was drawn from this angle.
+        assert!(!op.contains(0.0, 0.0, -20.0));
+        // And the band still bounds it.
+        assert!(!op.contains(0.0, 60.0, -60.0));
+    }
+
+    #[test]
+    fn a_screen_outlines_bounds_are_its_lines_of_sight_cut_by_the_band() {
+        let op = ClassOp::new(
+            0,
+            ClassRegion::Volume { polygon: square(1.0), view: Some(looking_north_45()), z_min: -20.0, z_max: 0.0 },
+            7,
+            ClassMask::ALL,
+        );
+        // Where the prism runs through the band: from about y = -1.4 at the
+        // top of the band to y = 21.4 at its floor.
+        assert!(op.intersects_aabb(&[-0.5, 9.5, -10.5], &[0.5, 10.5, -9.5]));
+        assert!(!op.intersects_aabb(&[-0.5, -30.0, -10.5], &[0.5, -25.0, -9.5]));
+        assert!(!op.intersects_aabb(&[5.0, 9.5, -10.5], &[6.0, 10.5, -9.5]));
+
+        // Looking horizontally the prism never leaves the band, so nothing
+        // in XY can be ruled out.
+        let side = ViewPlane { origin: [0.0; 3], right: [1.0, 0.0, 0.0], up: [0.0, 0.0, 1.0] };
+        let op = ClassOp::new(
+            0,
+            ClassRegion::Volume { polygon: square(1.0), view: Some(side), z_min: -20.0, z_max: 20.0 },
+            7,
+            ClassMask::ALL,
+        );
+        assert!(op.intersects_aabb(&[-0.5, 1.0e6, -0.5], &[0.5, 1.0e6 + 1.0, 0.5]));
+        assert!(op.contains(0.0, 1.0e6, 0.0));
+    }
+
+    #[test]
+    fn screen_outline_ops_survive_the_sidecar_and_plan_ones_keep_their_old_lines() {
+        let view = ViewPlane {
+            origin: [208_800.5, 373_300.25, 12.0],
+            right: [0.6, 0.8, 0.0],
+            up: [-0.4, 0.3, 0.866_025_403_784_438_6],
+        };
+        let polygon = vec![(-2.0, -1.0), (3.0, -1.0), (3.0, 4.0), (-2.0, 4.0)];
+        let volume = ClassOp::new(
+            3,
+            ClassRegion::Volume { polygon: polygon.clone(), view: Some(view), z_min: 1.0, z_max: 40.0 },
+            18,
+            ClassMask::single(1),
+        );
+        let ground = ClassOp::new(
+            4,
+            ClassRegion::AboveGround {
+                polygon: polygon.clone(),
+                view: Some(view),
+                origin: (208_801.0, 373_301.0),
+                plane: (0.01, -0.02, 11.5),
+                offset: 0.25,
+                z_min: 1.0,
+                z_max: 40.0,
+            },
+            7,
+            ClassMask::ALL,
+        );
+        for (op, kind) in [(&volume, "vvop;"), (&ground, "gvop;")] {
+            let line = format_op(op);
+            assert!(line.starts_with(kind), "{line}");
+            let back = parse_op(&line).expect("parses");
+            assert_eq!(back.seq, op.seq);
+            // Selects the same points either side of the round trip, probed
+            // along and across the prism.
+            for k in -5..=5 {
+                for (u, w) in [(0.0, 0.0), (2.9, 3.9), (3.1, 0.0), (0.0, -1.1)] {
+                    let p = view.point(u, w);
+                    let d = view.depth_dir();
+                    let t = k as f64 * 3.0;
+                    let (x, y, z) = (p[0] + t * d[0], p[1] + t * d[1], p[2] + t * d[2]);
+                    assert_eq!(op.contains(x, y, z), back.contains(x, y, z), "{kind} at ({u}, {w}, {t})");
+                }
+            }
+        }
+
+        // An outline from straight above is still a plan outline, written the
+        // way an older haiviz can read.
+        let plan = ClassOp::new(
+            0,
+            ClassRegion::Volume { polygon: square(5.0), view: None, z_min: 0.0, z_max: 1.0 },
+            7,
+            ClassMask::ALL,
+        );
+        assert!(format_op(&plan).starts_with("vop;"));
+    }
+
+    #[test]
+    fn the_ground_fits_under_an_oblique_outline() {
+        let mut pts = ground(0.05, 0.0, 10.0, 40.0);
+        // A canopy over the middle, where the outline's line of sight crosses
+        // both it and the ground under it.
+        for i in 0..31 {
+            for j in 0..21 {
+                pts.push((-15.0 + i as f64, -10.0 + j as f64, 16.0));
+            }
+        }
+        let v = ViewPlane { origin: [0.0, 0.0, 10.0], ..looking_north_45() };
+        let polygon = square(8.0);
+        let fit = fit_ground_plane_in(&pts, &polygon, Some(&v), 0.0, 30.0).expect("fits");
+        for &(x, y) in &[(0.0, 0.0), (5.0, 10.0), (-6.0, -8.0)] {
+            let want = 0.05 * x + 10.0;
+            assert!((fit.height_at(x, y) - want).abs() < 0.05, "at ({x},{y}) {} want {want}", fit.height_at(x, y));
+        }
+        // Nothing caught, nothing fitted.
+        assert!(fit_ground_plane_in(&pts, &polygon, Some(&v), 100.0, 200.0).is_none());
     }
 
     #[test]
