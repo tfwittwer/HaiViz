@@ -1,7 +1,8 @@
 # Manual vectorisation in HaiViz — implementation plan
 
-Status: **phases 0–4 implemented and driven on real data; 5 and 6 are still
-plan only.** Written 2026-09-10, last updated 2026-09-11.
+Status: **phases 0–4 implemented and driven on real data; phase 6 implemented
+but not yet driven; phase 5 is still plan only.** Written 2026-09-10, last
+updated 2026-09-11.
 
 See [§15](#15-where-this-stands) for what is done, what was learned from using
 it, and what a next session would pick up.
@@ -651,6 +652,86 @@ what the tracer sees, tuning channel weights is guesswork.
   pick a rail profile or a kerb face precisely. Placement and snapping only; no
   edge following (decision 8).
 
+### Status: built (6)
+
+`haiviz/src/vector_edit.rs` holds the editor state, the edit operations, the
+re-drape, the panel and the handles; `main.rs` holds `AppMode::EditLines`,
+`AppMode::SectionDigitise` and the wiring. Section-view snapping lives beside
+the 3D snap in `vectorise.rs` and `main.rs::resolve_section_snap`.
+
+**Editing is its own mode (`M`), not part of digitising.** Near an existing
+vertex a click means "grab it" to an editor and "tie into it" to a digitiser;
+one mode cannot mean both. `P` and `M` switch between the two, but `M` refuses
+mid-line rather than drop a half-drawn line on a stray key.
+
+**Drag, not click.** A press on a handle only moves anything once the pointer
+has travelled `DRAG_THRESHOLD_PX`; below that the release is a click and only
+selects. Otherwise selecting a vertex to read its coordinates would re-snap it
+to whatever sits a pixel away. Nothing reaches the model until release, so a
+drag is one undo entry and one auto-save. A release over a refused snap — or
+over the panel — leaves the line alone and says why; no stale position from
+earlier in the drag is committed.
+
+A dragged vertex snaps through the same `resolve_snap` as a new one, with two
+additions: `prev` (the vertex's own starting height, for same-Z) and
+`SnapExclude`, which hides the dragged vertex and its two segments from the
+existing-polyline snap. Without it that snap finds the vertex under the cursor
+on every frame and the drag never goes anywhere.
+
+**The selected vertex carries its line.** `Editor::vertex` is
+`(PolyRef, usize)`, not an index into `selected_poly`: selecting another line in
+the Polylines panel would otherwise silently move the selection to vertex *i* of
+a different line.
+
+**Undo is ordered across files.** Each `PolylineFile` keeps its own inverse
+stack (§7.1), so `Editor` records which file each committed change went to and
+`Ctrl+Z` walks that order. A finished digitised line goes on the same order, so
+the first undo after finishing takes the line back.
+
+**Re-drape keeps plan position.** Each vertex keeps its XY and takes a new Z,
+through the same backends, filters and COPC spacing guard as a snap. Letting it
+also move sideways onto whichever point realised a percentile would undo the
+placement the operator did by hand. `Nearest` means closest in **3D** among the
+in-radius candidates, so a vertex on a bridge deck stays on the deck. Same-Z and
+existing-polyline have no height of their own and are not offered. The whole
+drape is one `Edit::RestorePoints`, so one undo reverses it. Vertices that
+cannot be answered keep their height and are counted in the status line.
+
+**Section digitising lands on the plane.** A vertex takes the (along, height) it
+snapped to, on the section plane, even when the point it snapped to sits up to
+the corridor depth off it: the section view shows nothing of that offset, so a
+vertex that kept it would be a coordinate the operator never saw. Tying into an
+existing line is the exception (`polylines::nearest_in_section`), because
+sharing a coordinate is the whole point. Low/High Z take the percentile over a
+vertical strip of ±radius along the section — the slice's equivalent of the 3D
+radius column. The queries run over `SectionData`'s own points, which already
+carry the height band and class visibility; the index over them is a
+`OnceCell`, built on first use, because a section is rebuilt on every colour or
+ramp change and almost none of those are ever digitised on. On COPC, starting
+the tool force-loads the corridor through the lasso's path (`CorridorThen`
+replaces the old `corridor_load_to_lasso` flag), so there is no LOD to guard
+against.
+
+Not in the plan, added because they cost little: **Shift+Enter finishes a line
+as a ring**, and the selected line draws twice as wide.
+
+Found and fixed while wiring this:
+
+- Removing a polyline file left `digitise.target` and `selected_poly` pointing
+  at whatever file slid into its index. Removal is now deferred to the top of
+  the frame like cloud unloads, and every file index is fixed up in one place.
+- **Ctrl + wheel zoomed as well as changing the snap radius** — the zoom never
+  checked the modifier.
+- In tile mode `Enter` and `Delete` loaded and unloaded the selected tile while
+  digitising — so finishing a line also loaded a tile.
+- Three status messages had lost their `\` line continuations and showed long
+  runs of spaces in the panel.
+
+Not done: vertex editing in the section view (§11 never asked for it), and a
+re-drape on COPC does not pin nodes along the line — vertices where the loaded
+data is too coarse keep their height and are reported, and zooming in along the
+line then re-draping again fills them in.
+
 ---
 
 ## 12. Order of work
@@ -664,7 +745,7 @@ what the tracer sees, tuning channel weights is guesswork.
 | **3** | D — digitising mode, free vertex placement, panel wiring | ~450 | yes — **done** |
 | **4** | E — snapping, radius control, feedback, COPC guard + pinning | ~450 | yes, the core tool — **done** |
 | **5** | F — edge following, cost channels, livewire, heatmap | ~600 | yes |
-| **6** | G — vertex editing, section-view digitising, re-drape | ~400 | yes |
+| **6** | G — vertex editing, section-view digitising, re-drape | ~400 | yes — **done** |
 
 Phase 1 is worth doing early and independently: it is useful on its own, it
 improves the ground-plane fit immediately, and every later phase depends on the
@@ -705,14 +786,16 @@ on why digitising works from oblique views when the plan-view lassos do not.
 
 All of that is written **except the edge-following part of the Vectorisation
 section**, which waits on phase 5. The README also gained two sections the plan
-did not anticipate: *The panel* and *Class visibility*.
+did not anticipate: *The panel* and *Class visibility*. Phase 6 added *Editing
+lines* and *Digitising in a section* under Vectorisation, with their keys in the
+cheat-sheet.
 
 ---
 
 ## 15. Where this stands
 
-Branch `vectorisation`, ten commits off `master`. `cargo test -p haiviz` is
-green (107 tests) and `cargo clippy --all-targets` adds no warnings beyond the
+Branch `vectorisation`, twelve commits off `master`. `cargo test -p haiviz` is
+green (120 tests) and `cargo clippy --all-targets` adds no warnings beyond the
 two that predate this work.
 
 ### Done
@@ -725,6 +808,7 @@ two that predate this work.
 | 2b | GeoPackage read and write |
 | 3 | digitising mode |
 | 4 | snapping |
+| 6 | vertex editing, section-view digitising, re-drape |
 
 Plus four follow-ups after the tool was actually driven on a cloud: a ray-based
 fix to the existing-polyline snap, and three rounds of UI work — one docked
@@ -738,9 +822,20 @@ fixes to pointer and keyboard capture.
 value cannot be judged until the heatmap can be seen on real data. Deferred
 deliberately so phases 0–4 could be used first, not because it ran out of road.
 
-**Phase 6 — vertex editing, section-view digitising, re-drape.** Not
-speculative, just next. `polylines::pick_vertex` and the mutation API it needs
-already exist and are tested (phase 2a); nothing has been built on them yet.
+### Built, not yet driven
+
+**Phase 6.** Everything in §11, plus the fixes listed under its status. The
+model and editor logic are tested; the interaction has only been launched, not
+used. What most likely needs a second round, in the order worth trying:
+
+- the drag threshold and pick radii (`DRAG_THRESHOLD_PX`, `VERTEX_PICK_PX`,
+  `SEGMENT_PICK_PX`) — chosen, not measured, and never tried on a display whose
+  DPI scale is not 1;
+- left-drag does not orbit in edit mode, exactly as in digitising, because it
+  grabs handles; whether orbiting on empty space is missed;
+- section digitising on COPC, which goes through the corridor force-load;
+- re-drape of a long COPC line, where vertices away from the loaded
+  neighbourhood are kept and counted rather than draped.
 
 ### Things worth knowing before touching this again
 

@@ -30,6 +30,7 @@ mod spatial;
 mod polylines;
 mod gpkg;
 mod vectorise;
+mod vector_edit;
 mod gcp;
 mod classify;
 mod export;
@@ -293,6 +294,39 @@ enum AppMode {
     /// digitised vertex comes from a real point and is unambiguous from
     /// anywhere.
     Digitise,
+    /// Editing existing polylines: dragging vertices, pulling new ones out of
+    /// segments, deleting. From any camera angle, for the same reason as
+    /// digitising — a dragged vertex is snapped onto real data.
+    EditLines,
+    /// Digitising in the section view, in (along, height).
+    SectionDigitise,
+}
+
+/// Where to land once a force-loaded section corridor has streamed in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CorridorThen {
+    /// Plain section view — after an undo, which has to re-stream the slice.
+    View,
+    Lasso,
+    Digitise,
+}
+
+impl CorridorThen {
+    fn mode(self) -> AppMode {
+        match self {
+            CorridorThen::View => AppMode::SectionView,
+            CorridorThen::Lasso => AppMode::SectionLasso,
+            CorridorThen::Digitise => AppMode::SectionDigitise,
+        }
+    }
+
+    /// What the corridor is being loaded for, for the refusal message.
+    fn purpose(self) -> &'static str {
+        match self {
+            CorridorThen::View | CorridorThen::Lasso => "classifying",
+            CorridorThen::Digitise => "digitising",
+        }
+    }
 }
 
 /// What a plan-view lasso selects once it is closed.
@@ -458,6 +492,10 @@ fn cursor_ray(view_proj: &glam::Mat4, mx: f32, my: f32, view: ViewRect) -> ([f32
 /// the ray hit rather than from a fixed plane: that is what makes them mean
 /// "within 0.2 m of the surface I am pointing at" from an oblique view as well
 /// as from directly above.
+///
+/// `prev` is the vertex a same-Z snap holds the height of: the last one placed
+/// while digitising, or where a dragged vertex started. `exclude` is the part
+/// of a line being dragged, which the existing-polyline snap must not find.
 #[allow(clippy::too_many_arguments)]
 fn resolve_snap(
     stages: &[Stage],
@@ -470,6 +508,8 @@ fn resolve_snap(
     view: ViewRect,
     data_offset: [f64; 3],
     dig: &vectorise::Digitise,
+    prev: Option<[f64; 3]>,
+    exclude: Option<polylines::SnapExclude>,
 ) -> vectorise::SnapHit {
     use vectorise::{SnapHit, SnapMode, SnapQuality};
     let to_world = |v: [f32; 3]| [
@@ -512,14 +552,15 @@ fn resolve_snap(
             origin[2] as f64 + data_offset[2],
         ];
         let d = [dir[0] as f64, dir[1] as f64, dir[2] as f64];
-        return match polylines::nearest_on_lines_to_ray(poly_files, o, d, r as f64) {
+        return match polylines::nearest_on_lines_to_ray(poly_files, o, d, r as f64, exclude) {
             Some((w, _)) => SnapHit::good(w),
             None => empty("No polyline within the snap radius."),
         };
     }
 
     let Some(anchor) = anchor else {
-        return empty("Nothing within the snap radius. Widen it with Ctrl + wheel,                       or Shift-click to place a vertex freely.");
+        return empty("Nothing within the snap radius. Widen it with Ctrl + wheel, \
+                      or Shift-click to place a vertex freely.");
     };
 
     // The COPC spacing guard. Zoomed out the resident set is a thinned sample,
@@ -536,7 +577,9 @@ fn resolve_snap(
                     world: to_world(anchor),
                     quality: SnapQuality::Coarse,
                     note: Some(format!(
-                        "Point spacing here is {spacing:.2} m, wider than the {r:.2} m                          snap radius — a percentile would be taken over whatever the                          LOD happened to load. Zoom in, or widen the radius.",
+                        "Point spacing here is {spacing:.2} m, wider than the {r:.2} m \
+                         snap radius — a percentile would be taken over whatever the \
+                         LOD happened to load. Zoom in, or widen the radius.",
                     )),
                 };
             }
@@ -545,7 +588,7 @@ fn resolve_snap(
 
     match dig.snap_mode {
         SnapMode::Nearest => SnapHit::good(to_world(anchor)),
-        SnapMode::SameZ => match dig.last() {
+        SnapMode::SameZ => match prev {
             // The XY the operator pointed at, the Z they already committed to.
             Some(prev) => SnapHit::good([
                 anchor[0] as f64 + data_offset[0],
@@ -577,6 +620,284 @@ fn resolve_snap(
         }
         SnapMode::Existing => unreachable!("handled above"),
     }
+}
+
+/// Resolve the vertex under the cursor in the section view, at section-space
+/// `(along, height)`.
+///
+/// Queries the section's own points, which were cut with the height band and
+/// hidden classes already applied. The vertex lands on the section plane — see
+/// the note on the section view in `vectorise.rs` — except when tying into an
+/// existing line, which lands on that line.
+///
+/// There is no COPC spacing guard here: digitising in a section force-loads
+/// the corridor first, exactly as the section lasso does, so the slice is at
+/// full resolution by the time a vertex can be placed.
+#[allow(clippy::too_many_arguments)]
+fn resolve_section_snap(
+    sec: &SectionData,
+    poly_files: &[polylines::PolylineFile],
+    start: (f32, f32),
+    end: (f32, f32),
+    depth: f32,
+    along: f32,
+    height: f32,
+    data_offset: [f64; 3],
+    dig: &vectorise::Digitise,
+) -> vectorise::SnapHit {
+    use vectorise::{SnapHit, SnapMode, SnapQuality};
+    let empty = |note: &str| SnapHit {
+        world: [0.0; 3], quality: SnapQuality::Empty, note: Some(note.to_string()),
+    };
+    let (dx, dy) = (end.0 - start.0, end.1 - start.1);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 0.001 { return empty("The section line has no length."); }
+    let dir = (dx / len, dy / len);
+    let r = dig.radius;
+    let on_plane = |a: f32, h: f32| vectorise::section_to_world(start, dir, a, h, data_offset);
+
+    if dig.snap_mode == SnapMode::Existing {
+        return match polylines::nearest_in_section(poly_files, start, end, depth, along, height, r) {
+            Some(w) => SnapHit::good(w),
+            None => empty("No polyline within the snap radius."),
+        };
+    }
+
+    let (grid, pts) = sec.snap_index();
+    let nothing = "Nothing within the snap radius. Widen it with Ctrl + wheel, \
+                   or Shift-click to place a vertex freely.";
+    match dig.snap_mode {
+        SnapMode::Nearest => match vectorise::section_nearest(grid, pts, along, height, r) {
+            Some((a, h)) => SnapHit::good(on_plane(a, h)),
+            None => empty(nothing),
+        },
+        // As in 3D: the position comes from a real point near the cursor, the
+        // height from the vertex already committed to.
+        SnapMode::SameZ => match vectorise::section_nearest(grid, pts, along, height, r) {
+            Some((a, h)) => {
+                let w = on_plane(a, h);
+                SnapHit::good(match dig.last() { Some(prev) => [w[0], w[1], prev[2]], None => w })
+            }
+            None => empty(nothing),
+        },
+        SnapMode::LowZ | SnapMode::HighZ => {
+            let pct = if dig.snap_mode == SnapMode::LowZ { dig.low_pct } else { dig.high_pct };
+            match vectorise::section_percentile(grid, pts, along, r, pct) {
+                Some((a, h)) => SnapHit::good(on_plane(a, h)),
+                None => empty(nothing),
+            }
+        }
+        SnapMode::Existing => unreachable!("handled above"),
+    }
+}
+
+/// Re-drape a line onto the cloud with the current snap mode and radius.
+///
+/// Vertex by vertex through the same backends, filters and COPC spacing guard
+/// as a snap, so a re-draped vertex gets the height a click at its plan position
+/// would have. `vector_edit::drape` says why the plan position is kept.
+#[allow(clippy::too_many_arguments)]
+fn redrape_line(
+    stages: &[Stage],
+    copc_stages: &[CopcStage],
+    tile_mgr: &Option<TileStageManager>,
+    poly_files: &[polylines::PolylineFile],
+    line: polylines::PolyRef,
+    data_offset: [f64; 3],
+    dig: &vectorise::Digitise,
+) -> Option<vector_edit::Drape> {
+    use vector_edit::DrapeMiss;
+    use vectorise::SnapMode;
+    let pl = poly_files.get(line.file)?.get(line.line_ref())?;
+    let r = dig.radius;
+    let mut zs: Vec<(f32, [f32; 3])> = Vec::new();
+    Some(vector_edit::drape(pl.points(), |p| {
+        let v = [
+            (p[0] - data_offset[0]) as f32,
+            (p[1] - data_offset[1]) as f32,
+            (p[2] - data_offset[2]) as f32,
+        ];
+        if matches!(dig.snap_mode, SnapMode::LowZ | SnapMode::HighZ)
+            && copc_stages.iter().filter(|c| c.visible)
+                .any(|c| c.lod_spacing_near(v[0], v[1], r).is_some_and(|s| s > r as f64)) {
+            return Err(DrapeMiss::Coarse);
+        }
+        zs.clear();
+        for st in stages.iter().filter(|s| s.visible) { st.snap_z_candidates(v[0], v[1], r, &mut zs); }
+        for cs in copc_stages.iter().filter(|c| c.visible) { cs.snap_z_candidates(v[0], v[1], r, &mut zs); }
+        if let Some(mgr) = tile_mgr { mgr.snap_z_candidates(v[0], v[1], r, &mut zs); }
+        vector_edit::drape_z(dig.snap_mode, v, &mut zs, dig.low_pct, dig.high_pct)
+            .map(|z| z as f64 + data_offset[2])
+            .ok_or(DrapeMiss::Empty)
+    }))
+}
+
+/// Auto-save a vector file after a committed change.
+///
+/// Digitising and editing share this, and the granularity: one write per
+/// completed change. A file changed on disk since it was loaded is left alone
+/// and the change held in memory — every save rewrites the whole file, so an
+/// external edit would be destroyed rather than merely conflicted with.
+fn autosave_vectors(pf: &mut polylines::PolylineFile) -> Result<(), String> {
+    if pf.changed_on_disk() {
+        return Err(format!(
+            "{} changed on disk since it was loaded — the change is held in memory, \
+             not written. Use Save As to keep it.",
+            pf.file_name(),
+        ));
+    }
+    pf.save().map_err(|e| format!("Save failed: {e}"))
+}
+
+/// A status line for an edit and the auto-save that followed it.
+fn saved_status(what: String, saved: Result<(), String>) -> String {
+    match saved {
+        Ok(()) => format!("{what} Saved."),
+        Err(e) => format!("{what} {e}"),
+    }
+}
+
+/// Give digitising a layer to put lines in, creating the sidecar beside the
+/// cloud if it has none yet. False, with the reason in the status line, when
+/// there is nowhere for a line to go.
+fn ensure_digitise_target(
+    digitise: &mut vectorise::Digitise,
+    poly_files: &mut Vec<polylines::PolylineFile>,
+    stages: &[Stage],
+    copc_stages: &[CopcStage],
+    tile_mgr: &Option<TileStageManager>,
+) -> bool {
+    if digitise.target.is_some() { return true; }
+    // A layer has a destination from the moment it exists, because layers
+    // auto-save — there is no later "save this somewhere" step to hang a file
+    // dialog on.
+    match cloud_source_path(stages, copc_stages, tile_mgr) {
+        Some(cloud) => {
+            let srs = poly_files.iter()
+                .flat_map(|f| &f.layers)
+                .map(|l| l.srs_id)
+                .find(|s| *s != 0)
+                .unwrap_or(0);
+            let t = vectorise::ensure_target(poly_files, &cloud, srs, digitise.width_px);
+            digitise.target = Some(t);
+            digitise.status = Some(format!(
+                "New lines go to {}",
+                vectorise::short_path(&poly_files[t.0].path),
+            ));
+            true
+        }
+        None => {
+            digitise.status = Some("Load a point cloud first.".to_string());
+            false
+        }
+    }
+}
+
+/// Commit the line in progress and auto-save it — from the 3D view or the
+/// section view alike.
+///
+/// Granularity is the completed line, not the vertex: a whole-file rewrite per
+/// click would be waste, and a half-drawn line is not a meaningful thing to
+/// persist. A crash therefore costs at most the line in progress.
+fn finish_digitised_line(
+    digitise: &mut vectorise::Digitise,
+    editor: &mut vector_edit::Editor,
+    poly_files: &mut [polylines::PolylineFile],
+    closed: bool,
+) {
+    let Some(fi) = digitise.finish(poly_files, closed) else { return };
+    // On the same undo order as edits, so Ctrl+Z straight after finishing a
+    // line takes the line back.
+    editor.record(fi);
+    let pf = &mut poly_files[fi];
+    digitise.status = Some(match autosave_vectors(pf) {
+        Ok(()) => format!("{} lines saved to {}", pf.line_count(), pf.file_name()),
+        Err(e) => e,
+    });
+}
+
+/// Everything vector-shaped drawn under the 3D camera: the loaded lines, the
+/// line being digitised, and a vertex drag in progress. Before
+/// `set_default_camera()`, so all of it is depth-tested against the cloud and
+/// still composites beneath the panel.
+#[allow(clippy::too_many_arguments)]
+fn draw_vector_overlays_3d(
+    poly_files: &[polylines::PolylineFile],
+    selected: Option<polylines::PolyRef>,
+    digitise: &vectorise::Digitise,
+    editor: &vector_edit::Editor,
+    app_mode: AppMode,
+    data_offset: [f64; 3],
+    view_dir: Vec3,
+    metres_per_pixel: f32,
+    snap_target: Option<[f64; 3]>,
+) {
+    if !poly_files.is_empty() {
+        polylines::draw_3d(poly_files, view_dir, metres_per_pixel, selected);
+    }
+    if app_mode == AppMode::Digitise || digitise.is_drawing() {
+        vectorise::draw_overlay(
+            digitise, data_offset, view_dir, metres_per_pixel,
+            snap_target, app_mode == AppMode::Digitise,
+        );
+    }
+    if app_mode == AppMode::EditLines && editor.drag.as_ref().is_some_and(|d| d.moving) {
+        vector_edit::draw_drag_preview(
+            editor, poly_files, data_offset, view_dir, metres_per_pixel, snap_target,
+        );
+        vectorise::draw_snap_marker(digitise, data_offset);
+    }
+}
+
+/// The screen-space half of the vector overlays, under the default camera and
+/// before egui: the cursor readout and the editing handles.
+#[allow(clippy::too_many_arguments)]
+fn draw_vector_overlays_2d(
+    poly_files: &[polylines::PolylineFile],
+    selected: Option<polylines::PolyRef>,
+    digitise: &vectorise::Digitise,
+    editor: &vector_edit::Editor,
+    app_mode: AppMode,
+    view_proj: &glam::Mat4,
+    view: ViewRect,
+    mx: f32,
+    my: f32,
+    ui_has_pointer: bool,
+) {
+    match app_mode {
+        AppMode::Digitise if !ui_has_pointer => vectorise::draw_cursor_readout(digitise, mx, my),
+        AppMode::EditLines => {
+            vector_edit::draw_handles(editor, poly_files, selected, view_proj, (view.x, view.y, view.w, view.h));
+            if editor.drag.as_ref().is_some_and(|d| d.moving) {
+                vectorise::draw_cursor_readout(digitise, mx, my);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The Digitising section of the panel — drawing new lines, and editing the
+/// ones already there. Shared by the three per-mode blocks.
+#[allow(clippy::too_many_arguments)]
+fn vector_tools_section(
+    ui: &mut egui_macroquad::egui::Ui,
+    digitise: &mut vectorise::Digitise,
+    editor: &vector_edit::Editor,
+    poly_files: &[polylines::PolylineFile],
+    selected: Option<polylines::PolyRef>,
+    app_mode: AppMode,
+    have_cloud: bool,
+    digitise_request: &mut Option<vectorise::Request>,
+    edit_request: &mut Option<vector_edit::Request>,
+) {
+    panel_section(ui, "Digitising", false, |ui| {
+        if let Some(r) = vectorise::controls(
+            ui, digitise, poly_files, app_mode == AppMode::Digitise, have_cloud,
+        ) { *digitise_request = Some(r); }
+        if let Some(r) = vector_edit::controls(
+            ui, editor, poly_files, selected, app_mode == AppMode::EditLines, digitise.snap_mode,
+        ) { *edit_request = Some(r); }
+    });
 }
 
 /// Project a world position to screen coordinates.
@@ -1140,6 +1461,9 @@ fn polylines_section(
     // A Salome save that would drop something, waiting for the operator to
     // say yes: (file index, target path, what would be lost).
     pending_salome: &mut Option<(usize, String, Vec<String>)>,
+    // Unloading is deferred to the top of the next frame, where everything
+    // that addresses a file by index can be fixed up in one place.
+    remove_request: &mut Option<usize>,
     data_offset: [f64; 3],
     background: Color,
 ) {
@@ -1163,7 +1487,6 @@ fn polylines_section(
                 ui.colored_label(egui_macroquad::egui::Color32::RED, err);
             }
             ui.separator();
-            let mut to_remove: Option<usize> = None;
             // `(file, Some(new path))` is Save As; `(file, None)` is Save.
             let mut save_request: Option<(usize, Option<String>)> = None;
             // File → layer → line. A GeoPackage is a container of named feature
@@ -1176,8 +1499,7 @@ fn polylines_section(
                         ui.label(pf.format.label());
                         if pf.dirty { ui.label("• unsaved"); }
                         if ui.small_button("Remove file").clicked() {
-                            to_remove = Some(fi);
-                            if selected_poly.map(|r| r.file) == Some(fi) { *selected_poly = None; }
+                            *remove_request = Some(fi);
                         }
                     });
                     ui.horizontal(|ui| {
@@ -1232,8 +1554,6 @@ fn polylines_section(
                     }
                 });
             }
-            if let Some(fi) = to_remove { poly_files.remove(fi); }
-
             if let Some((fi, target)) = save_request {
                 *poly_save_status = save_polylines(&mut poly_files[fi], fi, target, pending_salome);
             }
@@ -1289,7 +1609,8 @@ fn save_polylines(
             // rather than merely conflicted with.
             if pf.changed_on_disk() {
                 return Some(format!(
-                    "{} changed on disk since it was loaded. Saving would overwrite                      those changes — use Save As to write somewhere else.",
+                    "{} changed on disk since it was loaded. Saving would overwrite \
+                     those changes — use Save As to write somewhere else.",
                     pf.file_name(),
                 ));
             }
@@ -2169,7 +2490,7 @@ async fn main() {
     let mut corridor_status: Option<String> = None;
     // Where to land once the corridor has streamed in: the lasso tool if the
     // operator asked for it, or plain section view after an undo.
-    let mut corridor_load_to_lasso = false;
+    let mut corridor_then = CorridorThen::View;
     let mut corridor_total_points: i64 = 0;
 
     // Point pick state
@@ -2210,6 +2531,12 @@ async fn main() {
     // Set by the panel or by `P`, acted on once below rather than in each of
     // the three per-mode blocks.
     let mut digitise_request: Option<vectorise::Request> = None;
+    // Vertex editing, whose requests are likewise acted on in one place.
+    let mut editor = vector_edit::Editor::default();
+    let mut edit_request: Option<vector_edit::Request> = None;
+    // A polyline file the panel asked to unload, applied at the top of the
+    // next frame like the cloud unloads.
+    let mut poly_remove_request: Option<usize> = None;
     // Whether the COPC neighbourhood pins are currently held for digitising,
     // so leaving the mode releases them and the LOD is free to evict again.
     let mut digitise_pinned = false;
@@ -2370,6 +2697,24 @@ async fn main() {
                 picked_point = None;
             }
         }
+        if let Some(fi) = poly_remove_request.take()
+            && fi < poly_files.len()
+        {
+            poly_files.remove(fi);
+            // Everything that addresses a file by index shifts down past it.
+            digitise.file_removed(fi);
+            editor.file_removed(fi);
+            selected_poly = match selected_poly {
+                Some(r) if r.file == fi => None,
+                Some(r) if r.file > fi => Some(polylines::PolyRef { file: r.file - 1, ..r }),
+                s => s,
+            };
+            pending_salome = match pending_salome.take() {
+                Some((f, _, _)) if f == fi => None,
+                Some((f, p, l)) if f > fi => Some((f - 1, p, l)),
+                s => s,
+            };
+        }
 
         // If everything has been unloaded, forget the pinned coordinate frame and
         // reset the placeholder extents. The next load then re-pins the viewer origin
@@ -2473,6 +2818,19 @@ async fn main() {
                 // Same shape as the lasso, so the two do not need learning
                 // separately.
                 if digitise.is_drawing() { digitise.clear(); } else { app_mode = AppMode::View3D; }
+            } else if app_mode == AppMode::EditLines {
+                // One layer at a time: a drag in progress, then the selected
+                // vertex, then the mode itself.
+                if editor.drag.take().is_some() {
+                    digitise.hover = None;
+                } else if editor.vertex.is_some() {
+                    editor.vertex = None;
+                } else {
+                    editor.hover = None;
+                    app_mode = AppMode::View3D;
+                }
+            } else if app_mode == AppMode::SectionDigitise {
+                if digitise.is_drawing() { digitise.clear(); } else { app_mode = AppMode::SectionView; }
             } else if app_mode == AppMode::SectionLasso {
                 if lasso.is_empty() {
                     app_mode = AppMode::SectionView;
@@ -2498,7 +2856,7 @@ async fn main() {
         }
 
         // ---- Section 2D view ----
-        if matches!(app_mode, AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso | AppMode::SectionCorridorLoad) {
+        if matches!(app_mode, AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso | AppMode::SectionCorridorLoad | AppMode::SectionDigitise) {
             // Navigation
             if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) {
                 section_pan.y += MOVE_SPEED * section_zoom * 0.02;
@@ -2523,7 +2881,14 @@ async fn main() {
             }
 
             let (_mwx, mwy) = mouse_wheel();
-            if mwy.abs() > 0.001 {
+            let ctrl_down = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+            if mwy.abs() > 0.001 && ctrl_down && app_mode == AppMode::SectionDigitise {
+                // The snap radius, as in the 3D view; the plain wheel keeps zooming.
+                let step = if mwy > 0.0 { 1.25 } else { 1.0 / 1.25 };
+                digitise.radius = (digitise.radius * step)
+                    .clamp(vectorise::MIN_SNAP_RADIUS, vectorise::MAX_SNAP_RADIUS);
+                digitise.status = Some(format!("Snap radius {:.2} m", digitise.radius));
+            } else if mwy.abs() > 0.001 {
                 let factor = if mwy > 0.0 { 0.9 } else { 1.1 };
                 section_zoom *= factor;
                 section_zoom = section_zoom.clamp(0.1, 10000.0);
@@ -2563,11 +2928,7 @@ async fn main() {
                         sec_picked_point = None;
                     }
                     corridor_status = None;
-                    app_mode = if corridor_load_to_lasso {
-                        AppMode::SectionLasso
-                    } else {
-                        AppMode::SectionView
-                    };
+                    app_mode = corridor_then.mode();
                 } else {
                     let done = total.saturating_sub(pending);
                     corridor_status = Some(format!(
@@ -2719,6 +3080,36 @@ async fn main() {
                     draw_line(mx - ch, my, mx + ch, my, 1.0, Color::new(1.0, 1.0, 1.0, 0.7));
                     draw_line(mx, my - ch, mx, my + ch, 1.0, Color::new(1.0, 1.0, 1.0, 0.7));
                 }
+
+                // ---- Digitising in the section ----
+                if let (Some(start), Some(end)) = (section_start, section_end)
+                    && (app_mode == AppMode::SectionDigitise || digitise.is_drawing()) {
+                    let (mx, my) = mouse_position();
+                    let in_view = mx >= view_rect.x;
+                    // Resolved here rather than with the click, because the
+                    // marker is drawn now; the click further down places
+                    // whatever this found.
+                    digitise.hover = if app_mode == AppMode::SectionDigitise && in_view {
+                        let (ndc_x, ndc_y) = view_rect.ndc(mx, my);
+                        Some(resolve_section_snap(
+                            sec, &poly_files, start, end, section_depth,
+                            section_pan.x + ndc_x * half_w, section_pan.y + ndc_y * half_h,
+                            data_offset, &digitise,
+                        ))
+                    } else {
+                        None
+                    };
+                    let (dx, dy) = (end.0 - start.0, end.1 - start.1);
+                    let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+                    vectorise::draw_section_overlay(
+                        &digitise, start, (dx / len, dy / len), data_offset,
+                        |a, h| (world_to_screen_x(a), world_to_screen_y(h)),
+                        view_rect.h / (2.0 * half_h),
+                    );
+                    if app_mode == AppMode::SectionDigitise && in_view {
+                        vectorise::draw_cursor_readout(&digitise, mx, my);
+                    }
+                }
             }
 
             // Corridor force-load banner. This is the one moment where the
@@ -2751,6 +3142,9 @@ async fn main() {
             // already borrows most of the app state.
             let mut do_apply_lasso = false;
             let mut start_lasso = false;
+            let mut start_section_digitise = false;
+            let mut sec_digitise_request: Option<vectorise::Request> = None;
+            let have_cloud = !stages.is_empty() || !copc_stages.is_empty() || tile_mgr.is_some();
             let mut do_undo_op = false;
             let mut do_save_edits = false;
             let mut leave_corridor = false;
@@ -2779,6 +3173,7 @@ async fn main() {
                             sec_measure_b = None;
                             sec_picked_point = None;
                             lasso.clear();
+                            digitise.clear();
                             leave_corridor = true;
                         }
                         ui.separator();
@@ -2935,7 +3330,15 @@ async fn main() {
                         max_class, &class_defs,
                     );
                 });
-                polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
+                panel_section(ui, "Digitising", false, |ui| {
+                    if let Some(r) = vectorise::controls(
+                        ui, &mut digitise, &poly_files,
+                        app_mode == AppMode::SectionDigitise, have_cloud,
+                    ) { sec_digitise_request = Some(r); }
+                    ui.label("In a section, vertices land on the section plane.");
+                    ui.label("Editing existing lines is in the 3D view.");
+                });
+                polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, &mut poly_remove_request, data_offset, background);
                 gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
                     });
                 });
@@ -2977,6 +3380,26 @@ async fn main() {
                 if app_mode == AppMode::SectionLasso {
                     if is_key_pressed(KeyCode::Backspace) { lasso.pop(); }
                     if is_key_pressed(KeyCode::Enter) && lasso.len() >= 3 { do_apply_lasso = true; }
+                } else if app_mode == AppMode::SectionDigitise {
+                    // The same keys as digitising in 3D.
+                    let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+                    if is_key_pressed(KeyCode::N) {
+                        digitise.snap_mode = digitise.snap_mode.next();
+                        digitise.status = Some(format!("Snap: {}", digitise.snap_mode.label()));
+                    }
+                    if is_key_pressed(KeyCode::Backspace) { digitise.pop(); }
+                    if is_key_pressed(KeyCode::Enter) {
+                        sec_digitise_request = Some(if shift {
+                            vectorise::Request::FinishRing
+                        } else {
+                            vectorise::Request::Finish
+                        });
+                    }
+                    if is_key_pressed(KeyCode::P) {
+                        sec_digitise_request = Some(vectorise::Request::Cancel);
+                    }
+                } else if app_mode == AppMode::SectionView && is_key_pressed(KeyCode::P) {
+                    sec_digitise_request = Some(vectorise::Request::Start);
                 } else if classify_supported
                     && app_mode != AppMode::SectionCorridorLoad
                     && is_key_pressed(KeyCode::O)
@@ -2989,15 +3412,46 @@ async fn main() {
                 }
             }
 
+            // ---- Digitising requests from the section view ----
+            match sec_digitise_request.take() {
+                Some(vectorise::Request::Start)
+                    if app_mode != AppMode::SectionCorridorLoad
+                        && ensure_digitise_target(&mut digitise, &mut poly_files, &stages, &copc_stages, &tile_mgr) => {
+                    digitise.clear();
+                    lasso.clear();
+                    start_section_digitise = true;
+                }
+                Some(vectorise::Request::Start) => {}
+                Some(vectorise::Request::Cancel) => {
+                    digitise.clear();
+                    app_mode = AppMode::SectionView;
+                }
+                Some(vectorise::Request::Finish) =>
+                    finish_digitised_line(&mut digitise, &mut editor, &mut poly_files, false),
+                Some(vectorise::Request::FinishRing) =>
+                    finish_digitised_line(&mut digitise, &mut editor, &mut poly_files, true),
+                Some(vectorise::Request::UndoVertex) => { digitise.pop(); }
+                None => {}
+            }
+
             // ---- Starting the lasso pulls in the full-resolution corridor ----
+            // Digitising in the section needs the same, for the same reason: a
+            // snap over the thinned LOD sample would be quietly wrong.
             // A section cut for browsing shows the resident LOD, which is a
             // thinned sample. Classifying against that would mark the sampled
             // points and silently leave the dense remainder alone, so the
             // corridor is force-loaded here — once per section, not on every
             // cut — and the slice re-cut from it before any lasso is drawn.
-            if start_lasso {
+            let corridor_for = if start_lasso {
+                Some(CorridorThen::Lasso)
+            } else if start_section_digitise {
+                Some(CorridorThen::Digitise)
+            } else {
+                None
+            };
+            if let Some(then) = corridor_for {
                 if copc_stages.is_empty() || corridor_pinned {
-                    app_mode = AppMode::SectionLasso;
+                    app_mode = then.mode();
                 } else if let (Some(start), Some(end)) = (section_start, section_end) {
                     let mut nodes = 0usize;
                     let mut pts: i64 = 0;
@@ -3008,11 +3462,16 @@ async fn main() {
                     }
                     if pts > CORRIDOR_POINT_LIMIT {
                         for cs in copc_stages.iter_mut() { cs.clear_pins(); }
-                        classify_status = Some(format!(
+                        let msg = format!(
                             "Corridor holds {:.1}M points (limit {:.0}M) — shorten the \
-                             section line or reduce the depth before classifying.",
-                            pts as f64 / 1e6, CORRIDOR_POINT_LIMIT as f64 / 1e6,
-                        ));
+                             section line or reduce the depth before {}.",
+                            pts as f64 / 1e6, CORRIDOR_POINT_LIMIT as f64 / 1e6, then.purpose(),
+                        );
+                        if then == CorridorThen::Digitise {
+                            digitise.status = Some(msg);
+                        } else {
+                            classify_status = Some(msg);
+                        }
                     } else {
                         info!(
                             "Section corridor: {} nodes, {} points across {} file(s)",
@@ -3020,7 +3479,7 @@ async fn main() {
                         );
                         corridor_total_points = pts;
                         corridor_pinned = true;
-                        corridor_load_to_lasso = true;
+                        corridor_then = then;
                         classify_status = None;
                         app_mode = AppMode::SectionCorridorLoad;
                     }
@@ -3171,7 +3630,7 @@ async fn main() {
                     // The corridor has to stream in again before the slice can
                     // be rebuilt; go back through the loading state.
                     copc_section_raw = None;
-                    corridor_load_to_lasso = false;
+                    corridor_then = CorridorThen::View;
                     app_mode = AppMode::SectionCorridorLoad;
                 }
             }
@@ -3231,6 +3690,30 @@ async fn main() {
                                 &stages, &copc_section_raw, &tile_mgr,
                                 start, end, section_depth, z_clip, class_vis, wx, wy,
                             );
+                        }
+                    }
+                    AppMode::SectionDigitise => {
+                        let free = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+                        if free {
+                            // Exactly where clicked, on the plane — the section's
+                            // counterpart of the horizontal plane Shift uses in 3D.
+                            if let (Some(start), Some(end)) = (section_start, section_end) {
+                                let (dx, dy) = (end.0 - start.0, end.1 - start.1);
+                                let len = (dx * dx + dy * dy).sqrt();
+                                if len > 0.001 {
+                                    digitise.push(vectorise::section_to_world(
+                                        start, (dx / len, dy / len), wx, wy, data_offset,
+                                    ));
+                                    digitise.status = None;
+                                }
+                            }
+                        } else if let Some(hit) = digitise.hover.clone() {
+                            if hit.is_placeable() {
+                                digitise.push(hit.world);
+                                digitise.status = None;
+                            } else {
+                                digitise.status = hit.note;
+                            }
                         }
                     }
                     _ => {}
@@ -3366,7 +3849,11 @@ async fn main() {
         // ---- Digitising ----
         // `P` starts and cancels, mirroring how `G` and `V` toggle the lassos.
         // Unlike them it does not require a top view: see `AppMode::Digitise`.
-        if app_mode == AppMode::Digitise && !egui_wants_keyboard_prev {
+        let ctrl_down = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+        // Editing snaps a dragged vertex with the same settings, so the same
+        // keys adjust them there.
+        let snap_tool = matches!(app_mode, AppMode::Digitise | AppMode::EditLines);
+        if snap_tool && !egui_wants_keyboard_prev {
             if is_key_pressed(KeyCode::N) {
                 digitise.snap_mode = digitise.snap_mode.next();
                 digitise.status = Some(format!("Snap: {}", digitise.snap_mode.label()));
@@ -3386,8 +3873,29 @@ async fn main() {
 
         if is_key_pressed(KeyCode::P) && !egui_wants_keyboard_prev {
             match app_mode {
-                AppMode::View3D | AppMode::PointPick => digitise_request = Some(vectorise::Request::Start),
+                AppMode::View3D | AppMode::PointPick | AppMode::EditLines =>
+                    digitise_request = Some(vectorise::Request::Start),
                 AppMode::Digitise => digitise_request = Some(vectorise::Request::Cancel),
+                _ => {}
+            }
+        }
+        // `M` does the same for editing. From digitising it switches straight
+        // over, but only between lines: a half-drawn line is not something to
+        // throw away on a stray key.
+        if is_key_pressed(KeyCode::M) && !egui_wants_keyboard_prev {
+            match app_mode {
+                AppMode::View3D | AppMode::PointPick => edit_request = Some(vector_edit::Request::Start),
+                AppMode::Digitise if !digitise.is_drawing() => edit_request = Some(vector_edit::Request::Start),
+                AppMode::EditLines => edit_request = Some(vector_edit::Request::Stop),
+                _ => {}
+            }
+        }
+        // Ctrl+Z takes back the last committed change — a finished line, a
+        // moved vertex. Mid-line it takes back a vertex instead, like Backspace.
+        if ctrl_down && is_key_pressed(KeyCode::Z) && !egui_wants_keyboard_prev {
+            match app_mode {
+                AppMode::Digitise if digitise.is_drawing() => { digitise.pop(); }
+                AppMode::Digitise | AppMode::EditLines => edit_request = Some(vector_edit::Request::Undo),
                 _ => {}
             }
         }
@@ -3424,7 +3932,9 @@ async fn main() {
                 section_depth *= factor;
                 section_depth = section_depth.clamp(0.1, 500.0);
             }
-        } else if mwy.abs() > 0.001 {
+        } else if mwy.abs() > 0.001 && !(snap_tool && ctrl_down) {
+            // Ctrl + wheel is the snap radius while a snapping tool is active,
+            // and must not zoom as well.
             let zoom_factor = if mwy > 0.0 { 0.9 } else { 1.1 };
             ortho_scale *= zoom_factor;
             ortho_scale = ortho_scale.clamp(0.5, 10000.0);
@@ -3467,7 +3977,7 @@ async fn main() {
         
         let mode_uses_click = matches!(app_mode,
             AppMode::SectionPickStart | AppMode::SectionPickEnd |
-            AppMode::SectionAdjustDepth | AppMode::GroundLasso | AppMode::Digitise |
+            AppMode::SectionAdjustDepth | AppMode::GroundLasso | AppMode::Digitise | AppMode::EditLines |
             AppMode::PointPick | AppMode::MeasureFirst | AppMode::MeasureSecond
         );
         pivot_locked = false;
@@ -3576,7 +4086,7 @@ async fn main() {
                     // something the operator did not ask for.
                     let hit = resolve_snap(
                         &stages, &copc_stages, &tile_mgr, &poly_files,
-                        &view_proj, mx, my, view_rect, data_offset, &digitise,
+                        &view_proj, mx, my, view_rect, data_offset, &digitise, digitise.last(), None,
                     );
                     if hit.is_placeable() {
                         digitise.push(hit.world);
@@ -3589,7 +4099,13 @@ async fn main() {
             if !egui_wants_keyboard_prev {
                 if is_key_pressed(KeyCode::Backspace) { digitise.pop(); }
                 if is_key_pressed(KeyCode::Enter) {
-                    digitise_request = Some(vectorise::Request::Finish);
+                    // Shift+Enter closes the line into a ring, for outlines.
+                    let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+                    digitise_request = Some(if shift {
+                        vectorise::Request::FinishRing
+                    } else {
+                        vectorise::Request::Finish
+                    });
                 }
             }
         }
@@ -3602,11 +4118,108 @@ async fn main() {
         digitise.hover = if app_mode == AppMode::Digitise && !ui_has_pointer {
             Some(resolve_snap(
                 &stages, &copc_stages, &tile_mgr, &poly_files,
-                &view_proj, mx, my, view_rect, data_offset, &digitise,
+                &view_proj, mx, my, view_rect, data_offset, &digitise, digitise.last(), None,
             ))
         } else {
             None
         };
+        // ---- Editing ----
+        // Handled once here too. A press on a handle only becomes a change
+        // when the button comes up after a drag, so a drag is one undo step
+        // and one save however many frames it took.
+        if app_mode == AppMode::EditLines {
+            if let Some(drag) = editor.drag.as_mut() { drag.track(mx, my); }
+            if let Some((handle, origin)) = editor.drag.as_ref()
+                .filter(|d| d.moving)
+                .map(|d| (d.handle, d.origin)) {
+                // Over the panel there is nothing to place onto, and releasing
+                // there cancels rather than committing wherever the pointer
+                // last was in the view.
+                digitise.hover = if mx < view_rect.x {
+                    None
+                } else if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
+                    // Free placement, at the height the vertex had when grabbed.
+                    let z_view = (origin[2] - data_offset[2]) as f32;
+                    screen_to_world_xy(mx, my, &view_proj, z_view, view_rect).map(|(wx, wy)| {
+                        vectorise::SnapHit::good([
+                            wx as f64 + data_offset[0], wy as f64 + data_offset[1], origin[2],
+                        ])
+                    })
+                } else {
+                    Some(resolve_snap(
+                        &stages, &copc_stages, &tile_mgr, &poly_files, &view_proj, mx, my,
+                        view_rect, data_offset, &digitise, Some(origin), Some(handle.exclude()),
+                    ))
+                };
+            }
+
+            if editor.drag.is_some() && !is_mouse_button_down(MouseButton::Left) {
+                if let Some(drag) = editor.drag.take() {
+                    let line = drag.handle.line();
+                    if !drag.moving {
+                        // A click: select, change nothing.
+                        selected_poly = Some(line);
+                        editor.vertex = match drag.handle {
+                            vector_edit::Handle::Vertex { idx, .. } => Some((line, idx)),
+                            vector_edit::Handle::Segment { .. } => None,
+                        };
+                        editor.status = None;
+                    } else {
+                        editor.status = Some(match digitise.hover.take() {
+                            Some(hit) if hit.is_placeable() => {
+                                let what = match drag.handle {
+                                    vector_edit::Handle::Vertex { idx, .. } => format!("Vertex {} moved.", idx + 1),
+                                    vector_edit::Handle::Segment { i, .. } => format!("Vertex {} added.", i + 2),
+                                };
+                                match editor.commit_drag(&mut poly_files, drag.handle, hit.world) {
+                                    Some(fi) => {
+                                        selected_poly = Some(line);
+                                        saved_status(what, autosave_vectors(&mut poly_files[fi]))
+                                    }
+                                    None => "That line is no longer loaded.".to_string(),
+                                }
+                            }
+                            // Never somewhere else instead: a refused snap on
+                            // release leaves the line exactly as it was.
+                            Some(hit) => format!("Not moved: {}", hit.note.unwrap_or_default()),
+                            None => "Not moved: released outside the view.".to_string(),
+                        });
+                    }
+                }
+            } else if editor.drag.is_none() {
+                editor.hover = if ui_has_pointer {
+                    None
+                } else {
+                    vector_edit::hit_test(
+                        &poly_files, &view_proj,
+                        mx - view_rect.x, my - view_rect.y, view_rect.w, view_rect.h,
+                    )
+                };
+                if !ui_has_pointer && is_mouse_button_pressed(MouseButton::Left) {
+                    match editor.hover.and_then(|h| h.world(&poly_files).map(|w| (h, w))) {
+                        Some((handle, origin)) => {
+                            editor.drag = Some(vector_edit::Drag {
+                                handle, press: (mx, my), moving: false, origin,
+                            });
+                        }
+                        None => {
+                            selected_poly = None;
+                            editor.vertex = None;
+                        }
+                    }
+                }
+            }
+
+            if !egui_wants_keyboard_prev {
+                let delete = is_key_pressed(KeyCode::Delete);
+                if (delete || is_key_pressed(KeyCode::Backspace)) && editor.vertex.is_some() {
+                    edit_request = Some(vector_edit::Request::DeleteVertex);
+                } else if delete && selected_poly.is_some() {
+                    edit_request = Some(vector_edit::Request::DeleteLine);
+                }
+            }
+        }
+
         // The rubber band follows a placeable snap only, so it never draws to
         // somewhere a click would refuse to go.
         let digitise_cursor = digitise.hover.as_ref()
@@ -3619,7 +4232,7 @@ async fn main() {
         // full-resolution data to snap to in the first place. Skipped while a
         // section corridor owns the pins — the two use the same set, and the
         // corridor is the one the operator is waiting on.
-        if app_mode == AppMode::Digitise && !copc_stages.is_empty() && !corridor_pinned {
+        if snap_tool && !copc_stages.is_empty() && !corridor_pinned {
             let centre = digitise.hover.as_ref()
                 .map(|h| ((h.world[0] - data_offset[0]) as f32, (h.world[1] - data_offset[1]) as f32))
                 .or(cursor_world);
@@ -3688,15 +4301,10 @@ async fn main() {
             // points in front of them — which is the only way to judge where a
             // line actually sits. Drawn here, under the 3D camera and before
             // the panel composites.
-            if !poly_files.is_empty() {
-                polylines::draw_3d(&poly_files, front, metres_per_pixel);
-            }
-            if app_mode == AppMode::Digitise || digitise.is_drawing() {
-                vectorise::draw_overlay(
-                    &digitise, data_offset, front, metres_per_pixel,
-                    digitise_cursor, app_mode == AppMode::Digitise,
-                );
-            }
+            draw_vector_overlays_3d(
+                &poly_files, selected_poly, &digitise, &editor, app_mode,
+                data_offset, front, metres_per_pixel, digitise_cursor,
+            );
 
             set_default_camera();
 
@@ -3736,12 +4344,12 @@ async fn main() {
                         let section_label = match app_mode {
                             AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
                                 | AppMode::MeasureSecond | AppMode::GroundLasso
-                                | AppMode::Digitise => "Cross Section",
+                                | AppMode::Digitise | AppMode::EditLines => "Cross Section",
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
                             AppMode::SectionCorridorLoad => "Loading corridor...",
-                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso => "Back to 3D",
+                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso | AppMode::SectionDigitise => "Back to 3D",
                         };
                         if ui.button(section_label).clicked() {
                             match app_mode {
@@ -3932,13 +4540,11 @@ async fn main() {
                         max_class, &class_defs,
                     );
                 });
-                panel_section(ui, "Digitising", false, |ui| {
-                    if let Some(r) = vectorise::controls(
-                        ui, &mut digitise, &poly_files,
-                        app_mode == AppMode::Digitise, have_cloud,
-                    ) { digitise_request = Some(r); }
-                });
-                polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
+                vector_tools_section(
+                    ui, &mut digitise, &editor, &poly_files, selected_poly, app_mode, have_cloud,
+                    &mut digitise_request, &mut edit_request,
+                );
+                polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, &mut poly_remove_request, data_offset, background);
                 gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
                     });
                 });
@@ -3984,9 +4590,10 @@ async fn main() {
                     (view_rect.x, view_rect.y, view_rect.w, view_rect.h),
                 );
             }
-            if app_mode == AppMode::Digitise && !ui_has_pointer {
-                vectorise::draw_cursor_readout(&digitise, mx, my);
-            }
+            draw_vector_overlays_2d(
+                &poly_files, selected_poly, &digitise, &editor, app_mode,
+                &view_proj, view_rect, mx, my, ui_has_pointer,
+            );
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
             egui_wants_keyboard_prev = egui_wants_keyboard;
@@ -4176,15 +4783,10 @@ async fn main() {
             // points in front of them — which is the only way to judge where a
             // line actually sits. Drawn here, under the 3D camera and before
             // the panel composites.
-            if !poly_files.is_empty() {
-                polylines::draw_3d(&poly_files, front, metres_per_pixel);
-            }
-            if app_mode == AppMode::Digitise || digitise.is_drawing() {
-                vectorise::draw_overlay(
-                    &digitise, data_offset, front, metres_per_pixel,
-                    digitise_cursor, app_mode == AppMode::Digitise,
-                );
-            }
+            draw_vector_overlays_3d(
+                &poly_files, selected_poly, &digitise, &editor, app_mode,
+                data_offset, front, metres_per_pixel, digitise_cursor,
+            );
 
             set_default_camera();
 
@@ -4220,12 +4822,12 @@ async fn main() {
                         let section_label = match app_mode {
                             AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
                                 | AppMode::MeasureSecond | AppMode::GroundLasso
-                                | AppMode::Digitise => "Cross Section",
+                                | AppMode::Digitise | AppMode::EditLines => "Cross Section",
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
                             AppMode::SectionCorridorLoad => "Loading corridor...",
-                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso => "Back to 3D",
+                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso | AppMode::SectionDigitise => "Back to 3D",
                         };
                         if ui.button(section_label).clicked() {
                             match app_mode {
@@ -4407,13 +5009,11 @@ async fn main() {
                         max_class, &class_defs,
                     );
                 });
-                panel_section(ui, "Digitising", false, |ui| {
-                    if let Some(r) = vectorise::controls(
-                        ui, &mut digitise, &poly_files,
-                        app_mode == AppMode::Digitise, have_cloud,
-                    ) { digitise_request = Some(r); }
-                });
-                polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
+                vector_tools_section(
+                    ui, &mut digitise, &editor, &poly_files, selected_poly, app_mode, have_cloud,
+                    &mut digitise_request, &mut edit_request,
+                );
+                polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, &mut poly_remove_request, data_offset, background);
                 gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
                     });
                 });
@@ -4459,9 +5059,10 @@ async fn main() {
                     (view_rect.x, view_rect.y, view_rect.w, view_rect.h),
                 );
             }
-            if app_mode == AppMode::Digitise && !ui_has_pointer {
-                vectorise::draw_cursor_readout(&digitise, mx, my);
-            }
+            draw_vector_overlays_2d(
+                &poly_files, selected_poly, &digitise, &editor, app_mode,
+                &view_proj, view_rect, mx, my, ui_has_pointer,
+            );
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
             egui_wants_keyboard_prev = egui_wants_keyboard;
@@ -4687,15 +5288,10 @@ async fn main() {
             // points in front of them — which is the only way to judge where a
             // line actually sits. Drawn here, under the 3D camera and before
             // the panel composites.
-            if !poly_files.is_empty() {
-                polylines::draw_3d(&poly_files, front, metres_per_pixel);
-            }
-            if app_mode == AppMode::Digitise || digitise.is_drawing() {
-                vectorise::draw_overlay(
-                    &digitise, data_offset, front, metres_per_pixel,
-                    digitise_cursor, app_mode == AppMode::Digitise,
-                );
-            }
+            draw_vector_overlays_3d(
+                &poly_files, selected_poly, &digitise, &editor, app_mode,
+                data_offset, front, metres_per_pixel, digitise_cursor,
+            );
 
             set_default_camera();
 
@@ -4750,12 +5346,12 @@ async fn main() {
                         let section_label = match app_mode {
                             AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
                                 | AppMode::MeasureSecond | AppMode::GroundLasso
-                                | AppMode::Digitise => "Cross Section",
+                                | AppMode::Digitise | AppMode::EditLines => "Cross Section",
                             AppMode::SectionPickStart => "Click start point... (Esc to cancel)",
                             AppMode::SectionPickEnd => "Click end point... (Esc to cancel)",
                             AppMode::SectionAdjustDepth => "Scroll depth, click to confirm",
                             AppMode::SectionCorridorLoad => "Loading corridor...",
-                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso => "Back to 3D",
+                            AppMode::SectionView | AppMode::SectionMeasureFirst | AppMode::SectionMeasureSecond | AppMode::SectionPointPick | AppMode::SectionLasso | AppMode::SectionDigitise => "Back to 3D",
                         };
                         if ui.button(section_label).clicked() {
                             match app_mode {
@@ -4934,13 +5530,11 @@ async fn main() {
                         max_class, &class_defs,
                     );
                 });
-                panel_section(ui, "Digitising", false, |ui| {
-                    if let Some(r) = vectorise::controls(
-                        ui, &mut digitise, &poly_files,
-                        app_mode == AppMode::Digitise, have_cloud,
-                    ) { digitise_request = Some(r); }
-                });
-                polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
+                vector_tools_section(
+                    ui, &mut digitise, &editor, &poly_files, selected_poly, app_mode, have_cloud,
+                    &mut digitise_request, &mut edit_request,
+                );
+                polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, &mut poly_remove_request, data_offset, background);
                 gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
                     });
                 });
@@ -4986,9 +5580,10 @@ async fn main() {
                     (view_rect.x, view_rect.y, view_rect.w, view_rect.h),
                 );
             }
-            if app_mode == AppMode::Digitise && !ui_has_pointer {
-                vectorise::draw_cursor_readout(&digitise, mx, my);
-            }
+            draw_vector_overlays_2d(
+                &poly_files, selected_poly, &digitise, &editor, app_mode,
+                &view_proj, view_rect, mx, my, ui_has_pointer,
+            );
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
             egui_wants_keyboard_prev = egui_wants_keyboard;
@@ -5078,7 +5673,10 @@ async fn main() {
             }
 
             // Handle load/unload (from buttons or keyboard)
-            if let Some(sel) = selected_tile {
+            // Only while browsing: in the vector tools Enter finishes a line and
+            // Delete removes a vertex, and neither should load or drop a tile.
+            if let Some(sel) = selected_tile
+                && app_mode == AppMode::View3D && !egui_wants_keyboard_prev {
                 if is_key_pressed(KeyCode::Enter) && mgr.loaded[sel].is_none() {
                     request_load = Some(sel);
                 }
@@ -5179,32 +5777,10 @@ async fn main() {
         if let Some(req) = digitise_request.take() {
             match req {
                 vectorise::Request::Start => {
-                    if digitise.target.is_none() {
-                        // A layer has a destination from the moment it exists,
-                        // because layers auto-save — there is no later "save
-                        // this somewhere" step to hang a file dialog on.
-                        match cloud_source_path(&stages, &copc_stages, &tile_mgr) {
-                            Some(cloud) => {
-                                let srs = poly_files.iter()
-                                    .flat_map(|f| &f.layers)
-                                    .map(|l| l.srs_id)
-                                    .find(|s| *s != 0)
-                                    .unwrap_or(0);
-                                let t = vectorise::ensure_target(
-                                    &mut poly_files, &cloud, srs, digitise.width_px,
-                                );
-                                digitise.target = Some(t);
-                                digitise.status = Some(format!(
-                                    "New lines go to {}",
-                                    vectorise::short_path(&poly_files[t.0].path),
-                                ));
-                            }
-                            None => digitise.status =
-                                Some("Load a point cloud first.".to_string()),
-                        }
-                    }
-                    if digitise.target.is_some() {
+                    if ensure_digitise_target(&mut digitise, &mut poly_files, &stages, &copc_stages, &tile_mgr) {
                         digitise.clear();
+                        editor.drag = None;
+                        editor.hover = None;
                         app_mode = AppMode::Digitise;
                     }
                 }
@@ -5213,32 +5789,96 @@ async fn main() {
                     app_mode = AppMode::View3D;
                 }
                 vectorise::Request::UndoVertex => { digitise.pop(); }
-                vectorise::Request::Finish => {
-                    if let Some(fi) = digitise.finish(&mut poly_files) {
-                        // Granularity is the completed line, not the vertex:
-                        // a whole-file rewrite per click would be waste, and a
-                        // half-drawn line is not a meaningful thing to persist.
-                        // A crash therefore costs at most the line in progress.
-                        let pf = &mut poly_files[fi];
-                        digitise.status = Some(if pf.changed_on_disk() {
-                            format!(
-                                "{} changed on disk since it was loaded — the line is \
-                                 held in memory, not written. Use Save As to keep it.",
-                                pf.file_name(),
-                            )
+                vectorise::Request::Finish =>
+                    finish_digitised_line(&mut digitise, &mut editor, &mut poly_files, false),
+                vectorise::Request::FinishRing =>
+                    finish_digitised_line(&mut digitise, &mut editor, &mut poly_files, true),
+            }
+        }
+
+        // ---- Act on an editing request ----
+        // Likewise one place, whether it came from a key or from the panel.
+        if let Some(req) = edit_request.take() {
+            use vector_edit::Request as Edit;
+            match req {
+                Edit::Start => {
+                    if digitise.is_drawing() {
+                        editor.status = Some("Finish or cancel the line being drawn first.".to_string());
+                    } else {
+                        editor.status = None;
+                        app_mode = AppMode::EditLines;
+                    }
+                }
+                Edit::Stop => {
+                    editor.drag = None;
+                    editor.hover = None;
+                    app_mode = AppMode::View3D;
+                }
+                Edit::DeleteVertex => {
+                    if let Some((line, idx)) = editor.vertex.filter(|(l, _)| Some(*l) == selected_poly) {
+                        editor.status = Some(match editor.delete_vertex(&mut poly_files, line, idx) {
+                            Ok(fi) => saved_status(
+                                format!("Vertex {} deleted.", idx + 1),
+                                autosave_vectors(&mut poly_files[fi]),
+                            ),
+                            Err(e) => e,
+                        });
+                    }
+                }
+                Edit::DeleteLine => {
+                    if let Some(line) = selected_poly {
+                        let name = poly_files.get(line.file)
+                            .and_then(|f| f.get(line.line_ref()))
+                            .map(|l| l.name.clone())
+                            .unwrap_or_default();
+                        if let Some(fi) = editor.delete_line(&mut poly_files, line) {
+                            selected_poly = None;
+                            editor.status = Some(saved_status(
+                                format!("Deleted {name} — Ctrl+Z brings it back."),
+                                autosave_vectors(&mut poly_files[fi]),
+                            ));
+                        }
+                    }
+                }
+                Edit::ToggleRing => {
+                    if let Some(line) = selected_poly {
+                        editor.status = Some(match editor.toggle_ring(&mut poly_files, line) {
+                            Ok(fi) => {
+                                let closed = poly_files[fi].get(line.line_ref()).is_some_and(|l| l.closed);
+                                let what = if closed { "Closed into a ring." } else { "Ring opened." };
+                                saved_status(what.to_string(), autosave_vectors(&mut poly_files[fi]))
+                            }
+                            Err(e) => e,
+                        });
+                    }
+                }
+                Edit::Redrape => {
+                    if let Some(line) = selected_poly
+                        && let Some(d) = redrape_line(
+                            &stages, &copc_stages, &tile_mgr, &poly_files, line, data_offset, &digitise,
+                        ) {
+                        let summary = d.summary(digitise.snap_mode);
+                        editor.status = Some(if d.moved == 0 {
+                            summary
                         } else {
-                            match pf.save() {
-                                Ok(()) => format!(
-                                    "{} lines saved to {}",
-                                    pf.line_count(), pf.file_name(),
-                                ),
-                                Err(e) => format!("Save failed: {e}"),
+                            match editor.replace_points(&mut poly_files, line, d.points) {
+                                Some(fi) => saved_status(summary, autosave_vectors(&mut poly_files[fi])),
+                                None => "That line is no longer loaded.".to_string(),
                             }
                         });
                     }
                 }
+                Edit::Undo => {
+                    editor.status = Some(match editor.undo(&mut poly_files) {
+                        Some(fi) => saved_status("Undone.".to_string(), autosave_vectors(&mut poly_files[fi])),
+                        None => "Nothing to undo.".to_string(),
+                    });
+                }
             }
         }
+        // An undo, a delete or an unload can take a selected line or vertex
+        // away; drop the selection rather than let it address something else.
+        editor.validate(&poly_files, &mut selected_poly);
 
         // ---- Plan-view ground tool: start / cancel / apply ----
         if let Some(kind) = start_ground_lasso {

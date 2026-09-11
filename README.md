@@ -100,7 +100,8 @@ collapsible sections:
 - **Controls** — camera, colouring, height filter, cross sections, measure;
 - **Classification** — the lasso tools, the **Classes** table and **Export**,
   which are one job;
-- **Digitising** — snap mode, radius and the line being drawn;
+- **Digitising** — snap mode, radius and the line being drawn, and editing the
+  lines already there;
 - **Polylines** and **Ground Control Points** — the overlays.
 
 Drag the panel's inner edge to resize it. It is docked left so that the view
@@ -217,7 +218,9 @@ There you can:
 - click **Point Info** and then a point to inspect its attributes; the
   **Copy** buttons beside the coordinate and GPS time readouts put those
   values on the clipboard (coordinates tab separated),
-- see any polylines that cross the corridor drawn into the slice.
+- see any polylines that cross the corridor drawn into the slice,
+- **digitise** polylines in the slice with `P` — see
+  [Digitising in a section](#digitising-in-a-section).
 
 Click **Back to 3D** to return.
 
@@ -286,7 +289,9 @@ instead, at the previous vertex's height, which is what lets you draw across a
 gap in the data.
 
 `Backspace` removes the last vertex, `Enter` finishes the line, `Esc` discards
-it and a second `Esc` leaves digitising.
+it and a second `Esc` leaves digitising. `Shift+Enter` finishes it as a closed
+ring instead, for outlines. Between lines, `Ctrl+Z` takes back the last
+committed change — starting with the line you just finished.
 
 A readout follows the cursor with the distance and height difference to the
 previous vertex, its slope, and the running total — so the numbers are where
@@ -365,6 +370,68 @@ Polylines section to keep it somewhere else.
 `{n}` in the **Name** field becomes the line's number within its layer, so a run
 of lines does not need renaming one at a time. **Code** is written to the
 `code` attribute.
+
+### Editing lines
+
+Press `M`, or **Edit lines** in the Digitising panel, to change lines that
+already exist — ones you drew, or any loaded layer, a GeoPackage from QGIS
+included.
+
+- **Drag a vertex** to move it. It snaps exactly as a new vertex does — same
+  mode, same radius, same refusals. Hold `Shift` to place it freely, at the
+  height it had.
+- **Drag a segment** to pull a new vertex out of it.
+- **Click** a vertex or a line to select it. A press only becomes a move once
+  the pointer has travelled a few pixels, so selecting a vertex to read its
+  coordinates cannot nudge it.
+- `Delete` or `Backspace` removes the selected vertex; `Delete` with only a line
+  selected removes the line. A line keeps at least two vertices and a ring at
+  least three — **Delete line** is how to remove one entirely.
+- **Close ring** / **Open ring** in the panel.
+- `Ctrl+Z` undoes the last change, in whichever file it was made.
+- `Esc` cancels a drag, then clears the vertex selection, then leaves editing.
+
+With the existing-polyline snap, the vertex being dragged and the segments
+attached to it are ignored, so it ties into a neighbouring line instead of
+snapping back to where it started. Releasing over a refused snap leaves the line
+exactly as it was.
+
+Every change is saved the moment it is made, with the same safeguards as a
+finished line: the write is atomic, and it is refused if the file changed on
+disk since it was loaded.
+
+**Re-drape** gives every vertex of the selected line a new height from the
+cloud, using the current snap mode and radius — draw a kerb with Nearest, switch
+to High Z, re-drape, and it sits on the kerb top. Each vertex **keeps its plan
+position**: a change of snap mode is about height, and letting vertices wander
+sideways onto whichever point realised a percentile would undo the placement you
+did by hand. Nearest takes the point closest in 3D, so a vertex on a bridge deck
+stays on the deck rather than dropping to the road underneath. A vertex with
+nothing within the radius — or, on COPC, where the loaded data is too sparse —
+keeps its height, and the status line says how many did. One `Ctrl+Z` undoes the
+whole drape.
+
+### Digitising in a section
+
+Press `P` in the section view, or **Digitise** in its panel, to digitise in the
+slice — the natural place to pick a rail profile, a kerb face or a wall foot
+precisely. Clicks, `Shift`-click, `Backspace`, `Enter`, `Shift+Enter`, `N` and
+**Ctrl + mouse wheel** work as in 3D; `Esc` discards the line, then returns to
+the section view.
+
+Vertices land **on the section plane**, at the position along the section and
+the height they snapped to. A point inside the corridor can sit up to the
+section depth off the plane, but the section view shows nothing of that offset,
+so a vertex that kept it would be a coordinate you never saw. Tying into an
+existing line is the exception: that lands exactly on the line, wherever it
+crosses the corridor.
+
+Low Z and High Z take the percentile over a vertical strip the width of the
+radius either side of the cursor — what the 3D view's radius column becomes in a
+slice. On a COPC file, starting the tool first loads the corridor at full
+resolution, as the section lasso does, so there is no thinned LOD to refuse.
+
+Vertex editing and re-drape are 3D-view tools.
 
 ## GCP Overlay
 
@@ -552,6 +619,7 @@ If no `classes.txt` is present, built-in default labels and colours are used.
 | `C` | Start / cancel a cross section |
 | `G` | Start / cancel the ground lasso |
 | `P` | Start / cancel digitising |
+| `M` | Start / stop editing lines |
 | `T` `F` `B` `L` `R` | Top / front / back / left / right view |
 | `Esc` | Cancel current pick / measure / section action |
 
@@ -565,7 +633,23 @@ If no `classes.txt` is present, built-in default labels and colours are used.
 | Ctrl + mouse wheel | Change the snap radius |
 | `Backspace` | Remove the last vertex |
 | `Enter` | Finish the line and save |
+| `Shift` + `Enter` | Finish as a closed ring and save |
+| `Ctrl` + `Z` | Mid-line: remove the last vertex. Between lines: undo the last change |
 | `Esc` | Discard the line; again to leave digitising |
+
+**Editing lines** (`M`, or **Edit lines**)
+
+| Input | Action |
+|-------|--------|
+| Drag a vertex | Move it, snapped to the data |
+| Drag a segment | Insert a vertex, snapped to the data |
+| `Shift` + drag | Place freely, at the original height |
+| Left-click | Select a vertex or a line |
+| `Delete` / `Backspace` | Delete the selected vertex |
+| `Delete`, line selected | Delete the line |
+| `N` / Ctrl + mouse wheel | Snap mode / snap radius |
+| `Ctrl` + `Z` | Undo the last change |
+| `Esc` | Cancel the drag; clear the selection; leave editing |
 
 **Building a cross section** (start from the **Cross Section** button)
 
@@ -582,6 +666,7 @@ If no `classes.txt` is present, built-in default labels and colours are used.
 |-------|--------|
 | Mouse wheel | Zoom the slice |
 | `O` | Start the classification lasso |
+| `P` | Start / cancel digitising in the slice (keys as in 3D) |
 | **Measure** → click ×2 | Distance + slope between two points |
 | **Point Info** → click | Inspect a point's attributes |
 | **Back to 3D** | Leave the section view |
@@ -610,8 +695,8 @@ If no `classes.txt` is present, built-in default labels and colours are used.
 | Input | Action |
 |-------|--------|
 | Left-click footprint | Select tile |
-| `Enter` | Load selected tile |
-| `Delete` | Unload selected tile |
+| `Enter` | Load selected tile (while browsing, not in a tool) |
+| `Delete` | Unload selected tile (likewise) |
 | **Zoom on Object** | Frame the selection |
 
 **Measure & point info (3D)**

@@ -43,6 +43,7 @@ use macroquad::prelude::*;
 use std::path::Path;
 
 use crate::polylines::{Layer, Polyline, PolylineFile, VectorFormat};
+use crate::spatial::{NO_FILTER, SpatialGrid, percentile_by_z};
 
 /// The sidecar a new layer lands in, beside the cloud it was drawn on.
 const VECTOR_SIDECAR_SUFFIX: &str = ".haiviz-vectors.gpkg";
@@ -95,6 +96,16 @@ impl SnapMode {
         let i = SnapMode::ALL.iter().position(|m| m == self).unwrap_or(0);
         SnapMode::ALL[(i + 1) % SnapMode::ALL.len()]
     }
+
+    /// Whether a whole line can be re-draped in this mode.
+    ///
+    /// A drape keeps every vertex's plan position and asks the cloud for its
+    /// height, so it needs a mode that answers "how high is the data here".
+    /// Same-Z and existing-polyline are both about *other vertices*, not the
+    /// data, and have nothing to say about a vertex on its own.
+    pub fn drapes(&self) -> bool {
+        matches!(self, SnapMode::Nearest | SnapMode::LowZ | SnapMode::HighZ)
+    }
 }
 
 /// How much to trust a snap.
@@ -138,6 +149,8 @@ pub enum Request {
     Start,
     Cancel,
     Finish,
+    /// Finish, joining the last vertex back to the first.
+    FinishRing,
     UndoVertex,
 }
 
@@ -228,27 +241,52 @@ impl Digitise {
         Some((dz / run * 100.0, dz))
     }
 
-    /// Commit the pending vertices as a line in the target layer.
+    /// Commit the pending vertices as a line in the target layer — as a closed
+    /// ring when `closed`, for outlines.
     ///
     /// Returns the file that now needs saving, so the caller can auto-save it
     /// without this module reaching for the filesystem.
-    pub fn finish(&mut self, files: &mut [PolylineFile]) -> Option<usize> {
-        if self.pending.len() < 2 {
-            self.status = Some("A line needs at least two vertices.".to_string());
+    pub fn finish(&mut self, files: &mut [PolylineFile], closed: bool) -> Option<usize> {
+        let needed = crate::vector_edit::min_vertices(closed);
+        if self.pending.len() < needed {
+            self.status = Some(if closed {
+                "A ring needs at least three vertices.".to_string()
+            } else {
+                "A line needs at least two vertices.".to_string()
+            });
             return None;
         }
-        let (fi, li) = self.target?;
-        let pf = files.get_mut(fi)?;
-        let n = pf.layers.get(li)?.polylines.len() + 1;
+        let Some((fi, li)) = self.target else {
+            self.status = Some("No layer to put the line in.".to_string());
+            return None;
+        };
+        let Some(n) = files.get(fi).and_then(|pf| pf.layers.get(li)).map(|l| l.polylines.len() + 1) else {
+            // The target's file was removed from under the tool. Keep the
+            // vertices: the operator can point "Into:" somewhere else and
+            // finish again, rather than redrawing the line.
+            self.status = Some("The target layer is no longer loaded — choose another in Into:.".to_string());
+            self.target = None;
+            return None;
+        };
         let name = self.name_template.replace("{n}", &n.to_string());
 
         let mut line = Polyline::from_points(name, self.color, std::mem::take(&mut self.pending));
+        line.closed = closed;
         if !self.code.is_empty() {
             line.attrs.insert("code".to_string(), self.code.clone());
         }
-        pf.add_line(li, line)?;
+        files[fi].add_line(li, line)?;
         self.committed_lines += 1;
         Some(fi)
+    }
+
+    /// Keep `target` pointing at the same layer after file `fi` is unloaded.
+    pub fn file_removed(&mut self, fi: usize) {
+        self.target = match self.target {
+            Some((f, _)) if f == fi => None,
+            Some((f, l)) if f > fi => Some((f - 1, l)),
+            t => t,
+        };
     }
 }
 
@@ -346,26 +384,33 @@ pub fn draw_overlay(
     if drawing { draw_snap_marker(dig, origin); }
 }
 
+/// The marker colour for a snap: the line colour when it can be placed, and a
+/// visibly different one — not merely a dimmer one — when it is refused. A
+/// coarse snap is a refusal, and it must not read as "nearly fine".
+fn marker_color(dig: &Digitise, quality: SnapQuality) -> Color {
+    match quality {
+        SnapQuality::Good => dig.color,
+        SnapQuality::Coarse => Color::new(1.0, 0.4, 0.1, 1.0),
+        SnapQuality::Empty => Color::new(0.9, 0.25, 0.25, 1.0),
+    }
+}
+
 /// Draw the snap marker and the radius circle at the candidate vertex.
 ///
 /// A cross, like `measure_a` / `measure_b`, so it reads the same way as the
 /// other precision tools. The circle sits at the *snapped* Z rather than at the
 /// cursor's, so what it encloses is what the percentile was taken over — and
 /// it is built in world units, so it keeps showing the true radius in metres.
-fn draw_snap_marker(dig: &Digitise, origin: [f64; 3]) {
+///
+/// Shared with vertex editing, which snaps a dragged vertex the same way.
+pub fn draw_snap_marker(dig: &Digitise, origin: [f64; 3]) {
     let Some(hit) = &dig.hover else { return };
     let to_view = |p: [f64; 3]| vec3(
         (p[0] - origin[0]) as f32,
         (p[1] - origin[1]) as f32,
         (p[2] - origin[2]) as f32,
     );
-    let color = match hit.quality {
-        SnapQuality::Good => dig.color,
-        // Visibly different, not merely dimmer: a coarse snap is a refusal,
-        // and it must not read as "nearly fine".
-        SnapQuality::Coarse => Color::new(1.0, 0.4, 0.1, 1.0),
-        SnapQuality::Empty => Color::new(0.9, 0.25, 0.25, 1.0),
-    };
+    let color = marker_color(dig, hit.quality);
 
     let c = to_view(hit.world);
     let r = dig.radius;
@@ -382,6 +427,141 @@ fn draw_snap_marker(dig: &Digitise, origin: [f64; 3]) {
         let next = vec3(c.x + r * a.cos(), c.y + r * a.sin(), c.z);
         draw_line_3d(prev, next, faint);
         prev = next;
+    }
+}
+
+// ---- The section view ----
+//
+// Digitising in a section works in (along, height): the space the operator is
+// looking at. A vertex lands **on the section plane**, at the along-position
+// and height it was snapped to — even when the point it snapped to sits some
+// way off the plane inside the corridor. The section view shows nothing about
+// that offset, so a vertex that kept it would be a coordinate the operator
+// never saw. The existing-polyline snap is the one exception; see
+// `polylines::nearest_in_section`.
+//
+// The snap queries run over the section's own points, which are exactly the
+// ones on screen: the height band and hidden classes were already applied when
+// the section was cut.
+
+/// A vertex on the section plane, in world coordinates, from a section-space
+/// position. `start` / `dir` are the section line in viewer space.
+pub fn section_to_world(
+    start: (f32, f32),
+    dir: (f32, f32),
+    along: f32,
+    height: f32,
+    origin: [f64; 3],
+) -> [f64; 3] {
+    [
+        start.0 as f64 + dir.0 as f64 * along as f64 + origin[0],
+        start.1 as f64 + dir.1 as f64 * along as f64 + origin[1],
+        height as f64 + origin[2],
+    ]
+}
+
+/// A world position in section space, as `(along, height)`.
+pub fn world_to_section(
+    start: (f32, f32),
+    dir: (f32, f32),
+    p: [f64; 3],
+    origin: [f64; 3],
+) -> (f32, f32) {
+    let rx = (p[0] - origin[0]) as f32 - start.0;
+    let ry = (p[1] - origin[1]) as f32 - start.1;
+    (rx * dir.0 + ry * dir.1, (p[2] - origin[2]) as f32)
+}
+
+/// The section point nearest to `(along, height)`, within `r` metres of it on
+/// screen — the section view's counterpart of the nearest-to-ray snap.
+pub fn section_nearest(
+    grid: &SpatialGrid,
+    pts: &[[f32; 3]],
+    along: f32,
+    height: f32,
+    r: f32,
+) -> Option<(f32, f32)> {
+    let mut cands = Vec::new();
+    grid.points_in_radius(pts, along, height, r, NO_FILTER, &mut cands);
+    let d2 = |p: &[f32; 3]| (p[0] - along).powi(2) + (p[1] - height).powi(2);
+    cands.iter()
+        .map(|&i| pts[i as usize])
+        .min_by(|a, b| d2(a).partial_cmp(&d2(b)).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|p| (p[0], p[1]))
+}
+
+/// The `pct`-th percentile of height among the section points within `r`
+/// metres of `along`, whatever their height.
+///
+/// A vertical strip, which is what the 3D view's radius column becomes when the
+/// view is a slice: "the lowest data within 0.2 m of here" means the whole
+/// strip, not a disc around the cursor, or a low percentile would miss the
+/// ground whenever the cursor was held above it.
+pub fn section_percentile(
+    grid: &SpatialGrid,
+    pts: &[[f32; 3]],
+    along: f32,
+    r: f32,
+    pct: f32,
+) -> Option<(f32, f32)> {
+    let (lo, hi) = grid.bounds_xy();
+    let mut zs: Vec<(f32, f32)> = Vec::new();
+    grid.cells_in_box([along - r, lo[1]], [along + r, hi[1]], |cell| {
+        for &i in cell.points {
+            let p = pts[i as usize];
+            if (p[0] - along).abs() <= r { zs.push((p[1], p[0])); }
+        }
+    });
+    percentile_by_z(&mut zs, pct).map(|(h, a)| (a, h))
+}
+
+/// The line in progress, the rubber band and the snap marker, in the section
+/// view. Screen space, under the default camera; `to_screen` maps
+/// `(along, height)` to window pixels and `px_per_m` is the view's scale.
+pub fn draw_section_overlay(
+    dig: &Digitise,
+    start: (f32, f32),
+    dir: (f32, f32),
+    origin: [f64; 3],
+    to_screen: impl Fn(f32, f32) -> (f32, f32),
+    px_per_m: f32,
+) {
+    let pts: Vec<(f32, f32)> = dig.pending.iter()
+        .map(|p| {
+            let (a, h) = world_to_section(start, dir, *p, origin);
+            to_screen(a, h)
+        })
+        .collect();
+    let width = dig.width_px.max(1.0);
+    for w in pts.windows(2) {
+        draw_line(w[0].0, w[0].1, w[1].0, w[1].1, width, dig.color);
+    }
+    for (x, y) in &pts {
+        draw_rectangle_lines(x - 4.0, y - 4.0, 8.0, 8.0, 1.5, dig.color);
+    }
+
+    let Some(hit) = &dig.hover else { return };
+    let (a, h) = world_to_section(start, dir, hit.world, origin);
+    let (cx, cy) = to_screen(a, h);
+    if hit.is_placeable()
+        && let Some(&(lx, ly)) = pts.last() {
+        let faint = Color::new(dig.color.r, dig.color.g, dig.color.b, 0.55);
+        draw_line(lx, ly, cx, cy, width, faint);
+    }
+    let color = marker_color(dig, hit.quality);
+    let arm = 9.0;
+    draw_line(cx - arm, cy, cx + arm, cy, 1.5, color);
+    draw_line(cx, cy - arm, cx, cy + arm, 1.5, color);
+    // The radius at the view's scale, so what it encloses is what a snap can
+    // reach. For the percentile modes the strip is what counts, so mark its
+    // edges too.
+    let r_px = dig.radius * px_per_m;
+    draw_circle_lines(cx, cy, r_px.max(2.0), 1.0, Color::new(color.r, color.g, color.b, 0.5));
+    if matches!(dig.snap_mode, SnapMode::LowZ | SnapMode::HighZ) {
+        let faint = Color::new(color.r, color.g, color.b, 0.25);
+        for x in [cx - r_px, cx + r_px] {
+            draw_line(x, cy - 3.0 * r_px.max(8.0), x, cy + 3.0 * r_px.max(8.0), 1.0, faint);
+        }
     }
 }
 
@@ -647,7 +827,7 @@ mod tests {
         dig.push([208_800.0, 373_300.0, 12.0]);
         dig.push([208_810.0, 373_300.0, 12.5]);
 
-        assert_eq!(dig.finish(&mut files), Some(0), "the caller is told which file to save");
+        assert_eq!(dig.finish(&mut files, false), Some(0), "the caller is told which file to save");
         assert_eq!(files[0].layers[0].polylines.len(), 1);
         assert_eq!(files[0].layers[0].polylines[0].name, "Line 1");
         assert!(dig.pending.is_empty(), "finishing clears the pending line");
@@ -666,7 +846,7 @@ mod tests {
         for _ in 0..3 {
             dig.push([0.0, 0.0, 0.0]);
             dig.push([1.0, 1.0, 1.0]);
-            dig.finish(&mut files);
+            dig.finish(&mut files, false);
         }
         let names: Vec<&str> = files[0].layers[0].polylines.iter()
             .map(|p| p.name.as_str()).collect();
@@ -680,7 +860,7 @@ mod tests {
         let mut files = files_with_layer();
         let mut dig = Digitise { target: Some((0, 0)), ..Default::default() };
         dig.push([0.0, 0.0, 0.0]);
-        assert_eq!(dig.finish(&mut files), None);
+        assert_eq!(dig.finish(&mut files, false), None);
         assert!(dig.status.is_some(), "and the operator is told why");
         assert_eq!(files[0].layers[0].polylines.len(), 0);
         // The vertex is kept, not discarded — Enter by accident must not cost

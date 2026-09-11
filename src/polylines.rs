@@ -229,6 +229,10 @@ enum Edit {
     Readd { at: LineRef, line: Box<Polyline> },
     /// Undo by setting `closed` back to `was`.
     Unclose { at: LineRef, was: bool },
+    /// Undo by putting every vertex back. One entry for a change that touches
+    /// the whole line at once — a re-drape — so a single undo reverses it
+    /// rather than one vertex of it.
+    RestorePoints { at: LineRef, points: Vec<[f64; 3]> },
 }
 
 pub struct PolylineFile {
@@ -349,6 +353,14 @@ impl PolylineFile {
         self.touch(at);
     }
 
+    /// Replace every vertex of a line as one undoable change.
+    pub fn set_points(&mut self, at: LineRef, points: Vec<[f64; 3]>) {
+        let Some(pl) = self.get_mut(at) else { return };
+        let was = std::mem::replace(&mut pl.points, points);
+        self.undo.push(Edit::RestorePoints { at, points: was });
+        self.touch(at);
+    }
+
     /// Append a line to a layer and return its address.
     pub fn add_line(&mut self, layer: usize, line: Polyline) -> Option<LineRef> {
         let l = self.layers.get_mut(layer)?;
@@ -396,6 +408,10 @@ impl PolylineFile {
             }
             Edit::Unclose { at, was } => {
                 if let Some(pl) = self.get_mut(*at) { pl.closed = *was; }
+                *at
+            }
+            Edit::RestorePoints { at, points } => {
+                if let Some(pl) = self.get_mut(*at) { pl.points = points.clone(); }
                 *at
             }
             Edit::Unadd { at } => {
@@ -665,6 +681,29 @@ fn flush(current: &mut Vec<[f64; 3]>, polylines: &mut Vec<Polyline>, color: Colo
     }
 }
 
+/// The part of a line a snap must not land on, because it is the part moving.
+///
+/// Dragging a vertex with the existing-polyline snap would otherwise find that
+/// vertex, or the segments meeting it, straight under the cursor on every frame
+/// — the drag would snap to where it started and never go anywhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SnapExclude {
+    pub line: PolyRef,
+    /// A vertex being moved. It and both segments meeting it are skipped.
+    pub vertex: Option<usize>,
+    /// A segment a new vertex is being pulled out of, by its vertex indices.
+    pub segment: Option<(usize, usize)>,
+}
+
+fn skips_vertex(ex: Option<SnapExclude>, at: PolyRef, i: usize) -> bool {
+    ex.is_some_and(|e| e.line == at && e.vertex == Some(i))
+}
+
+fn skips_segment(ex: Option<SnapExclude>, at: PolyRef, i: usize, j: usize) -> bool {
+    ex.is_some_and(|e| e.line == at
+        && (e.segment == Some((i, j)) || e.vertex.is_some_and(|v| v == i || v == j)))
+}
+
 /// Every visible line across all files, as `(address, line)`.
 fn visible_lines(files: &[PolylineFile]) -> impl Iterator<Item = (PolyRef, &Polyline)> {
     files.iter().enumerate().flat_map(|(fi, pf)| {
@@ -743,9 +782,17 @@ pub fn draw_ribbon_3d(
 /// actually in front of.
 ///
 /// `metres_per_pixel` converts each layer's pixel width into world units.
-pub fn draw_3d(files: &[PolylineFile], view_dir: glam::Vec3, metres_per_pixel: f32) {
+/// The `selected` line draws twice as wide, so a selection made in the panel or
+/// by clicking can be found on screen.
+pub fn draw_3d(
+    files: &[PolylineFile],
+    view_dir: glam::Vec3,
+    metres_per_pixel: f32,
+    selected: Option<PolyRef>,
+) {
     for (at, pl) in visible_lines(files) {
-        let width_px = files[at.file].layers[at.layer].width_px.max(0.5);
+        let mut width_px = files[at.file].layers[at.layer].width_px.max(0.5);
+        if selected == Some(at) { width_px = (width_px * 2.0).max(4.0); }
         let pts: Vec<glam::Vec3> = pl.view.iter().map(|p| glam::Vec3::from(*p)).collect();
         draw_ribbon_3d(
             &pts, pl.closed, width_px * 0.5 * metres_per_pixel, pl.color, view_dir,
@@ -823,6 +870,16 @@ fn clip_segment(
     b_along: f32, b_perp: f32, b_h: f32,
     depth: f32,
 ) -> Option<((f32, f32), (f32, f32))> {
+    let (t0, t1) = clip_segment_t(a_perp, b_perp, depth)?;
+    let interp = |a: f32, b: f32, t: f32| a + t * (b - a);
+    let sa = (interp(a_along, b_along, t0), interp(a_h, b_h, t0));
+    let sb = (interp(a_along, b_along, t1), interp(a_h, b_h, t1));
+    Some((sa, sb))
+}
+
+/// The parameter range `t0..=t1` of a segment that lies within `|perp| <= depth`
+/// of the section plane, or `None` when none of it does.
+fn clip_segment_t(a_perp: f32, b_perp: f32, depth: f32) -> Option<(f32, f32)> {
     let mut t0: f32 = 0.0;
     let mut t1: f32 = 1.0;
 
@@ -845,11 +902,81 @@ fn clip_segment(
     }
 
     if t0 > t1 { return None; }
+    Some((t0, t1))
+}
 
-    let interp = |a: f32, b: f32, t: f32| a + t * (b - a);
-    let sa = (interp(a_along, b_along, t0), interp(a_h, b_h, t0));
-    let sb = (interp(a_along, b_along, t1), interp(a_h, b_h, t1));
-    Some((sa, sb))
+/// The nearest point on any visible polyline to a section-view position, within
+/// `r` metres of it in (along, height) space — as an exact **world** coordinate
+/// on the line, not a projection onto the section plane.
+///
+/// Every other section-view snap lands on the plane, because the operator can
+/// only see and judge (along, height) there. Tying into an existing line is the
+/// exception: the entire point of it is that the two lines share a coordinate,
+/// and a vertex moved onto the plane would leave a gap the width of wherever the
+/// line happened to cross the corridor.
+///
+/// Only the parts of a line inside the corridor are candidates — the parts
+/// `draw_section` shows. `section_start` / `section_end` are viewer space.
+pub fn nearest_in_section(
+    files: &[PolylineFile],
+    section_start: (f32, f32),
+    section_end: (f32, f32),
+    depth: f32,
+    along: f32,
+    height: f32,
+    r: f32,
+) -> Option<[f64; 3]> {
+    let dx = section_end.0 - section_start.0;
+    let dy = section_end.1 - section_start.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 0.001 { return None; }
+    let (ux, uy) = (dx / len, dy / len);
+
+    let mut best: Option<(f32, [f64; 3])> = None;
+    let mut consider = |d: f32, at: [f64; 3]| {
+        if d <= r && best.is_none_or(|(bd, _)| d < bd) { best = Some((d, at)); }
+    };
+
+    for (_, pl) in visible_lines(files) {
+        let proj: Vec<(f32, f32, f32)> = pl.view.iter().map(|p| {
+            let rx = p[0] - section_start.0;
+            let ry = p[1] - section_start.1;
+            (rx * ux + ry * uy, -rx * uy + ry * ux, p[2])
+        }).collect();
+
+        for (i, &(a, ap, ah)) in proj.iter().enumerate() {
+            if ap.abs() <= depth {
+                consider(((a - along).powi(2) + (ah - height).powi(2)).sqrt(), pl.points[i]);
+            }
+        }
+        for (i, j) in pl.segments() {
+            let (a, ap, ah) = proj[i];
+            let (b, bp, bh) = proj[j];
+            let Some((t0, t1)) = clip_segment_t(ap, bp, depth) else { continue };
+            let (ex, ez) = (b - a, bh - ah);
+            let e2 = ex * ex + ez * ez;
+            let t = if e2 < 1e-12 {
+                // The segment runs straight through the plane, so the whole of
+                // it lands on one spot in the section. Take where it crosses
+                // the plane itself, which is the part of it on screen.
+                let dp = bp - ap;
+                if dp.abs() < 1e-9 { t0 } else { (-ap / dp).clamp(t0, t1) }
+            } else {
+                (((along - a) * ex + (height - ah) * ez) / e2).clamp(t0, t1)
+            };
+            let d = ((a + t * ex - along).powi(2) + (ah + t * ez - height).powi(2)).sqrt();
+            let (pa, pb) = (pl.points[i], pl.points[j]);
+            let t = t as f64;
+            // A hair worse than a vertex at the same place, as in the 3D snap,
+            // so tying into an endpoint lands exactly on it.
+            consider(d * (1.0 + 1e-6) + 1e-6, [
+                pa[0] + t * (pb[0] - pa[0]),
+                pa[1] + t * (pb[1] - pa[1]),
+                pa[2] + t * (pb[2] - pa[2]),
+            ]);
+        }
+    }
+    best.map(|(_, at)| at)
 }
 
 /// The visible polyline closest to `(mx, my)` in screen space, within
@@ -909,6 +1036,43 @@ pub fn pick_vertex(
     result
 }
 
+/// The visible **segment** closest to `(mx, my)` in screen space, within
+/// `threshold` pixels, as `(line, i, j, t)`: the segment's two vertex indices
+/// and how far along it the closest point lies.
+///
+/// The camera is orthographic, so projection is affine and `t` is the same
+/// fraction of the segment in the world as on screen — which is what lets a
+/// vertex pulled out of a segment start exactly where it was grabbed.
+pub fn pick_segment(
+    files: &[PolylineFile],
+    view_proj: &glam::Mat4,
+    mx: f32,
+    my: f32,
+    sw: f32,
+    sh: f32,
+    threshold: f32,
+) -> Option<(PolyRef, usize, usize, f32)> {
+    let mut best = threshold;
+    let mut result = None;
+    for (at, pl) in visible_lines(files) {
+        for (i, j) in pl.segments() {
+            let a = project(view_proj, pl.view[i], sw, sh);
+            let b = project(view_proj, pl.view[j], sw, sh);
+            let d = seg_dist(mx, my, a, b);
+            if d < best {
+                let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+                let len2 = dx * dx + dy * dy;
+                let t = if len2 < 1e-6 { 0.0 } else {
+                    (((mx - a.0) * dx + (my - a.1) * dy) / len2).clamp(0.0, 1.0)
+                };
+                best = d;
+                result = Some((at, i, j, t));
+            }
+        }
+    }
+    result
+}
+
 /// The nearest point on any visible polyline to `p`, in world space, within
 /// `r` metres.
 ///
@@ -950,11 +1114,15 @@ pub fn nearest_on_lines(
 /// when tying into an existing line matters most. Under an orthographic camera
 /// the ray origin sits far behind the data, so distances along it are large and
 /// positive; only the perpendicular distance is compared.
+///
+/// `exclude` names the part of a line that is being dragged; see
+/// [`SnapExclude`].
 pub fn nearest_on_lines_to_ray(
     files: &[PolylineFile],
     origin: [f64; 3],
     dir: [f64; 3],
     r: f64,
+    exclude: Option<SnapExclude>,
 ) -> Option<([f64; 3], PolyRef)> {
     let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
     // NaN as well as zero: normalising by either poisons every comparison below.
@@ -972,11 +1140,13 @@ pub fn nearest_on_lines_to_ray(
     };
 
     for (at, pl) in visible_lines(files) {
-        for v in pl.points() {
+        for (i, v) in pl.points().iter().enumerate() {
+            if skips_vertex(exclude, at, i) { continue; }
             let (perp, along) = ray_distance_to_point(origin, d, *v);
             consider(perp, along, *v, at);
         }
         for (i, j) in pl.segments() {
+            if skips_segment(exclude, at, i, j) { continue; }
             let (a, b) = (pl.points()[i], pl.points()[j]);
             if let Some((q, perp, along)) = ray_closest_on_segment(origin, d, a, b) {
                 // A hair worse than a vertex at the same place, so tying to an
@@ -1391,25 +1561,104 @@ mod tests {
         let files = vec![pf];
 
         // Straight down onto the middle of the segment.
-        let (at, _) = nearest_on_lines_to_ray(&files, [5.0, 0.0, 100.0], [0.0, 0.0, -1.0], 0.5)
+        let (at, _) = nearest_on_lines_to_ray(&files, [5.0, 0.0, 100.0], [0.0, 0.0, -1.0], 0.5, None)
             .expect("hits");
         assert_eq!(at, [5.0, 0.0, 5.0]);
 
         // Straight down near the endpoint: the vertex wins.
-        let (at, _) = nearest_on_lines_to_ray(&files, [10.02, 0.0, 100.0], [0.0, 0.0, -1.0], 0.5)
+        let (at, _) = nearest_on_lines_to_ray(&files, [10.02, 0.0, 100.0], [0.0, 0.0, -1.0], 0.5, None)
             .expect("hits");
         assert_eq!(at, [10.0, 0.0, 5.0]);
 
         // Oblique, which the point form could not do at all.
-        let (at, _) = nearest_on_lines_to_ray(&files, [5.0, -50.0, 55.0], [0.0, 1.0, -1.0], 0.5)
+        let (at, _) = nearest_on_lines_to_ray(&files, [5.0, -50.0, 55.0], [0.0, 1.0, -1.0], 0.5, None)
             .expect("hits");
         assert!((at[0] - 5.0).abs() < 1e-6 && (at[2] - 5.0).abs() < 1e-6, "{at:?}");
 
         // Too far off the line, and pointing away, both give nothing.
-        assert!(nearest_on_lines_to_ray(&files, [5.0, 20.0, 100.0], [0.0, 0.0, -1.0], 0.5).is_none());
-        assert!(nearest_on_lines_to_ray(&files, [5.0, 0.0, 100.0], [0.0, 0.0, 1.0], 0.5).is_none());
+        assert!(nearest_on_lines_to_ray(&files, [5.0, 20.0, 100.0], [0.0, 0.0, -1.0], 0.5, None).is_none());
+        assert!(nearest_on_lines_to_ray(&files, [5.0, 0.0, 100.0], [0.0, 0.0, 1.0], 0.5, None).is_none());
         // A degenerate direction is refused rather than dividing by zero.
-        assert!(nearest_on_lines_to_ray(&files, [5.0, 0.0, 100.0], [0.0; 3], 0.5).is_none());
+        assert!(nearest_on_lines_to_ray(&files, [5.0, 0.0, 100.0], [0.0; 3], 0.5, None).is_none());
+    }
+
+    #[test]
+    fn a_dragged_vertex_does_not_snap_to_itself() {
+        let mut pf = PolylineFile::new(tmp("exclude"), VectorFormat::Salome);
+        pf.layers.push(Layer::new("l"));
+        pf.refresh_view([0.0; 3]);
+        pf.add_line(0, Polyline::from_points("a", WHITE, vec![
+            [0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 10.0, 0.0],
+        ]));
+        pf.add_line(0, Polyline::from_points("b", WHITE, vec![
+            [10.3, -5.0, 0.0], [10.3, 5.0, 0.0],
+        ]));
+        let files = vec![pf];
+        let a = PolyRef { file: 0, layer: 0, line: 0 };
+        let down = [0.0, 0.0, -1.0];
+
+        // Without an exclusion, dragging vertex 1 finds vertex 1.
+        let (hit, who) = nearest_on_lines_to_ray(&files, [10.0, 0.0, 50.0], down, 0.5, None).unwrap();
+        assert_eq!((hit, who), ([10.0, 0.0, 0.0], a));
+
+        // With it, the neighbouring line is what the cursor is actually over.
+        let ex = SnapExclude { line: a, vertex: Some(1), segment: None };
+        let (hit, who) = nearest_on_lines_to_ray(&files, [10.0, 0.0, 50.0], down, 0.5, Some(ex)).unwrap();
+        assert_eq!(who.line, 1, "{hit:?}");
+
+        // An insert excludes only the segment being split, so the far end of
+        // the same line is still a legitimate place to tie into.
+        let ex = SnapExclude { line: a, vertex: None, segment: Some((0, 1)) };
+        let (hit, _) = nearest_on_lines_to_ray(&files, [10.0, 10.0, 50.0], down, 0.5, Some(ex)).unwrap();
+        assert_eq!(hit, [10.0, 10.0, 0.0]);
+    }
+
+    #[test]
+    fn replacing_every_vertex_is_one_undo_step() {
+        let (mut pf, at) = file_with_one_line();
+        let before = pf.get(at).unwrap().points().to_vec();
+        let draped: Vec<[f64; 3]> = before.iter().map(|p| [p[0], p[1], p[2] + 1.5]).collect();
+        pf.set_points(at, draped.clone());
+        assert_eq!(pf.get(at).unwrap().points(), &draped[..]);
+        assert_eq!(pf.get(at).unwrap().view()[2][2], 1.5, "the draw cache follows");
+        assert!(pf.undo());
+        assert_eq!(pf.get(at).unwrap().points(), &before[..], "one undo reverses the whole drape");
+    }
+
+    #[test]
+    fn a_segment_pick_says_where_along_it_the_cursor_is() {
+        let (pf, _) = file_with_one_line();
+        let files = vec![pf];
+        // Identity view-projection over a 2×2 "screen": NDC (x, y) maps to
+        // pixels ((x + 1), (1 - y)), so world (0.5, 0) is at pixel (1.5, 1).
+        let vp = glam::Mat4::IDENTITY;
+        let (at, i, j, t) = pick_segment(&files, &vp, 1.5, 1.0, 2.0, 2.0, 0.1).expect("on the line");
+        assert_eq!((at.line, i, j), (0, 0, 1));
+        assert!((t - 0.5).abs() < 1e-5, "{t}");
+        assert!(pick_segment(&files, &vp, 0.2, 1.8, 2.0, 2.0, 0.1).is_none());
+    }
+
+    #[test]
+    fn a_section_snap_to_a_line_lands_on_the_line_not_the_plane() {
+        // A kerb crossing a north-south section obliquely, along y = x + 4.7.
+        let mut pf = PolylineFile::new(tmp("section"), VectorFormat::Salome);
+        pf.layers.push(Layer::new("l"));
+        pf.refresh_view([0.0; 3]);
+        pf.add_line(0, Polyline::from_points("kerb", WHITE, vec![
+            [-1.7, 3.0, 2.0], [2.3, 7.0, 2.0],
+        ]));
+        let files = vec![pf];
+        // Section along +Y from the origin, 1 m either side: "along" is y.
+        // At along = 5.0 the kerb is 0.3 m east of the plane.
+        let hit = nearest_in_section(&files, (0.0, 0.0), (0.0, 10.0), 1.0, 5.0, 2.05, 0.2)
+            .expect("the kerb crosses the corridor");
+        assert!((hit[0] - 0.3).abs() < 1e-4 && (hit[1] - 5.0).abs() < 1e-4,
+                "on the kerb, not projected onto the plane at x = 0: {hit:?}");
+        assert!((hit[2] - 2.0).abs() < 1e-6);
+
+        // Outside the corridor nothing is offered, even if it is near in
+        // (along, height) — the section does not draw it.
+        assert!(nearest_in_section(&files, (0.0, 0.0), (0.0, 10.0), 0.1, 3.0, 2.0, 0.2).is_none());
     }
 
     #[test]

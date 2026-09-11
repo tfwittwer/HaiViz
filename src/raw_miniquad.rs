@@ -273,6 +273,23 @@
         pub height_max: f32,
         /// Full Z span of the source dataset — used by the shader for height-based colouring.
         pub height_range: f32,
+        /// Section-space positions of the points drawn, as `[along, height, 0]`
+        /// — the same filtered set that is on screen, so a snap in the section
+        /// view can never land on a point the operator cannot see.
+        points: Vec<[f32; 3]>,
+        /// Index over `points` in (along, height), built on first use. A
+        /// section is rebuilt on every colour or ramp change, and most of those
+        /// sections are never digitised on, so paying for an index up front
+        /// would put a build on every slider frame.
+        index: std::cell::OnceCell<SpatialGrid>,
+    }
+
+    impl SectionData {
+        /// The section's points and an index over them, for section-view
+        /// snapping. Both are in (along, height) — the grid's X and Y.
+        pub fn snap_index(&self) -> (&SpatialGrid, &[[f32; 3]]) {
+            (self.index.get_or_init(|| SpatialGrid::build(&self.points)), &self.points)
+        }
     }
 
     pub struct Stage {
@@ -1382,30 +1399,9 @@
                 }
             }
 
-            let num_points = section_verts.len() as i32;
             info!("Section: {:.1}m long, {:.1}m depth, {} points, height {:.1}..{:.1}m",
-                len, depth, num_points, h_min, h_max);
-
-            let (pos_buffer, color_buffer) = upload_split_verts(ctx, &section_verts);
-            let indices: Vec<u32> = (0..num_points as u32).collect();
-            let index_buffer = ctx.new_buffer(
-                BufferType::IndexBuffer,
-                BufferUsage::Immutable,
-                BufferSource::slice(&indices),
-            );
-
-            SectionData {
-                bindings: Bindings {
-                    vertex_buffers: vec![pos_buffer, color_buffer],
-                    index_buffer,
-                    images: vec![],
-                },
-                num_points,
-                length: len,
-                height_min: h_min,
-                height_max: h_max,
-                height_range: self.height_range(),
-            }
+                len, depth, section_verts.len(), h_min, h_max);
+            make_section_data(ctx, section_verts, len, h_min, h_max, self.height_range())
         }
 
         pub fn draw_section(&self, ctx: &mut dyn RenderingBackend, section: &SectionData, mvp: &glam::Mat4, point_size: f32) {
@@ -2793,6 +2789,8 @@
             height_min,
             height_max,
             height_range,
+            points: verts.iter().map(|v| v.pos).collect(),
+            index: std::cell::OnceCell::new(),
         }
     }
 
