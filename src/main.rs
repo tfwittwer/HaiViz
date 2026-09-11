@@ -380,13 +380,20 @@ impl ViewRect {
         (self.x + (nx + 1.0) * 0.5 * self.w, self.y + (1.0 - ny) * 0.5 * self.h)
     }
 
-    /// As GL wants it: origin at the bottom-left of the window.
+    /// As GL wants it: origin at the bottom-left, in **physical** pixels.
+    ///
+    /// `screen_width`, `screen_height` and `mouse_position` are all logical —
+    /// macroquad divides them by the DPI scale — but `apply_viewport` addresses
+    /// the framebuffer, which is not. Mixing the two puts the rendered view a
+    /// scale factor away from where every pick thinks it is, which shows up as
+    /// a snap marker that trails the cursor by a growing offset.
     fn gl(&self) -> (i32, i32, i32, i32) {
+        let dpi = miniquad::window::dpi_scale();
         (
-            self.x.round() as i32,
-            (screen_height() - self.y - self.h).round() as i32,
-            self.w.max(1.0).round() as i32,
-            self.h.max(1.0).round() as i32,
+            (self.x * dpi).round() as i32,
+            ((screen_height() - self.y - self.h) * dpi).round() as i32,
+            (self.w.max(1.0) * dpi).round() as i32,
+            (self.h.max(1.0) * dpi).round() as i32,
         )
     }
 }
@@ -2759,15 +2766,12 @@ async fn main() {
                 || copc_stages.iter().any(|cs| cs.edits.dirty);
             let export_sources = export_source_list(&stages, &copc_stages);
             egui_macroquad::ui(|egui_ctx| {
-                egui_wants_sec_pointer = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
-                egui_wants_sec_keyboard = egui_ctx.wants_keyboard_input();
                 egui_macroquad::egui::SidePanel::left("haiviz_panel")
                     .resizable(true)
                     .default_width(340.0)
                     .show(egui_ctx, |ui| {
                     egui_macroquad::egui::ScrollArea::vertical().show(ui, |ui| {
-                class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
-panel_section(ui, "Controls", true, |ui| {
+                panel_section(ui, "Controls", true, |ui| {
                         if ui.button("Back to 3D").clicked() {
                             app_mode = AppMode::View3D;
                             set_section(&mut section_data, &mut section_trash, None);
@@ -2922,16 +2926,27 @@ panel_section(ui, "Controls", true, |ui| {
                         } else {
                             ui.label("Classification editing is not available in tile mode.");
                         }
-});
-                export_request = export_section(
-                    ui, &mut reveal_export, &mut export_filter,
-                    &mut export_job, &mut export_status, &export_sources,
-                    max_class, &class_defs,
-                );
+                });
+                panel_section(ui, "Classification", false, |ui| {
+                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
+                    export_request = export_section(
+                        ui, &mut reveal_export, &mut export_filter,
+                        &mut export_job, &mut export_status, &export_sources,
+                        max_class, &class_defs,
+                    );
+                });
                 polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
                 gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
                     });
                 });
+                // Read after the panel is laid out, not before.
+                // `is_pointer_over_area` treats a SidePanel as background and falls
+                // back to egui's unused_rect, which still covers the whole screen
+                // until a panel has shrunk it — so asking first says the pointer is
+                // over the viewport even when it is on a button, and the click both
+                // presses the button and drops a vertex.
+                egui_wants_sec_pointer = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
+                egui_wants_sec_keyboard = egui_ctx.wants_keyboard_input();
                 // What the panel actually took, so the view renders beside it.
                 panel_px = egui_ctx.available_rect().min.x * egui_ctx.pixels_per_point();
             });
@@ -3712,15 +3727,12 @@ panel_section(ui, "Controls", true, |ui| {
             let mut export_request: Option<usize> = None;
             let export_sources = export_source_list(&stages, &copc_stages);
             egui_macroquad::ui(|egui_ctx| {
-                egui_wants_pointer = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
-                egui_wants_keyboard = egui_ctx.wants_keyboard_input();
                 egui_macroquad::egui::SidePanel::left("haiviz_panel")
                     .resizable(true)
                     .default_width(340.0)
                     .show(egui_ctx, |ui| {
                     egui_macroquad::egui::ScrollArea::vertical().show(ui, |ui| {
-                class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
-panel_section(ui, "Controls", true, |ui| {
+                panel_section(ui, "Controls", true, |ui| {
                         let section_label = match app_mode {
                             AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
                                 | AppMode::MeasureSecond | AppMode::GroundLasso
@@ -3812,17 +3824,6 @@ panel_section(ui, "Controls", true, |ui| {
                                 ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
                             }
                         });
-                        if let Some(kind) = ground_tool_controls(
-                            ui, &mut app_mode, ground_lasso.len(), lasso_kind,
-                            is_top_view(pitch),
-                            &mut classify_target, &mut classify_from, &mut ground_offset,
-                            max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
-                            &mut apply_ground_lasso, &mut cancel_ground_lasso,
-                        ) { start_ground_lasso = Some(kind); }
-                        if let Some(r) = vectorise::controls(
-                            ui, &mut digitise, &poly_files,
-                            app_mode == AppMode::Digitise, have_cloud,
-                        ) { digitise_request = Some(r); }
                         if color_mode == ColorMode::Rgb {
                             for (i, ov) in new_overrides.iter_mut().enumerate() {
                                 let label = if stages.len() > 1 {
@@ -3913,16 +3914,42 @@ panel_section(ui, "Controls", true, |ui| {
                             ui.separator();
                             point_info_ui(ui, "Point Info:", p, &class_defs);
                         }
-});
-                export_request = export_section(
-                    ui, &mut reveal_export, &mut export_filter,
-                    &mut export_job, &mut export_status, &export_sources,
-                    max_class, &class_defs,
-                );
+                });
+                // Classification: the lasso tools, the class table and the
+                // export that consumes them, together because they are one job.
+                panel_section(ui, "Classification", false, |ui| {
+                    if let Some(kind) = ground_tool_controls(
+                        ui, &mut app_mode, ground_lasso.len(), lasso_kind,
+                        is_top_view(pitch),
+                        &mut classify_target, &mut classify_from, &mut ground_offset,
+                        max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
+                        &mut apply_ground_lasso, &mut cancel_ground_lasso,
+                    ) { start_ground_lasso = Some(kind); }
+                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
+                    export_request = export_section(
+                        ui, &mut reveal_export, &mut export_filter,
+                        &mut export_job, &mut export_status, &export_sources,
+                        max_class, &class_defs,
+                    );
+                });
+                panel_section(ui, "Digitising", false, |ui| {
+                    if let Some(r) = vectorise::controls(
+                        ui, &mut digitise, &poly_files,
+                        app_mode == AppMode::Digitise, have_cloud,
+                    ) { digitise_request = Some(r); }
+                });
                 polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
                 gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
                     });
                 });
+                // Read after the panel is laid out, not before.
+                // `is_pointer_over_area` treats a SidePanel as background and falls
+                // back to egui's unused_rect, which still covers the whole screen
+                // until a panel has shrunk it — so asking first says the pointer is
+                // over the viewport even when it is on a button, and the click both
+                // presses the button and drops a vertex.
+                egui_wants_pointer = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
+                egui_wants_keyboard = egui_ctx.wants_keyboard_input();
                 // What the panel actually took, so the view renders beside it.
                 panel_px = egui_ctx.available_rect().min.x * egui_ctx.pixels_per_point();
             });
@@ -4184,15 +4211,12 @@ panel_section(ui, "Controls", true, |ui| {
             let mut export_request: Option<usize> = None;
             let export_sources = export_source_list(&stages, &copc_stages);
             egui_macroquad::ui(|egui_ctx| {
-                egui_wants_pointer = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
-                egui_wants_keyboard = egui_ctx.wants_keyboard_input();
                 egui_macroquad::egui::SidePanel::left("haiviz_panel")
                     .resizable(true)
                     .default_width(340.0)
                     .show(egui_ctx, |ui| {
                     egui_macroquad::egui::ScrollArea::vertical().show(ui, |ui| {
-                class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
-panel_section(ui, "Controls", true, |ui| {
+                panel_section(ui, "Controls", true, |ui| {
                         let section_label = match app_mode {
                             AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
                                 | AppMode::MeasureSecond | AppMode::GroundLasso
@@ -4278,17 +4302,6 @@ panel_section(ui, "Controls", true, |ui| {
                                 ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
                             }
                         });
-                        if let Some(kind) = ground_tool_controls(
-                            ui, &mut app_mode, ground_lasso.len(), lasso_kind,
-                            is_top_view(pitch),
-                            &mut classify_target, &mut classify_from, &mut ground_offset,
-                            max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
-                            &mut apply_ground_lasso, &mut cancel_ground_lasso,
-                        ) { start_ground_lasso = Some(kind); }
-                        if let Some(r) = vectorise::controls(
-                            ui, &mut digitise, &poly_files,
-                            app_mode == AppMode::Digitise, have_cloud,
-                        ) { digitise_request = Some(r); }
                         if color_mode == ColorMode::Rgb {
                             for (i, ov) in new_copc_overrides.iter_mut().enumerate() {
                                 let label = if copc_stages.len() > 1 {
@@ -4376,16 +4389,42 @@ panel_section(ui, "Controls", true, |ui| {
                             ui.separator();
                             point_info_ui(ui, "Point Info:", p, &class_defs);
                         }
-});
-                export_request = export_section(
-                    ui, &mut reveal_export, &mut export_filter,
-                    &mut export_job, &mut export_status, &export_sources,
-                    max_class, &class_defs,
-                );
+                });
+                // Classification: the lasso tools, the class table and the
+                // export that consumes them, together because they are one job.
+                panel_section(ui, "Classification", false, |ui| {
+                    if let Some(kind) = ground_tool_controls(
+                        ui, &mut app_mode, ground_lasso.len(), lasso_kind,
+                        is_top_view(pitch),
+                        &mut classify_target, &mut classify_from, &mut ground_offset,
+                        max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
+                        &mut apply_ground_lasso, &mut cancel_ground_lasso,
+                    ) { start_ground_lasso = Some(kind); }
+                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
+                    export_request = export_section(
+                        ui, &mut reveal_export, &mut export_filter,
+                        &mut export_job, &mut export_status, &export_sources,
+                        max_class, &class_defs,
+                    );
+                });
+                panel_section(ui, "Digitising", false, |ui| {
+                    if let Some(r) = vectorise::controls(
+                        ui, &mut digitise, &poly_files,
+                        app_mode == AppMode::Digitise, have_cloud,
+                    ) { digitise_request = Some(r); }
+                });
                 polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
                 gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
                     });
                 });
+                // Read after the panel is laid out, not before.
+                // `is_pointer_over_area` treats a SidePanel as background and falls
+                // back to egui's unused_rect, which still covers the whole screen
+                // until a panel has shrunk it — so asking first says the pointer is
+                // over the viewport even when it is on a button, and the click both
+                // presses the button and drops a vertex.
+                egui_wants_pointer = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
+                egui_wants_keyboard = egui_ctx.wants_keyboard_input();
                 // What the panel actually took, so the view renders beside it.
                 panel_px = egui_ctx.available_rect().min.x * egui_ctx.pixels_per_point();
             });
@@ -4701,15 +4740,12 @@ panel_section(ui, "Controls", true, |ui| {
             let mut export_request: Option<usize> = None;
             let export_sources = export_source_list(&stages, &copc_stages);
             egui_macroquad::ui(|egui_ctx| {
-                egui_wants_pointer = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
-                egui_wants_keyboard = egui_ctx.wants_keyboard_input();
                 egui_macroquad::egui::SidePanel::left("haiviz_panel")
                     .resizable(true)
                     .default_width(340.0)
                     .show(egui_ctx, |ui| {
                     egui_macroquad::egui::ScrollArea::vertical().show(ui, |ui| {
-                class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
-panel_section(ui, "Controls", true, |ui| {
+                panel_section(ui, "Controls", true, |ui| {
                         // Cross Section button
                         let section_label = match app_mode {
                             AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
@@ -4807,17 +4843,6 @@ panel_section(ui, "Controls", true, |ui| {
                                 ui.add(egui_macroquad::egui::Slider::new(&mut edl_strength, 1.0..=30.0).step_by(1.0));
                             }
                         });
-                        if let Some(kind) = ground_tool_controls(
-                            ui, &mut app_mode, ground_lasso.len(), lasso_kind,
-                            is_top_view(pitch),
-                            &mut classify_target, &mut classify_from, &mut ground_offset,
-                            max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
-                            &mut apply_ground_lasso, &mut cancel_ground_lasso,
-                        ) { start_ground_lasso = Some(kind); }
-                        if let Some(r) = vectorise::controls(
-                            ui, &mut digitise, &poly_files,
-                            app_mode == AppMode::Digitise, have_cloud,
-                        ) { digitise_request = Some(r); }
                         ui.label(format!(
                             "{}/{} points | {} chunks | {}/{} tiles | FPS: {:.0}",
                             drawn, total, mgr.total_chunks(),
@@ -4891,16 +4916,42 @@ panel_section(ui, "Controls", true, |ui| {
                                 point_info_ui(ui, &format!("Point Info ({})", mgr.tiles[tile_idx].filename), p, &class_defs);
                             
                         }
-});
-                export_request = export_section(
-                    ui, &mut reveal_export, &mut export_filter,
-                    &mut export_job, &mut export_status, &export_sources,
-                    max_class, &class_defs,
-                );
+                });
+                // Classification: the lasso tools, the class table and the
+                // export that consumes them, together because they are one job.
+                panel_section(ui, "Classification", false, |ui| {
+                    if let Some(kind) = ground_tool_controls(
+                        ui, &mut app_mode, ground_lasso.len(), lasso_kind,
+                        is_top_view(pitch),
+                        &mut classify_target, &mut classify_from, &mut ground_offset,
+                        max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
+                        &mut apply_ground_lasso, &mut cancel_ground_lasso,
+                    ) { start_ground_lasso = Some(kind); }
+                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
+                    export_request = export_section(
+                        ui, &mut reveal_export, &mut export_filter,
+                        &mut export_job, &mut export_status, &export_sources,
+                        max_class, &class_defs,
+                    );
+                });
+                panel_section(ui, "Digitising", false, |ui| {
+                    if let Some(r) = vectorise::controls(
+                        ui, &mut digitise, &poly_files,
+                        app_mode == AppMode::Digitise, have_cloud,
+                    ) { digitise_request = Some(r); }
+                });
                 polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
                 gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
                     });
                 });
+                // Read after the panel is laid out, not before.
+                // `is_pointer_over_area` treats a SidePanel as background and falls
+                // back to egui's unused_rect, which still covers the whole screen
+                // until a panel has shrunk it — so asking first says the pointer is
+                // over the viewport even when it is on a button, and the click both
+                // presses the button and drops a vertex.
+                egui_wants_pointer = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
+                egui_wants_keyboard = egui_ctx.wants_keyboard_input();
                 // What the panel actually took, so the view renders beside it.
                 panel_px = egui_ctx.available_rect().min.x * egui_ctx.pixels_per_point();
             });
@@ -5093,7 +5144,7 @@ panel_section(ui, "Controls", true, |ui| {
                     .default_width(340.0)
                     .show(egui_ctx, |ui| {
                     egui_macroquad::egui::ScrollArea::vertical().show(ui, |ui| {
-panel_section(ui, "Controls", true, |ui| {
+                panel_section(ui, "Controls", true, |ui| {
                         ui.label("No point cloud loaded.");
                         if ui.button("Open file…").clicked()
                             && let Some(paths) = rfd::FileDialog::new()
@@ -5105,9 +5156,17 @@ panel_section(ui, "Controls", true, |ui| {
                             }
                         }
                         ui.label("…or drag a .laz / .copc.laz file onto the window (Windows / X11).");
-});
+                        // Nothing is loaded, so there is nothing to classify,
+                        // digitise or export; the panel stays a single group.
+                });
                     });
                 });
+                // Read after the panel is laid out, not before.
+                // `is_pointer_over_area` treats a SidePanel as background and falls
+                // back to egui's unused_rect, which still covers the whole screen
+                // until a panel has shrunk it — so asking first says the pointer is
+                // over the viewport even when it is on a button, and the click both
+                // presses the button and drops a vertex.
                 // What the panel actually took, so the view renders beside it.
                 panel_px = egui_ctx.available_rect().min.x * egui_ctx.pixels_per_point();
             });

@@ -95,9 +95,16 @@ You can create COPC files out of conventional LAZ files with [copc-converter](ht
 ## The panel
 
 Everything lives in one panel docked to the left of the window, with
-collapsible sections — **Controls**, **Classes**, **Polylines**, **Ground
-Control Points** and **Export**. Drag its inner edge to resize it. It is docked
-left so that the view cube in the top-right corner stays clear.
+collapsible sections:
+
+- **Controls** — camera, colouring, height filter, cross sections, measure;
+- **Classification** — the lasso tools, the **Classes** table and **Export**,
+  which are one job;
+- **Digitising** — snap mode, radius and the line being drawn;
+- **Polylines** and **Ground Control Points** — the overlays.
+
+Drag the panel's inner edge to resize it. It is docked left so that the view
+cube in the top-right corner stays clear.
 
 The 3D and section views render **beside** the panel rather than underneath it,
 so nothing is hidden behind it and **Zoom All** frames into the space you can
