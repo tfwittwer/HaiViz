@@ -92,6 +92,13 @@ own **Unload** control.
 
 You can create COPC files out of conventional LAZ files with [copc-converter](https://github.com/360-geo/copc-converter).
 
+## The panel
+
+Everything lives in one panel docked to the left of the window, with
+collapsible sections — **Controls**, **Classes**, **Polylines**, **Ground
+Control Points** and **Export**. Drag its inner edge to resize it. It is docked
+left so that the view cube in the top-right corner stays clear.
+
 ## Navigation
 
 The 3D view uses an orthographic camera shared across all modes:
@@ -152,7 +159,7 @@ does not affect what an export writes. Use the **Omit classes** list for that.
 
 ## Class visibility
 
-Each row of the **Classes** window has a checkbox. Clear it and that class is
+Each row of the **Classes** section has a checkbox. Clear it and that class is
 switched off; **only** beside a row isolates it, and **All** / **None** /
 **Invert** act on every listed class at once.
 
@@ -173,7 +180,7 @@ Two things worth knowing:
 - **Visibility does not affect export.** Same as the height filter — use
   **Omit classes** for that. Hiding a class and exporting still writes it.
 - **A hidden class is invisible in more ways than one.** While any class is
-  hidden the classification panel says so, because a lasso that catches nothing
+  hidden the classification controls say so, because a lasso that catches nothing
   is otherwise very confusing.
 
 If you set **Only from: 5** while class 5 is hidden, the two exclude each other
@@ -205,7 +212,7 @@ Click **Back to 3D** to return.
 
 ## Polylines
 
-Open the **Polylines** window and **Load Polyline File…** to overlay vector
+Open the **Polylines** section and **Load Polyline File…** to overlay vector
 lines on the cloud. Two formats are read and written:
 
 - **GeoPackage** (`.gpkg`) — the OGC container QGIS and GDAL use. Every line
@@ -330,7 +337,7 @@ the line you are drawing.**
 
 If the target file changed on disk since it was loaded, the line is kept in
 memory and not written, and the panel says so. Use **Save As…** in the
-Polylines window to keep it somewhere else.
+Polylines section to keep it somewhere else.
 
 `{n}` in the **Name** field becomes the line's number within its layer, so a run
 of lines does not need renaming one at a time. **Code** is written to the
@@ -338,7 +345,7 @@ of lines does not need renaming one at a time. **Code** is written to the
 
 ## GCP Overlay
 
-Open the **Ground Control Points** window and **Load GCP File...**. Column separators and column types are auto-detected. GCP coordinates are drawn as overlays and are visible in both 3D and section view.
+Open the **Ground Control Points** section and **Load GCP File...**. Column separators and column types are auto-detected. GCP coordinates are drawn as overlays and are visible in both 3D and section view.
 
 ## Manual classification
 
@@ -482,7 +489,7 @@ and the viewer stays usable.
 
 ## Class editing
 
-Open the **Classes** window to edit classification labels and colours live.
+Open the **Classes** section to edit classification labels and colours live.
 It lists every classification id present in the data (plus any extras defined in
 your file), and for each id you can edit its **colour** and **label**. Changes
 apply immediately when colouring by **Classification**.

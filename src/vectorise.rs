@@ -154,6 +154,9 @@ pub struct Digitise {
     /// Attribute written to the `code` column, for whoever consumes the file.
     pub code: String,
     pub color: Color,
+    /// Drawn width of the line in progress, in screen pixels. Matches
+    /// `Layer::width_px`, and seeds it for a layer haiviz creates.
+    pub width_px: f32,
     pub status: Option<String>,
     pub snap_mode: SnapMode,
     /// Snap radius in metres. See [`DEFAULT_SNAP_RADIUS`].
@@ -177,6 +180,7 @@ impl Default for Digitise {
             name_template: "Line {n}".to_string(),
             code: String::new(),
             color: Color::new(1.0, 0.85, 0.2, 1.0),
+            width_px: 2.0,
             status: None,
             snap_mode: SnapMode::Nearest,
             radius: DEFAULT_SNAP_RADIUS,
@@ -270,23 +274,27 @@ pub fn ensure_target(
     files: &mut Vec<PolylineFile>,
     cloud_path: &str,
     srs_id: i32,
+    width_px: f32,
 ) -> (usize, usize) {
     let path = default_vector_path(cloud_path);
     if let Some(fi) = files.iter().position(|f| f.path == path) {
         if files[fi].layers.is_empty() {
-            files[fi].layers.push(new_layer(srs_id));
+            files[fi].layers.push(new_layer(srs_id, width_px));
         }
         return (fi, files[fi].layers.len() - 1);
     }
     let mut pf = PolylineFile::new(&path, VectorFormat::GeoPackage);
-    pf.layers.push(new_layer(srs_id));
+    pf.layers.push(new_layer(srs_id, width_px));
     files.push(pf);
     (files.len() - 1, 0)
 }
 
-fn new_layer(srs_id: i32) -> Layer {
+fn new_layer(srs_id: i32, width_px: f32) -> Layer {
     let mut l = Layer::new("digitised");
     l.srs_id = srs_id;
+    // The layer inherits the width the line was drawn at, so a finished line
+    // does not change thickness the moment it is committed.
+    l.width_px = width_px;
     l
 }
 
@@ -298,32 +306,61 @@ pub fn target_label(files: &[PolylineFile], fi: usize, li: usize) -> String {
     }
 }
 
-/// Draw the line in progress and the rubber band to the cursor.
+/// Draw the line in progress, the rubber band, and the snap marker.
 ///
-/// `origin` converts the world-space pending vertices into the viewer space
-/// everything else in the 3D view is drawn in.
-pub fn draw_3d(dig: &Digitise, origin: [f64; 3], cursor: Option<[f64; 3]>, drawing: bool) {
-    if dig.pending.is_empty() { return; }
-    let to_view = |p: [f64; 3]| vec3(
-        (p[0] - origin[0]) as f32,
-        (p[1] - origin[1]) as f32,
-        (p[2] - origin[2]) as f32,
-    );
+/// Projected and drawn in 2D for the same reasons as `polylines::draw_3d`:
+/// `draw_line_3d` has no width, and this has to composite before egui or the
+/// overlay lands on top of the panel. Call after `set_default_camera()`.
+///
+/// The snap circle is built in **world** space and projected vertex by vertex,
+/// so it keeps showing the true radius in metres rather than becoming a fixed
+/// blob on screen.
+pub fn draw_overlay(
+    dig: &Digitise,
+    origin: [f64; 3],
+    view_proj: &glam::Mat4,
+    cursor: Option<[f64; 3]>,
+    drawing: bool,
+) {
+    let (sw, sh) = (screen_width(), screen_height());
+    let to_screen = |p: [f64; 3]| project_world(view_proj, p, origin, sw, sh);
+    let w = dig.width_px.max(0.5);
 
-    let pts: Vec<Vec3> = dig.pending.iter().map(|p| to_view(*p)).collect();
-    for w in pts.windows(2) {
-        draw_line_3d(w[0], w[1], dig.color);
+    let pts: Vec<Option<(f32, f32)>> = dig.pending.iter().map(|p| to_screen(*p)).collect();
+    for pair in pts.windows(2) {
+        if let (Some(a), Some(b)) = (pair[0], pair[1]) {
+            draw_line(a.0, a.1, b.0, b.1, w, dig.color);
+        }
     }
     // Every committed vertex gets a marker: on a dense cloud the line alone
     // does not show where the operator actually clicked.
-    for p in &pts {
-        draw_cube_wires(*p, vec3(0.08, 0.08, 0.08), dig.color);
+    for p in pts.iter().flatten() {
+        draw_circle_lines(p.0, p.1, (w * 1.6).max(3.0), 1.0, dig.color);
     }
     if drawing
-        && let (Some(&last), Some(c)) = (pts.last(), cursor) {
+        && let (Some(Some(last)), Some(c)) = (pts.last(), cursor)
+        && let Some(cs) = to_screen(c) {
         let faint = Color::new(dig.color.r, dig.color.g, dig.color.b, 0.5);
-        draw_line_3d(last, to_view(c), faint);
+        draw_line(last.0, last.1, cs.0, cs.1, w, faint);
     }
+
+    if drawing { draw_snap_marker(dig, origin, view_proj); }
+}
+
+fn project_world(
+    vp: &glam::Mat4, p: [f64; 3], origin: [f64; 3], sw: f32, sh: f32,
+) -> Option<(f32, f32)> {
+    let v = glam::Vec4::new(
+        (p[0] - origin[0]) as f32,
+        (p[1] - origin[1]) as f32,
+        (p[2] - origin[2]) as f32,
+        1.0,
+    );
+    let clip = *vp * v;
+    if clip.w <= 0.0 { return None; }
+    let (nx, ny) = (clip.x / clip.w, clip.y / clip.w);
+    if !nx.is_finite() || !ny.is_finite() || nx.abs() > 50.0 || ny.abs() > 50.0 { return None; }
+    Some(((nx + 1.0) / 2.0 * sw, (1.0 - ny) / 2.0 * sh))
 }
 
 /// Draw the snap marker and the radius circle at the candidate vertex.
@@ -331,36 +368,42 @@ pub fn draw_3d(dig: &Digitise, origin: [f64; 3], cursor: Option<[f64; 3]>, drawi
 /// A cross, like `measure_a` / `measure_b`, so it reads the same way as the
 /// other precision tools. The circle sits at the *snapped* Z rather than at the
 /// cursor's, so what it encloses is what the percentile was taken over.
-pub fn draw_snap_marker(dig: &Digitise, origin: [f64; 3]) {
+fn draw_snap_marker(dig: &Digitise, origin: [f64; 3], view_proj: &glam::Mat4) {
     let Some(hit) = &dig.hover else { return };
-    let p = vec3(
-        (hit.world[0] - origin[0]) as f32,
-        (hit.world[1] - origin[1]) as f32,
-        (hit.world[2] - origin[2]) as f32,
-    );
+    let (sw, sh) = (screen_width(), screen_height());
+    let to_screen = |p: [f64; 3]| project_world(view_proj, p, origin, sw, sh);
     let color = match hit.quality {
         SnapQuality::Good => dig.color,
         // Visibly different, not merely dimmer: a coarse snap is a refusal,
         // and it must not read as "nearly fine".
         SnapQuality::Coarse => Color::new(1.0, 0.4, 0.1, 1.0),
-        SnapQuality::Empty => Color::new(0.8, 0.2, 0.2, 0.8),
+        SnapQuality::Empty => Color::new(0.9, 0.25, 0.25, 1.0),
     };
 
-    let arm = (dig.radius * 0.6).max(0.05);
-    draw_line_3d(p - vec3(arm, 0.0, 0.0), p + vec3(arm, 0.0, 0.0), color);
-    draw_line_3d(p - vec3(0.0, arm, 0.0), p + vec3(0.0, arm, 0.0), color);
-    draw_line_3d(p - vec3(0.0, 0.0, arm), p + vec3(0.0, 0.0, arm), color);
+    let r = dig.radius as f64;
+    let c = hit.world;
+    // Three world-space arms, so the cross shrinks with the radius and stays
+    // an honest indication of scale.
+    for axis in 0..3 {
+        let mut a = c;
+        let mut b = c;
+        a[axis] -= r * 0.6;
+        b[axis] += r * 0.6;
+        if let (Some(p), Some(q)) = (to_screen(a), to_screen(b)) {
+            draw_line(p.0, p.1, q.0, q.1, 1.5, color);
+        }
+    }
 
-    // The radius the query actually used, so the operator can see what a
-    // percentile is being taken over rather than having to imagine it.
-    const SEGMENTS: usize = 32;
-    let faint = Color::new(color.r, color.g, color.b, 0.45);
-    let mut prev = vec3(p.x + dig.radius, p.y, p.z);
-    for i in 1..=SEGMENTS {
-        let a = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
-        let next = vec3(p.x + dig.radius * a.cos(), p.y + dig.radius * a.sin(), p.z);
-        draw_line_3d(prev, next, faint);
-        prev = next;
+    const SEGMENTS: usize = 40;
+    let faint = Color::new(color.r, color.g, color.b, 0.5);
+    let mut prev: Option<(f32, f32)> = None;
+    for i in 0..=SEGMENTS {
+        let a = i as f64 / SEGMENTS as f64 * std::f64::consts::TAU;
+        let here = to_screen([c[0] + r * a.cos(), c[1] + r * a.sin(), c[2]]);
+        if let (Some(p), Some(q)) = (prev, here) {
+            draw_line(p.0, p.1, q.0, q.1, 1.0, faint);
+        }
+        prev = here;
     }
 }
 
@@ -457,6 +500,9 @@ pub fn controls(
             );
         }
         ui.label("line colour");
+        ui.add(egui::DragValue::new(&mut dig.width_px)
+            .speed(0.2).range(0.5..=12.0).max_decimals(1).suffix(" px"))
+            .on_hover_text("Drawn width in the 3D view");
     });
 
     if drawing {
@@ -640,13 +686,13 @@ mod tests {
         assert_eq!(default_vector_path(cloud), "/data/site/scan.copc.laz.haiviz-vectors.gpkg");
 
         let mut files: Vec<PolylineFile> = Vec::new();
-        let (fi, li) = ensure_target(&mut files, cloud, 28992);
+        let (fi, li) = ensure_target(&mut files, cloud, 28992, 2.0);
         assert_eq!((fi, li), (0, 0));
         assert_eq!(files[0].format, VectorFormat::GeoPackage);
         assert_eq!(files[0].layers[0].srs_id, 28992);
 
         // Asking again reuses it rather than forking the file.
-        let again = ensure_target(&mut files, cloud, 28992);
+        let again = ensure_target(&mut files, cloud, 28992, 2.0);
         assert_eq!(again, (0, 0));
         assert_eq!(files.len(), 1);
     }

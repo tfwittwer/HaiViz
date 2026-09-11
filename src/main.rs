@@ -651,17 +651,7 @@ fn draw_3d_overlays(
     ortho_scale: f32,
     ground_lasso: &[glam::Vec2],
     ground_color: Color,
-    digitise: &vectorise::Digitise,
-    // Viewer origin, to project the digitised vertices — which are stored in
-    // world coordinates — into the space everything else here is drawn in.
-    data_offset: [f64; 3],
-    // World-space point the next vertex would land on, for the rubber band.
-    digitise_cursor: Option<[f64; 3]>,
 ) {
-    vectorise::draw_3d(digitise, data_offset, digitise_cursor, app_mode == AppMode::Digitise);
-    if app_mode == AppMode::Digitise {
-        vectorise::draw_snap_marker(digitise, data_offset);
-    }
     if !ground_lasso.is_empty() {
         let pts: Vec<Vec3> = ground_lasso.iter().map(|v| vec3(v.x, v.y, mid_z)).collect();
         for w in pts.windows(2) {
@@ -1060,9 +1050,44 @@ fn pick_section_point(
     best
 }
 
+/// One collapsible section of the docked panel.
+///
+/// haiviz used to scatter five floating windows across the viewport; they
+/// overlapped each other, covered the data, and had to be re-found after every
+/// resize. One docked panel with collapsible sections keeps all of it in one
+/// place and leaves the view unobstructed — and docking **left** specifically,
+/// because the view cube lives in the top-right corner.
+fn panel_section<R>(
+    ui: &mut egui_macroquad::egui::Ui,
+    title: &str,
+    default_open: bool,
+    add: impl FnOnce(&mut egui_macroquad::egui::Ui) -> R,
+) -> Option<R> {
+    panel_section_forced(ui, title, default_open, None, add)
+}
+
+/// As [`panel_section`], but a `force_open` of `Some(_)` overrides the stored
+/// state for this frame — and egui stores the new value, so passing it on a
+/// single frame opens the section and leaves the header free to toggle it
+/// afterwards. That is what lets a button elsewhere in the panel reveal a
+/// section without taking ownership of it.
+fn panel_section_forced<R>(
+    ui: &mut egui_macroquad::egui::Ui,
+    title: &str,
+    default_open: bool,
+    force_open: Option<bool>,
+    add: impl FnOnce(&mut egui_macroquad::egui::Ui) -> R,
+) -> Option<R> {
+    egui_macroquad::egui::CollapsingHeader::new(title)
+        .default_open(default_open)
+        .open(force_open)
+        .show(ui, add)
+        .body_returned
+}
+
 #[allow(clippy::too_many_arguments)]
-fn polylines_window(
-    egui_ctx: &egui_macroquad::egui::Context,
+fn polylines_section(
+    ui: &mut egui_macroquad::egui::Ui,
     poly_files: &mut Vec<polylines::PolylineFile>,
     selected_poly: &mut Option<polylines::PolyRef>,
     poly_load_error: &mut Option<String>,
@@ -1073,16 +1098,7 @@ fn polylines_window(
     data_offset: [f64; 3],
     background: Color,
 ) {
-    egui_macroquad::egui::Window::new("Polylines")
-        .default_pos([10.0, 600.0])
-        // `default_pos` is clamped so the window fits on screen, and on the
-        // first frame egui assumes a window is its default size (340x420),
-        // even one that opens collapsed. That reserves ~400px of height and
-        // silently pins any y past `screen_height - 400` to that ceiling —
-        // which is how two windows given different positions end up stacked.
-        .constrain(false)
-        .default_open(false)
-        .show(egui_ctx, |ui| {
+    panel_section(ui, "Polylines", false, |ui| {
             let luma = background.r * 0.299 + background.g * 0.587 + background.b * 0.114;
             let default_color = if luma > 0.5 { BLACK } else { WHITE };
             if ui.button("Load Polyline File...").clicked() &&
@@ -1148,6 +1164,9 @@ fn polylines_window(
                             ui.add(egui_macroquad::egui::DragValue::new(&mut layer.srs_id)
                                 .range(0..=1_000_000))
                                 .on_hover_text("Coordinate reference system written to GeoPackage");
+                            ui.add(egui_macroquad::egui::DragValue::new(&mut layer.width_px)
+                                .speed(0.2).range(0.5..=12.0).max_decimals(1).suffix(" px"))
+                                .on_hover_text("Drawn width in the 3D view");
                         });
                         ui.indent(("poly_layer", fi, li), |ui| {
                             for (pi, pl) in layer.polylines.iter_mut().enumerate() {
@@ -1203,7 +1222,7 @@ fn polylines_window(
             if let Some(msg) = poly_save_status {
                 ui.label(msg.as_str());
             }
-        });
+    });
 }
 
 /// Perform a Save or Save As, returning the status line.
@@ -1260,20 +1279,15 @@ fn save_polylines(
 
 /// Ground control point overlay: load text tables, review/override the detected
 /// column mapping, and control how the markers are drawn in both views.
-fn gcp_window(
-    egui_ctx: &egui_macroquad::egui::Context,
+fn gcp_section(
+    ui: &mut egui_macroquad::egui::Ui,
     gcp_files: &mut Vec<gcp::GcpFile>,
     selected_gcp: &mut Option<(usize, usize)>,
     gcp_load_error: &mut Option<String>,
     background: Color,
 ) {
     use egui_macroquad::egui;
-    egui::Window::new("Ground Control Points")
-        .default_pos([10.0, 700.0])
-        // See the note in `polylines_window`.
-        .constrain(false)
-        .default_open(false)
-        .show(egui_ctx, |ui| {
+    panel_section(ui, "Ground Control Points", false, |ui| {
             let luma = background.r * 0.299 + background.g * 0.587 + background.b * 0.114;
             let default_color = if luma > 0.5 {
                 Color::new(0.85, 0.1, 0.1, 1.0)
@@ -1401,7 +1415,7 @@ fn gcp_window(
                 gcp_files.remove(fi);
                 *selected_gcp = None;
             }
-        });
+    });
 }
 
 /// Built-in editor for classification labels & colours (classes.txt).
@@ -1410,8 +1424,8 @@ fn gcp_window(
 /// palette/labels when the window is first opened. Returns `true` when a colour
 /// was edited or the file was reloaded, i.e. when point colours need a rebuild.
 /// Label-only edits update the defs in place and need no rebuild.
-fn classes_window(
-    egui_ctx: &egui_macroquad::egui::Context,
+fn classes_section(
+    ui: &mut egui_macroquad::egui::Ui,
     class_defs: &mut Option<ClassDefs>,
     class_vis: &mut ClassVis,
     max_class: u8,
@@ -1419,12 +1433,7 @@ fn classes_window(
 ) -> bool {
     use egui_macroquad::egui;
     let mut colors_changed = false;
-    egui::Window::new("Classes")
-        .default_pos([10.0, 500.0])
-        // See the note in `polylines_window`.
-        .constrain(false)
-        .default_open(false)
-        .show(egui_ctx, |ui| {
+    panel_section(ui, "Classes", false, |ui| {
             let mut do_reload = false;
             {
                 let defs = class_defs.get_or_insert_with(ClassDefs::new);
@@ -1433,7 +1442,7 @@ fn classes_window(
                 extra.sort();
                 ids.extend(extra);
                 // All / None / Invert act on the listed ids only. An id that is
-                // not listed cannot be switched off in this window, so leaving
+                // not listed cannot be switched off here, so leaving
                 // it alone is what keeps "N classes hidden" a number the
                 // operator can reconcile with what is on screen.
                 ui.horizontal(|ui| {
@@ -1473,7 +1482,7 @@ fn classes_window(
                                 .clicked() {
                                 // Over the listed ids only, like All/None/Invert:
                                 // ClassVis::single would also switch off the 200-odd
-                                // ids this window never shows, and the "N classes
+                                // ids this panel never shows, and the "N classes
                                 // hidden" indicator would stop meaning anything.
                                 isolate = Some(id);
                             }
@@ -1517,7 +1526,7 @@ fn classes_window(
             if let Some(msg) = save_status {
                 ui.label(msg.as_str());
             }
-        });
+    });
     colors_changed
 }
 
@@ -1650,8 +1659,8 @@ fn ground_tool_controls(
 /// Export panel: pick which classes to drop, then write one source out.
 /// Returns the index into `sources` the user asked to export, if any.
 #[allow(clippy::too_many_arguments)]
-fn export_window(
-    egui_ctx: &egui_macroquad::egui::Context,
+fn export_section(
+    ui: &mut egui_macroquad::egui::Ui,
     open: &mut bool,
     filter: &mut crate::classify::ExportFilter,
     job: &mut Option<crate::export::ExportJob>,
@@ -1660,13 +1669,12 @@ fn export_window(
     max_class: u8,
     class_defs: &Option<ClassDefs>,
 ) -> Option<usize> {
-    if !*open { return None; }
     let mut requested = None;
-    let mut keep_open = true;
-    egui_macroquad::egui::Window::new("Export")
-        .open(&mut keep_open)
-        .default_pos([420.0, 10.0])
-        .show(egui_ctx, |ui| {
+    // The Export button elsewhere in the panel reveals this section once; the
+    // header owns it from then on.
+    let force = if *open { Some(true) } else { None };
+    *open = false;
+    panel_section_forced(ui, "Export", false, force, |ui| {
             ui.label("Writes LAS/LAZ with all manual classification applied.");
             ui.label("COPC input exports as plain LAZ — re-run copc-converter to");
             ui.label("rebuild the octree.");
@@ -1721,8 +1729,7 @@ fn export_window(
                 ui.separator();
                 ui.label(msg.as_str());
             }
-        });
-    if !keep_open { *open = false; }
+    });
     requested
 }
 
@@ -2050,6 +2057,13 @@ async fn main() {
     show_mouse(!grabbed);
     let mut pivot_locked = false;
     let mut egui_wants_pointer_prev = false;
+    // A drag that began over the UI stays the UI's until the button comes up.
+    //
+    // The per-frame flag alone is not enough: drag a slider out over the
+    // viewport and the pointer is no longer over an egui area, so the guard
+    // releases mid-gesture and the camera starts orbiting under the cursor.
+    // Latching on the press is what makes the grab last as long as the drag.
+    let mut drag_owned_by_ui = false;
     // Whether egui had keyboard focus last frame — a class label being edited,
     // say. Without this, typing a name would trigger the single-letter view and
     // cross-section shortcuts.
@@ -2103,7 +2117,8 @@ async fn main() {
     let mut export_filter = crate::classify::ExportFilter::default();
     let mut export_job: Option<crate::export::ExportJob> = None;
     let mut export_status: Option<String> = None;
-    let mut show_export_window = false;
+    // Set by the Export button to reveal the Export section once.
+    let mut reveal_export = false;
     // Set once a corridor has been pinned, so leaving the section releases it.
     let mut corridor_pinned = false;
     let mut corridor_status: Option<String> = None;
@@ -2682,12 +2697,15 @@ async fn main() {
                 || copc_stages.iter().any(|cs| cs.edits.dirty);
             let export_sources = export_source_list(&stages, &copc_stages);
             egui_macroquad::ui(|egui_ctx| {
-                egui_wants_sec_pointer = egui_ctx.is_pointer_over_area();
+                egui_wants_sec_pointer = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
                 egui_wants_sec_keyboard = egui_ctx.wants_keyboard_input();
-                class_colors_changed = classes_window(egui_ctx, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
-                egui_macroquad::egui::Window::new("Controls")
-                    .default_pos([10.0, 10.0])
+                egui_macroquad::egui::SidePanel::left("haiviz_panel")
+                    .resizable(true)
+                    .default_width(340.0)
                     .show(egui_ctx, |ui| {
+                    egui_macroquad::egui::ScrollArea::vertical().show(ui, |ui| {
+                class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
+panel_section(ui, "Controls", true, |ui| {
                         if ui.button("Back to 3D").clicked() {
                             app_mode = AppMode::View3D;
                             set_section(&mut section_data, &mut section_trash, None);
@@ -2842,14 +2860,16 @@ async fn main() {
                         } else {
                             ui.label("Classification editing is not available in tile mode.");
                         }
-                    });
-                export_request = export_window(
-                    egui_ctx, &mut show_export_window, &mut export_filter,
+});
+                export_request = export_section(
+                    ui, &mut reveal_export, &mut export_filter,
                     &mut export_job, &mut export_status, &export_sources,
                     max_class, &class_defs,
                 );
-                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
-                gcp_window(egui_ctx, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
+                polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
+                gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
+                    });
+                });
             });
 
             // A narrowed band should drive the height ramp too: colouring
@@ -3299,17 +3319,23 @@ async fn main() {
             show_mouse(!grabbed);
         }
 
-        if is_key_down(KeyCode::Up) || is_key_down(KeyCode::W) {
-            position += up * MOVE_SPEED;
-        }
-        if is_key_down(KeyCode::Down) || is_key_down(KeyCode::S) {
-            position -= up * MOVE_SPEED;
-        }
-        if is_key_down(KeyCode::Left) || is_key_down(KeyCode::A) {
-            position -= right * MOVE_SPEED;
-        }
-        if is_key_down(KeyCode::Right) || is_key_down(KeyCode::D) {
-            position += right * MOVE_SPEED;
+        // Camera movement, suppressed while a text field has focus. `W`/`A`/
+        // `S`/`D` are obviously ambiguous with typing, but so are the arrows:
+        // they move the caret in a line-name or code field, and the view has
+        // no business following.
+        if !egui_wants_keyboard_prev {
+            if is_key_down(KeyCode::Up) || is_key_down(KeyCode::W) {
+                position += up * MOVE_SPEED;
+            }
+            if is_key_down(KeyCode::Down) || is_key_down(KeyCode::S) {
+                position -= up * MOVE_SPEED;
+            }
+            if is_key_down(KeyCode::Left) || is_key_down(KeyCode::A) {
+                position -= right * MOVE_SPEED;
+            }
+            if is_key_down(KeyCode::Right) || is_key_down(KeyCode::D) {
+                position += right * MOVE_SPEED;
+            }
         }
 
         let (_mwx, mwy) = mouse_wheel();
@@ -3328,6 +3354,19 @@ async fn main() {
         let mouse_pos: Vec2 = mouse_position().into();
         let mouse_delta = mouse_pos - last_mouse_position;
         last_mouse_position = mouse_pos;
+
+        let any_button_down = is_mouse_button_down(MouseButton::Left)
+            || is_mouse_button_down(MouseButton::Right)
+            || is_mouse_button_down(MouseButton::Middle);
+        if !any_button_down {
+            drag_owned_by_ui = false;
+        } else if (is_mouse_button_pressed(MouseButton::Left)
+            || is_mouse_button_pressed(MouseButton::Right)
+            || is_mouse_button_pressed(MouseButton::Middle))
+            && egui_wants_pointer_prev {
+            drag_owned_by_ui = true;
+        }
+        let ui_has_pointer = egui_wants_pointer_prev || drag_owned_by_ui;
 
         let mid_z = height_range * 0.5;
 
@@ -3354,7 +3393,7 @@ async fn main() {
         );
         pivot_locked = false;
 
-        if (grabbed || is_mouse_button_down(MouseButton::Left)) && !mode_uses_click && !egui_wants_pointer_prev {
+        if (grabbed || is_mouse_button_down(MouseButton::Left)) && !mode_uses_click && !ui_has_pointer {
 
             pivot_locked = true;
 
@@ -3381,7 +3420,7 @@ async fn main() {
             
         }
 
-        if is_mouse_button_down(MouseButton::Right) && !egui_wants_pointer_prev {
+        if is_mouse_button_down(MouseButton::Right) && !ui_has_pointer {
             // 1:1 with the cursor — the point under the pointer stays under it.
             // Any multiplier here makes the cloud outrun the mouse and shoot
             // off screen on a short drag.
@@ -3410,7 +3449,7 @@ async fn main() {
         let cursor_world = screen_to_world_xy(mx, my, &view_proj, mid_z);
 
         if app_mode == AppMode::GroundLasso {
-            if !egui_wants_pointer_prev && is_mouse_button_pressed(MouseButton::Left)
+            if !ui_has_pointer && is_mouse_button_pressed(MouseButton::Left)
                 && let Some((wx, wy)) = cursor_world {
                     ground_lasso.push(glam::Vec2::new(wx, wy));
             }
@@ -3425,7 +3464,7 @@ async fn main() {
         // Digitising input, handled once here rather than in each render
         // block's click match, exactly as the plan-view lasso above is.
         if app_mode == AppMode::Digitise {
-            if !egui_wants_pointer_prev && is_mouse_button_pressed(MouseButton::Left) {
+            if !ui_has_pointer && is_mouse_button_pressed(MouseButton::Left) {
                 let free = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
                 if free {
                     // Free placement: the cursor ray meets a horizontal plane
@@ -3474,7 +3513,7 @@ async fn main() {
         // the resident points, not something to spend on every frame of
         // ordinary navigation.
         let have_cloud = !stages.is_empty() || !copc_stages.is_empty() || tile_mgr.is_some();
-        digitise.hover = if app_mode == AppMode::Digitise && !egui_wants_pointer_prev {
+        digitise.hover = if app_mode == AppMode::Digitise && !ui_has_pointer {
             Some(resolve_snap(
                 &stages, &copc_stages, &tile_mgr, &poly_files,
                 &view_proj, mx, my, data_offset, &digitise,
@@ -3554,7 +3593,6 @@ async fn main() {
                 app_mode, measure_a, measure_b, section_start, section_end,
                 cursor_world, section_depth, mid_z, height_range, ortho_scale,
                 &ground_lasso, class_color_mq(classify_target, &class_defs),
-                &digitise, data_offset, digitise_cursor,
             );
 
             set_default_camera();
@@ -3586,12 +3624,15 @@ async fn main() {
             let mut export_request: Option<usize> = None;
             let export_sources = export_source_list(&stages, &copc_stages);
             egui_macroquad::ui(|egui_ctx| {
-                egui_wants_pointer = egui_ctx.is_pointer_over_area();
+                egui_wants_pointer = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
                 egui_wants_keyboard = egui_ctx.wants_keyboard_input();
-                class_colors_changed = classes_window(egui_ctx, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
-                egui_macroquad::egui::Window::new("Controls")
-                    .default_pos([10.0, 10.0])
+                egui_macroquad::egui::SidePanel::left("haiviz_panel")
+                    .resizable(true)
+                    .default_width(340.0)
                     .show(egui_ctx, |ui| {
+                    egui_macroquad::egui::ScrollArea::vertical().show(ui, |ui| {
+                class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
+panel_section(ui, "Controls", true, |ui| {
                         let section_label = match app_mode {
                             AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
                                 | AppMode::MeasureSecond | AppMode::GroundLasso
@@ -3668,7 +3709,7 @@ async fn main() {
                             }
                         });
                         ui.horizontal(|ui| {
-                            if ui.button("Export…").clicked() { show_export_window = !show_export_window; }
+                            if ui.button("Export…").clicked() { reveal_export = true; }
                             if ui.button("Zoom All").clicked() { do_zoom_all = true; }
                             ui.label("Pt size:");
                             if ui.button("-").clicked() { point_size = (point_size - 1.0).max(1.0); }
@@ -3784,14 +3825,16 @@ async fn main() {
                             ui.separator();
                             point_info_ui(ui, "Point Info:", p, &class_defs);
                         }
-                    });
-                export_request = export_window(
-                    egui_ctx, &mut show_export_window, &mut export_filter,
+});
+                export_request = export_section(
+                    ui, &mut reveal_export, &mut export_filter,
                     &mut export_job, &mut export_status, &export_sources,
                     max_class, &class_defs,
                 );
-                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
-                gcp_window(egui_ctx, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
+                polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
+                gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
+                    });
+                });
             });
 
             // A narrowed band should drive the height ramp too: colouring
@@ -3820,6 +3863,15 @@ async fn main() {
             // before egui so the panels still sit on top.
             if !gcp_files.is_empty() {
                 gcp::draw_3d(&gcp_files, data_offset, &view_proj, selected_gcp);
+            }
+            if !poly_files.is_empty() {
+                polylines::draw_3d(&poly_files, &view_proj);
+            }
+            if app_mode == AppMode::Digitise || digitise.is_drawing() {
+                vectorise::draw_overlay(
+                    &digitise, data_offset, &view_proj, digitise_cursor,
+                    app_mode == AppMode::Digitise,
+                );
             }
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
@@ -4002,7 +4054,6 @@ async fn main() {
                 app_mode, measure_a, measure_b, section_start, section_end,
                 cursor_world, section_depth, mid_z, height_range, ortho_scale,
                 &ground_lasso, class_color_mq(classify_target, &class_defs),
-                &digitise, data_offset, digitise_cursor,
             );
 
             set_default_camera();
@@ -4030,12 +4081,15 @@ async fn main() {
             let mut export_request: Option<usize> = None;
             let export_sources = export_source_list(&stages, &copc_stages);
             egui_macroquad::ui(|egui_ctx| {
-                egui_wants_pointer = egui_ctx.is_pointer_over_area();
+                egui_wants_pointer = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
                 egui_wants_keyboard = egui_ctx.wants_keyboard_input();
-                class_colors_changed = classes_window(egui_ctx, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
-                egui_macroquad::egui::Window::new("Controls")
-                    .default_pos([10.0, 10.0])
+                egui_macroquad::egui::SidePanel::left("haiviz_panel")
+                    .resizable(true)
+                    .default_width(340.0)
                     .show(egui_ctx, |ui| {
+                    egui_macroquad::egui::ScrollArea::vertical().show(ui, |ui| {
+                class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
+panel_section(ui, "Controls", true, |ui| {
                         let section_label = match app_mode {
                             AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
                                 | AppMode::MeasureSecond | AppMode::GroundLasso
@@ -4106,7 +4160,7 @@ async fn main() {
                             }
                         });
                         ui.horizontal(|ui| {
-                            if ui.button("Export…").clicked() { show_export_window = !show_export_window; }
+                            if ui.button("Export…").clicked() { reveal_export = true; }
                             if ui.button("Zoom All").clicked() { do_zoom_all = true; }
                             ui.label("Pt size:");
                             if ui.button("-").clicked() { point_size = (point_size - 1.0).max(1.0); }
@@ -4219,14 +4273,16 @@ async fn main() {
                             ui.separator();
                             point_info_ui(ui, "Point Info:", p, &class_defs);
                         }
-                    });
-                export_request = export_window(
-                    egui_ctx, &mut show_export_window, &mut export_filter,
+});
+                export_request = export_section(
+                    ui, &mut reveal_export, &mut export_filter,
                     &mut export_job, &mut export_status, &export_sources,
                     max_class, &class_defs,
                 );
-                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
-                gcp_window(egui_ctx, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
+                polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
+                gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
+                    });
+                });
             });
 
             // A narrowed band should drive the height ramp too: colouring
@@ -4255,6 +4311,15 @@ async fn main() {
             // before egui so the panels still sit on top.
             if !gcp_files.is_empty() {
                 gcp::draw_3d(&gcp_files, data_offset, &view_proj, selected_gcp);
+            }
+            if !poly_files.is_empty() {
+                polylines::draw_3d(&poly_files, &view_proj);
+            }
+            if app_mode == AppMode::Digitise || digitise.is_drawing() {
+                vectorise::draw_overlay(
+                    &digitise, data_offset, &view_proj, digitise_cursor,
+                    app_mode == AppMode::Digitise,
+                );
             }
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
@@ -4472,7 +4537,6 @@ async fn main() {
                 app_mode, measure_a, measure_b, section_start, section_end,
                 cursor_world, section_depth, mid_z, height_range, ortho_scale,
                 &ground_lasso, class_color_mq(classify_target, &class_defs),
-                &digitise, data_offset, digitise_cursor,
             );
 
             set_default_camera();
@@ -4517,12 +4581,15 @@ async fn main() {
             let mut export_request: Option<usize> = None;
             let export_sources = export_source_list(&stages, &copc_stages);
             egui_macroquad::ui(|egui_ctx| {
-                egui_wants_pointer = egui_ctx.is_pointer_over_area();
+                egui_wants_pointer = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
                 egui_wants_keyboard = egui_ctx.wants_keyboard_input();
-                class_colors_changed = classes_window(egui_ctx, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
-                egui_macroquad::egui::Window::new("Controls")
-                    .default_pos([10.0, 10.0])
+                egui_macroquad::egui::SidePanel::left("haiviz_panel")
+                    .resizable(true)
+                    .default_width(340.0)
                     .show(egui_ctx, |ui| {
+                    egui_macroquad::egui::ScrollArea::vertical().show(ui, |ui| {
+                class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
+panel_section(ui, "Controls", true, |ui| {
                         // Cross Section button
                         let section_label = match app_mode {
                             AppMode::View3D | AppMode::PointPick | AppMode::MeasureFirst
@@ -4704,14 +4771,16 @@ async fn main() {
                                 point_info_ui(ui, &format!("Point Info ({})", mgr.tiles[tile_idx].filename), p, &class_defs);
                             
                         }
-                    });
-                export_request = export_window(
-                    egui_ctx, &mut show_export_window, &mut export_filter,
+});
+                export_request = export_section(
+                    ui, &mut reveal_export, &mut export_filter,
                     &mut export_job, &mut export_status, &export_sources,
                     max_class, &class_defs,
                 );
-                polylines_window(egui_ctx, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
-                gcp_window(egui_ctx, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
+                polylines_section(ui, &mut poly_files, &mut selected_poly, &mut poly_load_error, &mut poly_save_status, &mut pending_salome, data_offset, background);
+                gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
+                    });
+                });
             });
 
             // A narrowed band should drive the height ramp too: colouring
@@ -4740,6 +4809,15 @@ async fn main() {
             // before egui so the panels still sit on top.
             if !gcp_files.is_empty() {
                 gcp::draw_3d(&gcp_files, data_offset, &view_proj, selected_gcp);
+            }
+            if !poly_files.is_empty() {
+                polylines::draw_3d(&poly_files, &view_proj);
+            }
+            if app_mode == AppMode::Digitise || digitise.is_drawing() {
+                vectorise::draw_overlay(
+                    &digitise, data_offset, &view_proj, digitise_cursor,
+                    app_mode == AppMode::Digitise,
+                );
             }
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
@@ -4887,20 +4965,16 @@ async fn main() {
             }
         }
 
-        // ---- Polyline 3D overlay (both modes) ----
-        if !poly_files.is_empty() {
-            set_camera(&camera);
-            polylines::draw_3d(&poly_files);
-            set_default_camera();
-        }
-
         // ---- Empty state: no data loaded ----
         // Show a minimal Controls window so the user knows how to load files.
         if stages.is_empty() && copc_stages.is_empty() && tile_mgr.is_none() {
             egui_macroquad::ui(|egui_ctx| {
-                egui_macroquad::egui::Window::new("Controls")
-                    .default_pos([10.0, 10.0])
+                egui_macroquad::egui::SidePanel::left("haiviz_panel")
+                    .resizable(true)
+                    .default_width(340.0)
                     .show(egui_ctx, |ui| {
+                    egui_macroquad::egui::ScrollArea::vertical().show(ui, |ui| {
+panel_section(ui, "Controls", true, |ui| {
                         ui.label("No point cloud loaded.");
                         if ui.button("Open file…").clicked()
                             && let Some(paths) = rfd::FileDialog::new()
@@ -4912,7 +4986,9 @@ async fn main() {
                             }
                         }
                         ui.label("…or drag a .laz / .copc.laz file onto the window (Windows / X11).");
+});
                     });
+                });
             });
             egui_macroquad::draw();
         }
@@ -4934,7 +5010,9 @@ async fn main() {
                                     .map(|l| l.srs_id)
                                     .find(|s| *s != 0)
                                     .unwrap_or(0);
-                                let t = vectorise::ensure_target(&mut poly_files, &cloud, srs);
+                                let t = vectorise::ensure_target(
+                                    &mut poly_files, &cloud, srs, digitise.width_px,
+                                );
                                 digitise.target = Some(t);
                                 digitise.status = Some(format!(
                                     "New lines go to {}",

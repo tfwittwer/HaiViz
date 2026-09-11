@@ -183,6 +183,15 @@ pub struct Layer {
     /// Non-geometry columns as declared, in table order. Empty means "a layer
     /// haiviz made", which gets the default set from §7.2 on the way out.
     pub columns: Vec<(String, String)>,
+    /// Drawn width in the 3D view, in **screen pixels**.
+    ///
+    /// Pixels rather than metres, and per layer rather than per line. The
+    /// section view draws a cross-section of a physical cylinder, so its width
+    /// is `Polyline::radius` in metres and has to scale with zoom; the 3D view
+    /// draws a schematic line, where what matters is that it stays legible at
+    /// any zoom. Those are different quantities and conflating them is why a
+    /// 1 cm radius drew a sub-pixel line.
+    pub width_px: f32,
 }
 
 impl Layer {
@@ -194,6 +203,7 @@ impl Layer {
             srs_id: 0,
             geom_column: "geom".to_string(),
             columns: Vec::new(),
+            width_px: 2.0,
         }
     }
 }
@@ -667,17 +677,38 @@ fn visible_lines(files: &[PolylineFile]) -> impl Iterator<Item = (PolyRef, &Poly
     })
 }
 
-/// Draw all polylines as 3D lines (single-pixel width; thickness applies in section view).
-pub fn draw_3d(files: &[PolylineFile]) {
-    for (_, pl) in visible_lines(files) {
+/// Draw all visible polylines over the 3D view.
+///
+/// Projected to screen and drawn in 2D rather than with `draw_line_3d`, for two
+/// reasons: `draw_line_3d` has no width, and this has to run in the same pass
+/// as the GCP markers — before egui composites — or the lines end up drawn on
+/// top of the panel. Call after `set_default_camera()`.
+pub fn draw_3d(files: &[PolylineFile], view_proj: &glam::Mat4) {
+    let (sw, sh) = (screen_width(), screen_height());
+    for (at, pl) in visible_lines(files) {
+        let width = files[at.file].layers[at.layer].width_px.max(0.5);
         for (a, b) in pl.segments() {
-            draw_line_3d(
-                glam::Vec3::from(pl.view[a]),
-                glam::Vec3::from(pl.view[b]),
-                pl.color,
-            );
+            let Some(p) = project_clipped(view_proj, pl.view[a], sw, sh) else { continue };
+            let Some(q) = project_clipped(view_proj, pl.view[b], sw, sh) else { continue };
+            draw_line(p.0, p.1, q.0, q.1, width, pl.color);
+            // Round the joins, or a thick polyline shows a notch at every
+            // vertex where two segments meet at an angle.
+            if width > 2.0 {
+                draw_circle(q.0, q.1, width * 0.5, pl.color);
+            }
         }
     }
+}
+
+/// Project to screen, rejecting anything behind the camera or implausibly far
+/// off screen — an unclipped projection wraps a behind-camera vertex round to
+/// the opposite side and draws a line across the whole view.
+fn project_clipped(vp: &glam::Mat4, p: [f32; 3], sw: f32, sh: f32) -> Option<(f32, f32)> {
+    let clip = *vp * glam::Vec4::new(p[0], p[1], p[2], 1.0);
+    if clip.w <= 0.0 { return None; }
+    let (nx, ny) = (clip.x / clip.w, clip.y / clip.w);
+    if !nx.is_finite() || !ny.is_finite() || nx.abs() > 50.0 || ny.abs() > 50.0 { return None; }
+    Some(((nx + 1.0) / 2.0 * sw, (1.0 - ny) / 2.0 * sh))
 }
 
 /// Draw polylines projected into section view 2D space.
