@@ -12,7 +12,13 @@ use crate::classify::{ClassMask, effective_class};
 use las::Point as LasPoint;
 
 const MOVE_SPEED: f32 = 0.5;
-const LOOK_SPEED: f32 = 0.5;
+/// Orbit rotation, in radians per logical pixel of mouse travel.
+///
+/// Per pixel, not per second: a mouse delta is already the movement since the
+/// last frame. Scaling it by the frame time as well makes the same hand
+/// movement rotate further the slower the frame — a tile load or a heavy EDL
+/// frame then turns a small drag into a jump that flips the view.
+const LOOK_SPEED: f32 = 0.008;
 
 /// Upper bound on the points a force-loaded section corridor may hold.
 /// Pinning bypasses the LOD point budget by design, so it needs its own guard:
@@ -66,7 +72,7 @@ mod view_cube {
     fn faces() -> [FaceDef; 6] {
         [
             FaceDef { corners: [4, 5, 6, 7], label: "Top",    normal: [ 0.0, 0.0, 1.0], snap_yaw: PI/2.0, snap_pitch: -PI/2.0, color: Color::new(0.3, 0.5, 0.8, 0.85) },
-            FaceDef { corners: [3, 2, 1, 0], label: "Bot",    normal: [ 0.0, 0.0,-1.0], snap_yaw: PI/2.0, snap_pitch:  PI/2.0, color: Color::new(0.2, 0.3, 0.5, 0.85) },
+            FaceDef { corners: [3, 2, 1, 0], label: "Bot",    normal: [ 0.0, 0.0,-1.0], snap_yaw: -PI/2.0, snap_pitch:  PI/2.0, color: Color::new(0.2, 0.3, 0.5, 0.85) },
             FaceDef { corners: [1, 2, 6, 5], label: "E",      normal: [ 1.0, 0.0, 0.0], snap_yaw: 0.0,    snap_pitch:  0.0,     color: Color::new(0.8, 0.3, 0.3, 0.85) },
             FaceDef { corners: [0, 3, 7, 4], label: "W",      normal: [-1.0, 0.0, 0.0], snap_yaw: PI,     snap_pitch:  0.0,     color: Color::new(0.5, 0.2, 0.2, 0.85) },
             FaceDef { corners: [3, 2, 6, 7], label: "N",      normal: [ 0.0, 1.0, 0.0], snap_yaw: PI/2.0, snap_pitch:  0.0,     color: Color::new(0.3, 0.7, 0.3, 0.85) },
@@ -2640,19 +2646,17 @@ async fn main() {
         Vec::new()
     };
 
-    let world_up = vec3(0.0, 0.0, 1.0);
     let mut yaw: f32 = std::f32::consts::FRAC_PI_2; //std::f32::consts::FRAC_PI_4;       // 45°
     let mut pitch: f32 = -std::f32::consts::FRAC_PI_2;    // -90° (true top-down)
 
-    // Compute camera right/up from yaw+pitch, handling the top-down gimbal-lock case.
-    // At pitch=-90°, front=(0,0,-1) is parallel to world_up so cross product is degenerate;
-    // use the yaw direction as the horizontal reference instead.
-    let recompute_right_up = |yaw: f32, pitch: f32, front: Vec3| -> (Vec3, Vec3) {
-        let r = if pitch.abs() > std::f32::consts::FRAC_PI_2 - 0.01 {
-            front.cross(vec3(yaw.cos(), yaw.sin(), 0.0)).normalize()
-        } else {
-            front.cross(world_up).normalize()
-        };
+    // Camera right/up from yaw. Right is horizontal and perpendicular to the
+    // yaw heading at every pitch, so it is taken from yaw directly rather than
+    // from `front × Z`, which degenerates looking straight down or up.
+    // The old special case for that swapped in a reference whose sign was
+    // wrong looking up: orbiting towards the bottom view spun the picture 180°
+    // in the last half degree.
+    let recompute_right_up = |yaw: f32, _pitch: f32, front: Vec3| -> (Vec3, Vec3) {
+        let r = vec3(yaw.sin(), -yaw.cos(), 0.0);
         (r, r.cross(front).normalize())
     };
 
@@ -2868,7 +2872,6 @@ async fn main() {
     loop {
         //println!("{} {}",yaw,pitch);
         //println!("{}",app_mode.label());
-        let delta = get_frame_time();
 
         // ---- Collect drag-and-dropped files into the load queue ----
         // On X11/XWayland/wasm miniquad fires files_dropped_event, so this works.
@@ -4188,7 +4191,11 @@ async fn main() {
             }
         }
 
-        if is_key_pressed(KeyCode::Tab) {
+        // Not while a text field has focus, where Tab moves to the next widget,
+        // and not with Alt held, in case the window manager lets an Alt+Tab
+        // through. Either would leave the view orbiting under a bare pointer.
+        let alt_down = is_key_down(KeyCode::LeftAlt) || is_key_down(KeyCode::RightAlt);
+        if is_key_pressed(KeyCode::Tab) && !egui_wants_keyboard_prev && !alt_down {
             grabbed = !grabbed;
             set_cursor_grab(grabbed);
             show_mouse(!grabbed);
@@ -4275,8 +4282,8 @@ async fn main() {
             pivot_locked = true;
 
             let old_front = front;
-            yaw += mouse_delta.x * delta * -LOOK_SPEED;
-            pitch += mouse_delta.y * delta * -LOOK_SPEED;
+            yaw += mouse_delta.x * -LOOK_SPEED;
+            pitch += mouse_delta.y * -LOOK_SPEED;
             pitch = pitch.clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
 
             front = vec3(
@@ -4311,7 +4318,11 @@ async fn main() {
         let camera = Camera3D {
             position,
             up,
-            target: orbit_pivot,
+            // Along `front`, not at the pivot. The pivot is where the centre
+            // ray meets the mid-height plane, and that can lie *behind* the
+            // camera — pan a side view down below mid-height, tilt to look
+            // down — and a look-at target behind the camera reverses the view.
+            target: position + front,
             projection: Projection::Orthographics,
             fovy: ortho_scale * 2.0,
             // Both are needed: `aspect` shapes the projection for the narrower
