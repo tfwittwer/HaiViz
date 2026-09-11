@@ -850,15 +850,16 @@ fn saved_status(what: String, saved: Result<(), String>) -> String {
     }
 }
 
-/// Give digitising a layer to put lines in, creating the sidecar beside the
-/// cloud if it has none yet. False, with the reason in the status line, when
-/// there is nowhere for a line to go.
+/// Give digitising a layer to put lines in — the sidecar beside the cloud,
+/// loaded if an earlier session left one, created if not. False, with the
+/// reason in the status line, when there is nowhere for a line to go.
 fn ensure_digitise_target(
     digitise: &mut vectorise::Digitise,
     poly_files: &mut Vec<polylines::PolylineFile>,
     stages: &[Stage],
     copc_stages: &[CopcStage],
     tile_mgr: &Option<TileStageManager>,
+    data_offset: [f64; 3],
 ) -> bool {
     if digitise.target.is_some() { return true; }
     // A layer has a destination from the moment it exists, because layers
@@ -871,13 +872,23 @@ fn ensure_digitise_target(
                 .map(|l| l.srs_id)
                 .find(|s| *s != 0)
                 .unwrap_or(0);
-            let t = vectorise::ensure_target(poly_files, &cloud, srs, digitise.width_px);
-            digitise.target = Some(t);
-            digitise.status = Some(format!(
-                "New lines go to {}",
-                vectorise::short_path(&poly_files[t.0].path),
-            ));
-            true
+            match vectorise::ensure_target(
+                poly_files, &cloud, srs, digitise.width_px, data_offset, digitise.color,
+            ) {
+                Ok(t) => {
+                    let pf = &poly_files[t.0];
+                    digitise.target = Some(t);
+                    digitise.status = Some(match pf.line_count() {
+                        0 => format!("New lines go to {}", pf.file_name()),
+                        n => format!("New lines are added to {} ({n} already there)", pf.file_name()),
+                    });
+                    true
+                }
+                Err(e) => {
+                    digitise.status = Some(e);
+                    false
+                }
+            }
         }
         None => {
             digitise.status = Some("Load a point cloud first.".to_string());
@@ -3517,7 +3528,7 @@ async fn main() {
             match sec_digitise_request.take() {
                 Some(vectorise::Request::Start)
                     if app_mode != AppMode::SectionCorridorLoad
-                        && ensure_digitise_target(&mut digitise, &mut poly_files, &stages, &copc_stages, &tile_mgr) => {
+                        && ensure_digitise_target(&mut digitise, &mut poly_files, &stages, &copc_stages, &tile_mgr, data_offset) => {
                     digitise.clear();
                     lasso.clear();
                     start_section_digitise = true;
@@ -5947,7 +5958,7 @@ async fn main() {
         if let Some(req) = digitise_request.take() {
             match req {
                 vectorise::Request::Start => {
-                    if ensure_digitise_target(&mut digitise, &mut poly_files, &stages, &copc_stages, &tile_mgr) {
+                    if ensure_digitise_target(&mut digitise, &mut poly_files, &stages, &copc_stages, &tile_mgr, data_offset) {
                         digitise.clear();
                         editor.drag = None;
                         editor.hover = None;

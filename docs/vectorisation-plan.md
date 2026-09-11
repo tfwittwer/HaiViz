@@ -540,6 +540,16 @@ moves. `MAX_CELLS_PER_POINT` is now a floor on the cell size that overrides
 `MAX_CELL`, taking that case to 4 MB, and it is enforced in `build_with_cell`
 too so an explicit cell size cannot bypass it.
 
+**Found later: reopening a cloud overwrote its sidecar.** `ensure_target` only
+looked among the files already loaded, so a new session created an empty
+GeoPackage for a path that already held the earlier session's lines — and the
+auto-save's mtime check could not object, because a file that was never loaded
+has no mtime. The first finished line replaced the file. It now loads an
+existing sidecar and adds to its `digitised` layer; matches files by resolved
+path rather than by string, since a cloud opened by relative path and a sidecar
+picked in a file dialog used to count as two files; and refuses to start when a
+sidecar exists but cannot be read.
+
 - A crash loses at most the line currently being drawn. That is an acceptable
   loss and much simpler than journalling in-progress geometry.
 - Whole-file rewrite cost is negligible at realistic sizes — a GeoPackage of

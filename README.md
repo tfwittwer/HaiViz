@@ -396,6 +396,11 @@ when the layer is created, because layers **auto-save** and a layer without a
 destination is not a state that can exist. Use **Into:** in the panel to send
 lines to any other loaded layer instead, including one opened from QGIS.
 
+When the cloud already has a sidecar from an earlier session, it is loaded and
+new lines are **added** to it — the panel says how many were there already. A
+sidecar that exists but cannot be read (damaged, or with a `-wal` file beside
+it) stops digitising with an explanation rather than being replaced.
+
 Saving happens when a line is finished, not on every vertex — the same
 granularity the classification sidecar uses, and for the same reason: a
 half-drawn line is not a meaningful thing to persist. **A crash loses at most

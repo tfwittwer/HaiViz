@@ -40,7 +40,7 @@
 #![allow(dead_code)]
 
 use macroquad::prelude::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::edge_follow::EdgeFollow;
 use crate::polylines::{Layer, Polyline, PolylineFile, VectorFormat};
@@ -334,30 +334,81 @@ pub fn default_vector_path(cloud_path: &str) -> String {
 
 /// Find or create the layer finished lines go into.
 ///
-/// If the sidecar is already open it is reused, so restarting digitising in one
-/// session does not fork the file. Otherwise a fresh in-memory GeoPackage is
-/// created; it reaches disk on the first finished line.
+/// Three cases, in this order:
+///
+/// 1. **The sidecar is already open** — reuse it, so restarting digitising does
+///    not fork the file. Matched by the file a path names, not by the string:
+///    a cloud opened as `scan.laz` and a sidecar picked in a file dialog as
+///    `/data/site/scan.laz.haiviz-vectors.gpkg` are the same file.
+/// 2. **It exists on disk from an earlier session** — load it and add to it.
+///    Starting a fresh one here would overwrite every line already in it on
+///    the first save: a file that was never loaded has no modification time,
+///    so the auto-save's conflict check has nothing to compare against.
+/// 3. **Neither** — a fresh in-memory GeoPackage, which reaches disk with the
+///    first finished line.
+///
+/// A sidecar that exists but cannot be read is an error rather than a reason to
+/// start again, for the same reason as case 2.
+///
+/// `origin` and `color` are what a loaded sidecar's lines are drawn with.
 pub fn ensure_target(
     files: &mut Vec<PolylineFile>,
     cloud_path: &str,
     srs_id: i32,
     width_px: f32,
-) -> (usize, usize) {
+    origin: [f64; 3],
+    color: Color,
+) -> Result<(usize, usize), String> {
     let path = default_vector_path(cloud_path);
-    if let Some(fi) = files.iter().position(|f| f.path == path) {
-        if files[fi].layers.is_empty() {
-            files[fi].layers.push(new_layer(srs_id, width_px));
+    let identity = file_identity(&path);
+    let fi = match files.iter().position(|f| file_identity(&f.path) == identity) {
+        Some(fi) => fi,
+        None if Path::new(&path).exists() => {
+            let pf = crate::polylines::load(&path, origin, color).map_err(|e| format!(
+                "{} already exists but could not be read ({e}). Move it aside before \
+                 digitising — a new layer in its place would overwrite it.",
+                short_path(&path),
+            ))?;
+            files.push(pf);
+            files.len() - 1
         }
-        return (fi, files[fi].layers.len() - 1);
-    }
-    let mut pf = PolylineFile::new(&path, VectorFormat::GeoPackage);
-    pf.layers.push(new_layer(srs_id, width_px));
-    files.push(pf);
-    (files.len() - 1, 0)
+        None => {
+            files.push(PolylineFile::new(&path, VectorFormat::GeoPackage));
+            files.len() - 1
+        }
+    };
+    let pf = &mut files[fi];
+    let li = match pf.layers.iter().position(|l| l.name == DIGITISED_LAYER) {
+        Some(li) => li,
+        None => {
+            // Joining a file that already has layers: its CRS says more about
+            // the data than a guess from whatever else is loaded.
+            let srs = pf.layers.iter().map(|l| l.srs_id).find(|s| *s != 0).unwrap_or(srs_id);
+            pf.layers.push(new_layer(srs, width_px));
+            pf.layers.len() - 1
+        }
+    };
+    Ok((fi, li))
+}
+
+/// The layer haiviz digitises into, inside the sidecar.
+const DIGITISED_LAYER: &str = "digitised";
+
+/// The file a path names, for deciding whether two paths are the same file.
+///
+/// Resolved through the filesystem, so `./`, symlinks and relative spellings
+/// all agree. A file that does not exist yet is its resolved directory joined
+/// with its name; a path that cannot be resolved at all is compared as written.
+fn file_identity(path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if let Ok(resolved) = std::fs::canonicalize(p) { return resolved; }
+    let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return p.to_path_buf() };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    std::fs::canonicalize(dir).map(|d| d.join(name)).unwrap_or_else(|_| p.to_path_buf())
 }
 
 fn new_layer(srs_id: i32, width_px: f32) -> Layer {
-    let mut l = Layer::new("digitised");
+    let mut l = Layer::new(DIGITISED_LAYER);
     l.srs_id = srs_id;
     // The layer inherits the width the line was drawn at, so a finished line
     // does not change thickness the moment it is committed.
@@ -979,14 +1030,82 @@ mod tests {
         assert_eq!(default_vector_path(cloud), "/data/site/scan.copc.laz.haiviz-vectors.gpkg");
 
         let mut files: Vec<PolylineFile> = Vec::new();
-        let (fi, li) = ensure_target(&mut files, cloud, 28992, 2.0);
+        let (fi, li) = ensure_target(&mut files, cloud, 28992, 2.0, [0.0; 3], WHITE).unwrap();
         assert_eq!((fi, li), (0, 0));
         assert_eq!(files[0].format, VectorFormat::GeoPackage);
         assert_eq!(files[0].layers[0].srs_id, 28992);
 
         // Asking again reuses it rather than forking the file.
-        let again = ensure_target(&mut files, cloud, 28992, 2.0);
+        let again = ensure_target(&mut files, cloud, 28992, 2.0, [0.0; 3], WHITE).unwrap();
         assert_eq!(again, (0, 0));
         assert_eq!(files.len(), 1);
+    }
+
+    /// A scratch directory holding a sidecar written by an "earlier session".
+    fn earlier_session(name: &str) -> (PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("haiviz-sidecar-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cloud = dir.join("cloud.laz").to_string_lossy().into_owned();
+        let mut pf = PolylineFile::new(default_vector_path(&cloud), VectorFormat::GeoPackage);
+        let mut layer = Layer::new(DIGITISED_LAYER);
+        layer.srs_id = 28992;
+        pf.layers.push(layer);
+        pf.refresh_view([0.0; 3]);
+        pf.add_line(0, Polyline::from_points("Line 1", WHITE, vec![[0.0, 0.0, 1.0], [5.0, 0.0, 1.0]]));
+        pf.save().expect("the earlier session saves");
+        (dir, cloud)
+    }
+
+    #[test]
+    fn an_existing_sidecar_is_added_to_not_overwritten() {
+        let (dir, cloud) = earlier_session("reopen");
+
+        // A new session: nothing loaded, the sidecar sitting on disk.
+        let mut files: Vec<PolylineFile> = Vec::new();
+        let target = ensure_target(&mut files, &cloud, 0, 2.0, [0.0; 3], WHITE).expect("loads it");
+        assert_eq!(files[0].line_count(), 1, "the earlier line is loaded, not discarded");
+        assert_eq!(files[0].layers[target.1].srs_id, 28992);
+
+        let mut dig = Digitise { target: Some(target), ..Default::default() };
+        dig.push([0.0, 10.0, 1.0]);
+        dig.push([5.0, 10.0, 1.0]);
+        let fi = dig.finish(&mut files, false).unwrap();
+        assert!(!files[fi].changed_on_disk(), "loading recorded the mtime the conflict check needs");
+        files[fi].save().unwrap();
+
+        let back = crate::polylines::load(&default_vector_path(&cloud), [0.0; 3], WHITE).unwrap();
+        assert_eq!(back.line_count(), 2, "both sessions' lines are in the file");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_same_sidecar_under_another_spelling_is_not_opened_twice() {
+        let (dir, cloud) = earlier_session("spelling");
+        let mut files = vec![
+            crate::polylines::load(&default_vector_path(&cloud), [0.0; 3], WHITE).unwrap(),
+        ];
+        // As a cloud opened by a relative path, or one with a `./` in it, would
+        // spell it.
+        let respelled = dir.join(".").join("cloud.laz").to_string_lossy().into_owned();
+        assert_ne!(default_vector_path(&respelled), files[0].path);
+        let target = ensure_target(&mut files, &respelled, 0, 2.0, [0.0; 3], WHITE).unwrap();
+        assert_eq!(target.0, 0);
+        assert_eq!(files.len(), 1, "a second copy would be saved over the first");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unreadable_sidecar_is_refused_and_left_alone() {
+        let (dir, cloud) = earlier_session("corrupt");
+        let path = default_vector_path(&cloud);
+        let garbage = b"SQLite format 3\0this is not a database".to_vec();
+        std::fs::write(&path, &garbage).unwrap();
+
+        let mut files: Vec<PolylineFile> = Vec::new();
+        let refused = ensure_target(&mut files, &cloud, 0, 2.0, [0.0; 3], WHITE);
+        assert!(refused.as_ref().is_err_and(|e| e.contains("Move it aside")), "{:?}", refused.map(|_| ()));
+        assert!(files.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), garbage, "and nothing was written over it");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
