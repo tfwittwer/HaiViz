@@ -616,6 +616,17 @@ COPC file loaded together, would have been quietly wrong. They are replaced by
 `snap_z_candidates`, which appends raw candidates so `resolve_snap` pools them
 and ranks once. `pick_world_point` from phase 3 is gone, superseded as planned.
 
+**Found later: on a slanted surface the snap sat a radius to one side.**
+"Frontmost point within the radius" picks the *edge* of the tube wherever the
+surface is not square to the view: the tube meets a façade seen obliquely in a
+long ellipse, whose nearest end is off to the camera-facing side — so the marker
+sat 0.2 m left or right of the cursor, flipping with the side of the house.
+`spatial::surface_hit` now searches the thinnest tube that finds anything,
+from one pixel doubling up to the radius. Separately, the ray was measured from
+the near plane 100 km behind the camera, where f32 cannot resolve a
+centimetre; it is now unprojected in f64 and started where it enters the loaded
+data.
+
 ## 10. Work package F — edge following
 
 Livewire / intelligent scissors, adapted to point clouds. **3D / oblique view

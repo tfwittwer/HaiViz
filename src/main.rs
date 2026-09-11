@@ -471,15 +471,41 @@ fn cloud_source_path(
 /// every point in front of the camera has a positive distance along this ray —
 /// which is what lets `nearest_ray` reject everything behind the operator.
 fn cursor_ray(view_proj: &glam::Mat4, mx: f32, my: f32, view: ViewRect) -> ([f32; 3], [f32; 3]) {
-    let inv = view_proj.inverse();
+    let (o, d) = cursor_ray_f64(view_proj, mx, my, view);
+    (o.as_vec3().to_array(), d.as_vec3().to_array())
+}
+
+/// [`cursor_ray`] in double precision.
+///
+/// The near plane sits 100 km behind the camera. At that magnitude an f32
+/// coordinate cannot resolve a centimetre, and neither can the matrix inverse
+/// that finds it, so the unprojection is done in f64 and callers that need
+/// precision move the origin up to the data before narrowing it.
+fn cursor_ray_f64(view_proj: &glam::Mat4, mx: f32, my: f32, view: ViewRect) -> (glam::DVec3, glam::DVec3) {
+    let inv = view_proj.as_dmat4().inverse();
     let (ndc_x, ndc_y) = view.ndc(mx, my);
-    let unproject = |z: f32| {
-        let p = inv * glam::Vec4::new(ndc_x, ndc_y, z, 1.0);
-        glam::Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w)
+    let unproject = |z: f64| {
+        let p = inv * glam::DVec4::new(ndc_x as f64, ndc_y as f64, z, 1.0);
+        p.truncate() / p.w
     };
     let near = unproject(-1.0);
-    let dir = (unproject(1.0) - near).normalize_or_zero();
-    ([near.x, near.y, near.z], [dir.x, dir.y, dir.z])
+    (near, (unproject(1.0) - near).normalize_or_zero())
+}
+
+/// How far along a ray it enters an axis-aligned box, or `None` when it
+/// misses. Negative when the origin is already inside.
+fn ray_box_entry(o: glam::DVec3, d: glam::DVec3, lo: glam::DVec3, hi: glam::DVec3) -> Option<f64> {
+    let (mut t0, mut t1) = (f64::NEG_INFINITY, f64::INFINITY);
+    for i in 0..3 {
+        if d[i].abs() < 1e-12 {
+            if o[i] < lo[i] || o[i] > hi[i] { return None; }
+            continue;
+        }
+        let (a, b) = ((lo[i] - o[i]) / d[i], (hi[i] - o[i]) / d[i]);
+        t0 = t0.max(a.min(b));
+        t1 = t1.min(a.max(b));
+    }
+    (t0 <= t1).then_some(t0)
 }
 
 /// Screen right and screen up, as unit vectors in viewer space.
@@ -576,37 +602,59 @@ fn resolve_snap(
         world: [0.0; 3], quality: SnapQuality::Empty, note: Some(note.to_string()),
     };
 
-    let (origin, dir) = cursor_ray(view_proj, mx, my, view);
+    let (ray_o, ray_d) = cursor_ray_f64(view_proj, mx, my, view);
     let r = dig.radius;
 
+    // Start the ray where it enters the loaded data, not at the near plane
+    // 100 km back. Every point a snap can find is still in front of it, and
+    // the distances along and across the ray become small numbers that f32 —
+    // which the grids work in — resolves to well under a millimetre. From the
+    // near plane, the tube test itself had centimetres of noise in it.
+    let start = loaded_aabb_viewer(stages, copc_stages, tile_mgr)
+        .and_then(|(lo, hi)| {
+            let pad = glam::DVec3::splat(r as f64 + 1.0);
+            ray_box_entry(ray_o, ray_d, lo.as_dvec3() - pad, hi.as_dvec3() + pad)
+        })
+        .filter(|t| *t > 0.0)
+        .map_or(ray_o, |t| ray_o + ray_d * t);
+    let (origin, dir) = (start.as_vec3().to_array(), ray_d.as_vec3().to_array());
+
+    // One screen pixel in metres, under the orthographic camera: the first
+    // row of the matrix scales world metres along screen-right into NDC.
+    let pixel = {
+        let row = glam::Vec3::new(view_proj.x_axis.x, view_proj.y_axis.x, view_proj.z_axis.x);
+        2.0 / (row.length() * view.w.max(1.0)).max(1e-9)
+    };
+
     // Where on the surface the cursor is pointing. Every mode except
-    // `Existing` starts from this.
-    let mut anchor: Option<[f32; 3]> = None;
-    let mut best_t = f32::INFINITY;
-    for st in stages {
-        if !st.visible { continue; }
-        if let Some(h) = st.snap_nearest_ray(origin, dir, r)
-            && h.t < best_t { best_t = h.t; anchor = Some(h.pos); }
-    }
-    for cs in copc_stages {
-        if !cs.visible { continue; }
-        if let Some((h, _)) = cs.snap_nearest_ray(origin, dir, r)
-            && h.t < best_t { best_t = h.t; anchor = Some(h.pos); }
-    }
-    if let Some(mgr) = tile_mgr
-        && let Some((_, h)) = mgr.snap_nearest_ray(origin, dir, r)
-        && h.t < best_t { anchor = Some(h.pos); }
+    // `Existing` starts from this. The thinnest tube that finds anything, from
+    // about a pixel up to the snap radius — not the frontmost point in the
+    // whole radius, which on a slanted wall is a radius off to one side. See
+    // `spatial::surface_hit`.
+    let anchor: Option<[f32; 3]> = crate::spatial::surface_hit(pixel, r, |tube| {
+        let mut best: Option<(f32, [f32; 3])> = None;
+        for st in stages.iter().filter(|s| s.visible) {
+            if let Some(h) = st.snap_nearest_ray(origin, dir, tube)
+                && best.is_none_or(|(t, _)| h.t < t) { best = Some((h.t, h.pos)); }
+        }
+        for cs in copc_stages.iter().filter(|c| c.visible) {
+            if let Some((h, _)) = cs.snap_nearest_ray(origin, dir, tube)
+                && best.is_none_or(|(t, _)| h.t < t) { best = Some((h.t, h.pos)); }
+        }
+        if let Some(mgr) = tile_mgr
+            && let Some((_, h)) = mgr.snap_nearest_ray(origin, dir, tube)
+            && best.is_none_or(|(t, _)| h.t < t) { best = Some((h.t, h.pos)); }
+        best.map(|(_, pos)| pos)
+    });
 
     if dig.snap_mode == SnapMode::Existing {
         // Against the ray, not against a point on the surface: the cursor may
         // be over a gap in the cloud, and tying into an existing line is
         // exactly what one does there.
-        let o = [
-            origin[0] as f64 + data_offset[0],
-            origin[1] as f64 + data_offset[1],
-            origin[2] as f64 + data_offset[2],
-        ];
-        let d = [dir[0] as f64, dir[1] as f64, dir[2] as f64];
+        // From the near plane, in f64: a polyline need not lie inside the
+        // cloud's box, so the shifted start could be past one.
+        let o = (ray_o + glam::DVec3::from_array(data_offset)).to_array();
+        let d = ray_d.to_array();
         return match polylines::nearest_on_lines_to_ray(poly_files, o, d, r as f64, exclude) {
             Some((w, _)) => SnapHit::good(w),
             None => empty("No polyline within the snap radius."),

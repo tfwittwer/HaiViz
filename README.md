@@ -315,7 +315,7 @@ thing at every zoom level, which is what makes a snap reproducible.
 
 | Mode | What it takes | Good for |
 |------|---------------|----------|
-| **Nearest point** | The nearest real point to the cursor ray | General tracing; works from any camera angle |
+| **Nearest point** | The real point under the cursor — the first surface along its line of sight, reaching out to the radius only over gaps | General tracing; works from any camera angle |
 | **Low Z** | A low percentile of Z within the radius | Gutters, ditch invert, toe of slope |
 | **High Z** | A high percentile of Z within the radius | Kerb top, crest, cable, roof ridge |
 | **Same Z as previous** | The cursor's XY at the previous vertex's height | Contours, breaklines |

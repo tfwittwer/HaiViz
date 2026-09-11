@@ -589,6 +589,29 @@ pub struct CellRef<'a> {
     pub points: &'a [u32],
 }
 
+/// The point under the cursor: the frontmost hit in the **thinnest** tube
+/// around the ray that holds anything. `query` is tried at `r_min`, then at
+/// double that, and so on up to `r_max`.
+///
+/// [`SpatialGrid::nearest_ray`] on its own returns the frontmost point within
+/// its whole tolerance — and wherever a surface is not square to the view, that
+/// point sits at the *edge* of the tolerance rather than on the axis. The tube
+/// meets a slanted façade in a long ellipse, and the ellipse's nearest end is
+/// off to the side facing the camera: a snap marker a full radius left or right
+/// of the cursor, flipping with the side of the building it is over. Growing
+/// the tube from about a pixel keeps "the surface facing you" and bounds the
+/// offset by the thinnest tube that finds a point — on the order of the point
+/// spacing — while a cursor over a gap still reaches out to the full radius.
+pub fn surface_hit<T>(r_min: f32, r_max: f32, mut query: impl FnMut(f32) -> Option<T>) -> Option<T> {
+    let r_max = r_max.max(1e-4);
+    let mut r = r_min.clamp(1e-4, r_max);
+    loop {
+        if let Some(hit) = query(r) { return Some(hit); }
+        if r >= r_max { return None; }
+        r = (r * 2.0).min(r_max);
+    }
+}
+
 /// Nearest-rank `pct`-th percentile of Z over `candidates`, and the point that
 /// realises it. Shared by [`SpatialGrid::percentile_in_radius`] and by callers
 /// that have merged candidates from several tiles or COPC nodes into one list —
@@ -629,6 +652,60 @@ fn bounds_xy(positions: &[[f32; 3]]) -> ([f32; 2], [f32; 2]) {
         max[1] = max[1].max(p[1]);
     }
     (min, max)
+}
+
+#[cfg(test)]
+mod surface_hit_tests {
+    // Unused when the bench includes this file by path; see `tests` below.
+    #[allow(unused_imports)]
+    use super::*;
+
+    fn perp(p: [f32; 3], o: [f32; 3], d: [f32; 3]) -> f32 {
+        let v = [p[0] - o[0], p[1] - o[1], p[2] - o[2]];
+        let t = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
+        ((v[0] - t * d[0]).powi(2) + (v[1] - t * d[1]).powi(2) + (v[2] - t * d[2]).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn the_snap_lands_under_the_cursor_on_a_slanted_wall() {
+        // A façade on y = 10 at 2 cm spacing, looked at 14° off its surface —
+        // an oblique view of a house front.
+        let mut pts = Vec::new();
+        for i in 0..500 {
+            for k in 0..300 {
+                pts.push([-5.0 + i as f32 * 0.02, 10.0, k as f32 * 0.02]);
+            }
+        }
+        let grid = SpatialGrid::build(&pts);
+        let l = (1.0f32 + 0.25 * 0.25 + 0.1 * 0.1).sqrt();
+        let d = [1.0 / l, 0.25 / l, -0.1 / l];
+        let aim = [0.31, 10.0, 3.05];
+        let o = [aim[0] - d[0] * 50.0, aim[1] - d[1] * 50.0, aim[2] - d[2] * 50.0];
+
+        // The whole radius at once: the frontmost point is at the tube's edge.
+        // This is the bug as reported — a marker a radius to one side.
+        let edge = grid.nearest_ray(&pts, o, d, 0.2, NO_FILTER).unwrap();
+        assert!(perp(edge.pos, o, d) > 0.15, "expected the edge of the tube, got {}", perp(edge.pos, o, d));
+
+        let hit = surface_hit(0.01, 0.2, |r| grid.nearest_ray(&pts, o, d, r, NO_FILTER)).unwrap();
+        assert!(perp(hit.pos, o, d) < 0.045, "{} m off the line of sight", perp(hit.pos, o, d));
+        assert!((hit.pos[1] - 10.0).abs() < 1e-4, "and still on the wall");
+    }
+
+    #[test]
+    fn over_a_gap_the_tube_widens_to_the_radius_and_no_further() {
+        let pts = vec![[0.0, 0.0, 0.0], [0.15, 0.0, 0.0]];
+        let grid = SpatialGrid::build(&pts);
+        let (o, d) = ([0.1, 0.0, 10.0], [0.0, 0.0, -1.0]);
+
+        let hit = surface_hit(0.01, 0.2, |r| grid.nearest_ray(&pts, o, d, r, NO_FILTER));
+        assert_eq!(hit.map(|h| h.pos), Some([0.15, 0.0, 0.0]), "the nearer of the two, found by widening");
+
+        let mut tried = Vec::new();
+        let none = surface_hit(0.01, 0.03, |r| { tried.push(r); grid.nearest_ray(&pts, o, d, r, NO_FILTER) });
+        assert!(none.is_none());
+        assert_eq!(tried, vec![0.01, 0.02, 0.03], "doubles, then stops at the radius");
+    }
 }
 
 #[cfg(test)]
