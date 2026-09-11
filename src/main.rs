@@ -1,5 +1,5 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 //use rfd;
 use log::{info,error};
 //use console::style;
@@ -7,7 +7,7 @@ use crate::glam::vec3;
 
 use macroquad::prelude::*;
 
-use crate::raw_miniquad::{ClassDefs, ClassVis, CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, build_section_from_raw_stages, build_section_from_stages, classification_color, default_class_label, load_class_defs, make_section_data, save_class_defs, scan_dir_for_copc};
+use crate::raw_miniquad::{ClassDefs, ClassVis, CopcStage, EdlRenderer, SectionData, Stage, TileStageManager, build_section_from_raw_stages, build_section_from_stages, classification_color, default_class_label, load_class_defs, load_class_defs_from, make_section_data, save_class_defs_to, scan_dir_for_copc, DEFAULT_CLASS_FILE};
 use crate::classify::{ClassMask, effective_class};
 use las::Point as LasPoint;
 
@@ -1920,23 +1920,47 @@ fn gcp_section(
     });
 }
 
-/// Built-in editor for classification labels & colours (classes.txt).
+/// The file dialog for class definitions, opening beside the current file so a
+/// set kept with a project is one click away.
+fn class_file_dialog(current: Option<&Path>) -> rfd::FileDialog {
+    let mut dialog = rfd::FileDialog::new()
+        .add_filter("Class definitions", &["txt"])
+        .add_filter("All files", &["*"]);
+    match current {
+        Some(p) => {
+            let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if let Some(dir) = p.parent() { dialog = dialog.set_directory(dir); }
+            if let Some(name) = p.file_name() { dialog = dialog.set_file_name(name.to_string_lossy()); }
+        }
+        None => dialog = dialog.set_file_name(DEFAULT_CLASS_FILE),
+    }
+    dialog
+}
+
+/// Built-in editor for classification labels & colours.
 /// Lists every class id up to the maximum present in the loaded data, plus any
 /// ids already defined beyond that; missing entries are seeded from the default
 /// palette/labels when the window is first opened. Returns `true` when a colour
-/// was edited or the file was reloaded, i.e. when point colours need a rebuild.
+/// was edited or a file was loaded, i.e. when point colours need a rebuild.
 /// Label-only edits update the defs in place and need no rebuild.
+///
+/// `class_file` is where the definitions came from or were last saved to —
+/// what **Save** and **Reload** act on. `None` until one is loaded or saved,
+/// in which case **Save** writes `classes.txt` in the launch directory, as it
+/// always has.
 fn classes_section(
     ui: &mut egui_macroquad::egui::Ui,
     class_defs: &mut Option<ClassDefs>,
     class_vis: &mut ClassVis,
     max_class: u8,
+    class_file: &mut Option<PathBuf>,
     save_status: &mut Option<String>,
 ) -> bool {
     use egui_macroquad::egui;
     let mut colors_changed = false;
     panel_section(ui, "Classes", false, |ui| {
-            let mut do_reload = false;
+            // Acted on after the buttons, outside the borrow of the definitions.
+            let (mut save, mut load): (Option<PathBuf>, Option<PathBuf>) = (None, None);
             {
                 let defs = class_defs.get_or_insert_with(ClassDefs::new);
                 let mut ids: Vec<u8> = (0..=max_class).collect();
@@ -2008,22 +2032,60 @@ fn classes_section(
                 }
                 ui.label("Visibility does not affect export — use Omit classes for that.");
                 ui.separator();
+                ui.label(match class_file.as_ref() {
+                    Some(p) => format!("File: {}", p.display()),
+                    None => format!("File: none — Save writes {DEFAULT_CLASS_FILE} where haiviz was started"),
+                });
                 ui.horizontal(|ui| {
-                    if ui.button("Save classes.txt").clicked() {
-                        *save_status = Some(match save_class_defs(defs) {
-                            Ok(()) => format!("Saved {} classes to classes.txt", defs.len()),
-                            Err(e) => format!("Save failed: {}", e),
-                        });
+                    let target = class_file.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_CLASS_FILE));
+                    if ui.button("Save")
+                        .on_hover_text(format!("Write to {}", target.display()))
+                        .clicked() {
+                        save = Some(target);
                     }
-                    if ui.button("Reload").clicked() {
-                        do_reload = true;
+                    if ui.button("Save As…").clicked()
+                        && let Some(p) = class_file_dialog(class_file.as_deref()).save_file() {
+                        save = Some(p);
+                    }
+                    if ui.button("Load…")
+                        .on_hover_text("Replace these definitions with a file's")
+                        .clicked()
+                        && let Some(p) = class_file_dialog(class_file.as_deref()).pick_file() {
+                        load = Some(p);
+                    }
+                    if ui.add_enabled(class_file.is_some(), egui::Button::new("Reload"))
+                        .on_hover_text("Re-read the file, discarding unsaved edits")
+                        .clicked() {
+                        load = class_file.clone();
                     }
                 });
+                if let Some(path) = save {
+                    *save_status = Some(match save_class_defs_to(defs, &path) {
+                        Ok(()) => {
+                            let msg = format!("Saved {} classes to {}", defs.len(), path.display());
+                            *class_file = Some(path);
+                            msg
+                        }
+                        Err(e) => format!("Save failed: {e}"),
+                    });
+                }
             }
-            if do_reload {
-                *class_defs = load_class_defs();
-                *save_status = None;
-                colors_changed = true;
+            if let Some(path) = load {
+                // A file that cannot be read leaves the current definitions as
+                // they are, rather than falling back to the built-in defaults.
+                *save_status = Some(match load_class_defs_from(&path) {
+                    Ok((defs, skipped)) => {
+                        let mut msg = format!("Loaded {} classes from {}", defs.len(), path.display());
+                        if skipped > 0 {
+                            msg.push_str(&format!(" — {skipped} unreadable line{} skipped", if skipped == 1 { "" } else { "s" }));
+                        }
+                        *class_defs = Some(defs);
+                        *class_file = Some(path);
+                        colors_changed = true;
+                        msg
+                    }
+                    Err(e) => format!("Load failed: {e}"),
+                });
             }
             if let Some(msg) = save_status {
                 ui.label(msg.as_str());
@@ -2401,6 +2463,8 @@ async fn main() {
     if is_copc { info!("Detected COPC format"); }
 
     let mut class_defs = load_class_defs();
+    // The file the definitions came from, for Save and Reload.
+    let mut class_file: Option<PathBuf> = class_defs.as_ref().map(|_| PathBuf::from(DEFAULT_CLASS_FILE));
     if let Some(ref cd) = class_defs {
         info!("Custom classes: {:?}", cd.keys().collect::<Vec<_>>());
     }
@@ -3460,7 +3524,7 @@ async fn main() {
                         }
                 });
                 panel_section(ui, "Classification", false, |ui| {
-                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
+                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
                     export_request = export_section(
                         ui, &mut reveal_export, &mut export_filter,
                         &mut export_job, &mut export_status, &export_sources,
@@ -4742,7 +4806,7 @@ async fn main() {
                         max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                         &mut apply_ground_lasso, &mut cancel_ground_lasso,
                     ) { start_ground_lasso = Some(kind); }
-                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
+                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
                     export_request = export_section(
                         ui, &mut reveal_export, &mut export_filter,
                         &mut export_job, &mut export_status, &export_sources,
@@ -5217,7 +5281,7 @@ async fn main() {
                         max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                         &mut apply_ground_lasso, &mut cancel_ground_lasso,
                     ) { start_ground_lasso = Some(kind); }
-                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
+                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
                     export_request = export_section(
                         ui, &mut reveal_export, &mut export_filter,
                         &mut export_job, &mut export_status, &export_sources,
@@ -5744,7 +5808,7 @@ async fn main() {
                         max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                         &mut apply_ground_lasso, &mut cancel_ground_lasso,
                     ) { start_ground_lasso = Some(kind); }
-                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut classes_save_status);
+                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
                     export_request = export_section(
                         ui, &mut reveal_export, &mut export_filter,
                         &mut export_job, &mut export_status, &export_sources,

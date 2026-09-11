@@ -644,11 +644,7 @@ It lists every classification id present in the data (plus any extras defined in
 your file), and for each id you can edit its **colour** and **label**. Changes
 apply immediately when colouring by **Classification**.
 
-Definitions are stored in a `classes.txt` file in the **current working
-directory** — the directory haiviz was launched from, not the one holding the
-point cloud. Definitions therefore persist across sessions only if you relaunch
-from the same place; started elsewhere, haiviz falls back to the built-in
-defaults and **Save classes.txt** writes a fresh file there. The format is:
+Definitions live in plain text files, one class per line:
 
 ```
 # id;r;g;b;label
@@ -656,8 +652,20 @@ defaults and **Save classes.txt** writes a fresh file there. The format is:
 5;0;128;0;High vegetation
 ```
 
-- **Save classes.txt** writes the current definitions to disk.
-- **Reload** re-reads `classes.txt`, discarding unsaved edits.
+At startup haiviz reads `classes.txt` from the **directory it was launched
+from**, if there is one. Any other file can be used as well, so a set of classes
+can be kept with a project and reused:
+
+- **Load…** replaces the current definitions with a file's. A file with no
+  readable definitions is refused and the current set kept; lines that cannot
+  be read are skipped and counted in the status line.
+- **Save** writes back to the file shown above the buttons — the one last
+  loaded or saved. If there is none yet, it writes `classes.txt` in the launch
+  directory.
+- **Save As…** writes to a file you choose, which then becomes the current one.
+- **Reload** re-reads the current file, discarding unsaved edits.
+
+The file dialogs open beside the current file.
 
 The per-row visibility checkboxes are covered under
 [Class visibility](#class-visibility); they are a view setting and are not

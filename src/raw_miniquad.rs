@@ -3,7 +3,7 @@
     use std::fs::File;
     use std::io::BufReader;
     use std::path::Path;
-    use ::log::{info,error};
+    use ::log::{info, error, warn};
 
 
     use las::{Point, Reader};
@@ -79,37 +79,65 @@
     /// as a bare `-1.0` at either end.
     pub const HIDDEN_COLOR: [f32; 3] = [-1.0, 0.0, 0.0];
 
-    /// Load class definitions from classes.txt in the current directory.
-    /// Format: id;r;g;b;label  (one per line, # for comments)
+    /// The class-definitions file read at startup: `classes.txt` in the
+    /// directory haiviz was launched from.
+    pub const DEFAULT_CLASS_FILE: &str = "classes.txt";
+
+    /// Load [`DEFAULT_CLASS_FILE`], if there is one. Startup only; any other
+    /// file is loaded on request, with [`load_class_defs_from`].
     pub fn load_class_defs() -> Option<ClassDefs> {
-        let path = Path::new("classes.txt");
+        let path = Path::new(DEFAULT_CLASS_FILE);
         if !path.exists() { return None; }
-        let content = std::fs::read_to_string(path).ok()?;
+        match load_class_defs_from(path) {
+            Ok((defs, _)) => Some(defs),
+            Err(e) => {
+                warn!("{e}");
+                None
+            }
+        }
+    }
+
+    /// Read class definitions from a file. Format: `id;r;g;b;label`, one per
+    /// line, `#` for comments; the label may itself contain `;`.
+    ///
+    /// Returns the definitions and the number of non-comment lines that could
+    /// not be read — counted rather than silently dropped, because a file
+    /// loaded on purpose that half-parses should say so. A file with no
+    /// definitions at all is an error: replacing the current set with nothing
+    /// is never what loading a file meant.
+    pub fn load_class_defs_from(path: &Path) -> Result<(ClassDefs, usize), String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let mut defs = HashMap::new();
+        let mut skipped = 0;
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') { continue; }
             let parts: Vec<&str> = line.splitn(5, ';').collect();
-            if parts.len() < 5 { continue; }
-            if let (Ok(id), Ok(r), Ok(g), Ok(b)) = (
+            let parsed = (parts.len() == 5).then(|| (
                 parts[0].trim().parse::<u8>(),
                 parts[1].trim().parse::<u8>(),
                 parts[2].trim().parse::<u8>(),
                 parts[3].trim().parse::<u8>(),
-            ) {
-                let label = parts[4].trim().to_string();
-                defs.insert(id, (label, [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]));
+            ));
+            match parsed {
+                Some((Ok(id), Ok(r), Ok(g), Ok(b))) => {
+                    let label = parts[4].trim().to_string();
+                    defs.insert(id, (label, [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]));
+                }
+                _ => skipped += 1,
             }
         }
-        if defs.is_empty() { None } else {
-            info!("Loaded {} class definitions from classes.txt", defs.len());
-            Some(defs)
+        if defs.is_empty() {
+            return Err(format!("{}: no class definitions (expected id;r;g;b;label lines)", path.display()));
         }
+        info!("Loaded {} class definitions from {}", defs.len(), path.display());
+        Ok((defs, skipped))
     }
 
-    /// Write class definitions to classes.txt in the current directory,
-    /// in the same format `load_class_defs` reads: id;r;g;b;label.
-    pub fn save_class_defs(defs: &ClassDefs) -> std::io::Result<()> {
+    /// Write class definitions to a file, in the format
+    /// [`load_class_defs_from`] reads.
+    pub fn save_class_defs_to(defs: &ClassDefs, path: &Path) -> std::io::Result<()> {
         let mut ids: Vec<u8> = defs.keys().copied().collect();
         ids.sort();
         let mut out = String::from("# id;r;g;b;label\n");
@@ -121,10 +149,11 @@
                 (c[0] * 255.0).round() as u8,
                 (c[1] * 255.0).round() as u8,
                 (c[2] * 255.0).round() as u8,
-                label,
+                // A line break in a label would split the entry in two.
+                label.replace(['\n', '\r'], " "),
             ));
         }
-        std::fs::write("classes.txt", out)
+        std::fs::write(path, out)
     }
 
     /// Default ASPRS label for a class id, used to seed the class editor for
@@ -3070,3 +3099,55 @@
         }
     }
 //}
+
+#[cfg(test)]
+mod class_file_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("haiviz-classes-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn class_definitions_round_trip_through_any_file() {
+        let dir = scratch("roundtrip");
+        let mut defs = ClassDefs::new();
+        defs.insert(2, ("Ground".to_string(), [139.0 / 255.0, 69.0 / 255.0, 19.0 / 255.0]));
+        // A label may contain the separator, and a line break must not split
+        // the entry.
+        defs.insert(40, ("Rail; left\nside".to_string(), [1.0, 0.0, 0.5]));
+
+        let path = dir.join("project-classes.txt");
+        save_class_defs_to(&defs, &path).expect("saves");
+        let (back, skipped) = load_class_defs_from(&path).expect("loads");
+        assert_eq!(skipped, 0);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[&2], defs[&2], "colours survive exactly at 8 bits");
+        assert_eq!(back[&40].0, "Rail; left side");
+        assert_eq!(back[&40].1, [1.0, 0.0, 128.0 / 255.0]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_class_file_with_no_definitions_is_refused() {
+        let dir = scratch("empty");
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "# just a comment\nthis is not a class file\n").unwrap();
+        assert!(load_class_defs_from(&path).is_err(), "loading it would wipe the current set");
+        assert!(load_class_defs_from(&dir.join("missing.txt")).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreadable_lines_are_counted_not_silently_dropped() {
+        let dir = scratch("partial");
+        let path = dir.join("classes.txt");
+        std::fs::write(&path, "# id;r;g;b;label\n2;139;69;19;Ground\n5;0;x;0;Veg\n300;0;0;0;Too big\n").unwrap();
+        let (defs, skipped) = load_class_defs_from(&path).expect("one line is good");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(skipped, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
