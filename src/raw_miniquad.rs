@@ -1526,9 +1526,22 @@
 
         /// Apply EDL post-process to the default framebuffer.
         /// Call after the draw_visible call; replaces end_render_pass.
-        pub fn apply(&self, ctx: &mut dyn RenderingBackend, strength: f32) {
+        /// Composite the shaded offscreen image into `viewport` of the default
+        /// framebuffer.
+        ///
+        /// The target rect is passed in rather than assumed to be the whole
+        /// window: the docked panel takes the left edge, and the offscreen
+        /// target is sized to what is left, so the full-screen quad has to land
+        /// on exactly that region or the image is stretched across the panel.
+        pub fn apply(
+            &self,
+            ctx: &mut dyn RenderingBackend,
+            strength: f32,
+            viewport: (i32, i32, i32, i32),
+        ) {
             ctx.end_render_pass();
             ctx.begin_default_pass(PassAction::Nothing);
+            ctx.apply_viewport(viewport.0, viewport.1, viewport.2, viewport.3);
             ctx.apply_pipeline(&self.edl_pipeline);
             ctx.apply_bindings(&self.quad_bindings);
             ctx.apply_uniforms(UniformsSource::table(&edl_shader::Uniforms {

@@ -99,6 +99,10 @@ collapsible sections — **Controls**, **Classes**, **Polylines**, **Ground
 Control Points** and **Export**. Drag its inner edge to resize it. It is docked
 left so that the view cube in the top-right corner stays clear.
 
+The 3D and section views render **beside** the panel rather than underneath it,
+so nothing is hidden behind it and **Zoom All** frames into the space you can
+actually see.
+
 ## Navigation
 
 The 3D view uses an orthographic camera shared across all modes:
@@ -231,7 +235,8 @@ external GeoPackage round-trips without its coordinates being quantised.
 Each loaded file is listed as a tree — file, then layer, then line — where you
 can:
 
-- toggle a **layer**'s visibility and set its **EPSG** code,
+- toggle a **layer**'s visibility, set its **EPSG** code and its drawn
+  **width** in pixels,
 - select a polyline,
 - change its **colour**,
 - adjust its **radius** (line thickness, in metres — this sets how wide it draws
@@ -274,8 +279,19 @@ instead, at the previous vertex's height, which is what lets you draw across a
 gap in the data.
 
 `Backspace` removes the last vertex, `Enter` finishes the line, `Esc` discards
-it and a second `Esc` leaves digitising. The panel shows the running vertex
-count, total length, and the last segment's length, ΔZ and slope.
+it and a second `Esc` leaves digitising.
+
+A readout follows the cursor with the distance and height difference to the
+previous vertex, its slope, and the running total — so the numbers are where
+you are looking rather than off in the panel. When a snap is refused, the reason
+appears there too. The panel carries the same figures for the line as drawn so
+far.
+
+Lines are drawn as real 3D geometry, so they are hidden by the points in front
+of them. That is what lets you tell where a line actually sits rather than
+merely where it projects to. **Eye-dome lighting is the exception** — it
+composites through an offscreen buffer that the overlays do not share a depth
+buffer with, so with **EDL: ON** the lines draw over the cloud.
 
 ### Snapping
 

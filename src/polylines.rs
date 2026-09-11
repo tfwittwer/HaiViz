@@ -37,6 +37,7 @@
 // has only its tests for callers.
 #![allow(dead_code)]
 
+use macroquad::models::{Mesh, Vertex, draw_mesh};
 use macroquad::prelude::*;
 use crate::gpkg;
 use std::collections::BTreeMap;
@@ -677,38 +678,79 @@ fn visible_lines(files: &[PolylineFile]) -> impl Iterator<Item = (PolyRef, &Poly
     })
 }
 
-/// Draw all visible polylines over the 3D view.
+/// Draw a polyline as a ribbon of camera-facing quads.
 ///
-/// Projected to screen and drawn in 2D rather than with `draw_line_3d`, for two
-/// reasons: `draw_line_3d` has no width, and this has to run in the same pass
-/// as the GCP markers — before egui composites — or the lines end up drawn on
-/// top of the panel. Call after `set_default_camera()`.
-pub fn draw_3d(files: &[PolylineFile], view_proj: &glam::Mat4) {
-    let (sw, sh) = (screen_width(), screen_height());
-    for (at, pl) in visible_lines(files) {
-        let width = files[at.file].layers[at.layer].width_px.max(0.5);
-        for (a, b) in pl.segments() {
-            let Some(p) = project_clipped(view_proj, pl.view[a], sw, sh) else { continue };
-            let Some(q) = project_clipped(view_proj, pl.view[b], sw, sh) else { continue };
-            draw_line(p.0, p.1, q.0, q.1, width, pl.color);
-            // Round the joins, or a thick polyline shows a notch at every
-            // vertex where two segments meet at an angle.
-            if width > 2.0 {
-                draw_circle(q.0, q.1, width * 0.5, pl.color);
-            }
+/// `draw_line_3d` has no width and a screen-space 2D line has no depth, and
+/// both of those matter here: a thin line is hard to see against a dense cloud,
+/// and a line that draws over the points in front of it gives no clue where it
+/// actually sits. Real geometry under the 3D camera gets both — macroquad's
+/// 3D pipeline depth-tests, and the cloud pass writes depth.
+///
+/// `half_width` is in world units; the caller converts from pixels so the line
+/// keeps its apparent thickness at any zoom.
+pub fn draw_ribbon_3d(
+    pts: &[glam::Vec3],
+    closed: bool,
+    half_width: f32,
+    color: Color,
+    view_dir: glam::Vec3,
+) {
+    if pts.len() < 2 { return; }
+    let segments: Vec<(usize, usize)> = (0..pts.len() - 1).map(|i| (i, i + 1))
+        .chain(if closed && pts.len() > 2 { Some((pts.len() - 1, 0)) } else { None })
+        .collect();
+
+    let mut mesh = Mesh { vertices: Vec::new(), indices: Vec::new(), texture: None };
+    // `indices` is u16, so a mesh holds at most 65535 vertices — four per
+    // segment. Flush well short of that rather than wrapping round silently.
+    const MAX_QUADS: usize = 8_000;
+
+    for (a, b) in segments {
+        let (p, q) = (pts[a], pts[b]);
+        let along = q - p;
+        if along.length_squared() <= 0.0 { continue; }
+        // Perpendicular to both the segment and the view direction, so the
+        // ribbon always faces the camera and never collapses to a hairline.
+        let mut off = along.cross(view_dir);
+        if off.length_squared() < 1e-12 {
+            // Segment pointing straight at the camera: any perpendicular will
+            // do, and this one is stable.
+            off = along.cross(glam::Vec3::Z).normalize_or_zero();
+            if off.length_squared() < 1e-12 { off = glam::Vec3::X; }
+        }
+        let off = off.normalize_or_zero() * half_width;
+
+        let base = mesh.vertices.len() as u16;
+        for v in [p - off, p + off, q + off, q - off] {
+            mesh.vertices.push(Vertex::new(v.x, v.y, v.z, 0.0, 0.0, color));
+        }
+        mesh.indices.extend_from_slice(&[
+            base, base + 1, base + 2, base, base + 2, base + 3,
+        ]);
+        if mesh.vertices.len() >= MAX_QUADS * 4 {
+            draw_mesh(&mesh);
+            mesh.vertices.clear();
+            mesh.indices.clear();
         }
     }
+    if !mesh.vertices.is_empty() { draw_mesh(&mesh); }
 }
 
-/// Project to screen, rejecting anything behind the camera or implausibly far
-/// off screen — an unclipped projection wraps a behind-camera vertex round to
-/// the opposite side and draws a line across the whole view.
-fn project_clipped(vp: &glam::Mat4, p: [f32; 3], sw: f32, sh: f32) -> Option<(f32, f32)> {
-    let clip = *vp * glam::Vec4::new(p[0], p[1], p[2], 1.0);
-    if clip.w <= 0.0 { return None; }
-    let (nx, ny) = (clip.x / clip.w, clip.y / clip.w);
-    if !nx.is_finite() || !ny.is_finite() || nx.abs() > 50.0 || ny.abs() > 50.0 { return None; }
-    Some(((nx + 1.0) / 2.0 * sw, (1.0 - ny) / 2.0 * sh))
+/// Draw all visible polylines in the 3D view.
+///
+/// Call with the 3D camera active, before `set_default_camera()` — that is what
+/// keeps the lines behind the panel and in front of only the points they are
+/// actually in front of.
+///
+/// `metres_per_pixel` converts each layer's pixel width into world units.
+pub fn draw_3d(files: &[PolylineFile], view_dir: glam::Vec3, metres_per_pixel: f32) {
+    for (at, pl) in visible_lines(files) {
+        let width_px = files[at.file].layers[at.layer].width_px.max(0.5);
+        let pts: Vec<glam::Vec3> = pl.view.iter().map(|p| glam::Vec3::from(*p)).collect();
+        draw_ribbon_3d(
+            &pts, pl.closed, width_px * 0.5 * metres_per_pixel, pl.color, view_dir,
+        );
+    }
 }
 
 /// Draw polylines projected into section view 2D space.
@@ -722,9 +764,11 @@ pub fn draw_section(
     depth: f32,
     section_pan: glam::Vec2,
     section_zoom: f32,
-    sw: f32,
-    sh: f32,
+    // The (x, y, w, h) rect the section view renders into — not the window,
+    // which the docked panel no longer fills.
+    view: (f32, f32, f32, f32),
 ) {
+    let (sw, sh) = (view.2, view.3);
     let dx = section_end.0 - section_start.0;
     let dy = section_end.1 - section_start.1;
     let len = (dx * dx + dy * dy).sqrt();
@@ -739,8 +783,8 @@ pub fn draw_section(
     let half_h = section_zoom;
     let half_w = half_h * aspect;
 
-    let to_sx = |wx: f32| (wx - (section_pan.x - half_w)) / (2.0 * half_w) * sw;
-    let to_sy = |wy: f32| (1.0 - (wy - (section_pan.y - half_h)) / (2.0 * half_h)) * sh;
+    let to_sx = |wx: f32| view.0 + (wx - (section_pan.x - half_w)) / (2.0 * half_w) * sw;
+    let to_sy = |wy: f32| view.1 + (1.0 - (wy - (section_pan.y - half_h)) / (2.0 * half_h)) * sh;
 
     for (_, pl) in visible_lines(files) {
         if pl.view.len() < 2 { continue; }

@@ -308,70 +308,57 @@ pub fn target_label(files: &[PolylineFile], fi: usize, li: usize) -> String {
 
 /// Draw the line in progress, the rubber band, and the snap marker.
 ///
-/// Projected and drawn in 2D for the same reasons as `polylines::draw_3d`:
-/// `draw_line_3d` has no width, and this has to composite before egui or the
-/// overlay lands on top of the panel. Call after `set_default_camera()`.
-///
-/// The snap circle is built in **world** space and projected vertex by vertex,
-/// so it keeps showing the true radius in metres rather than becoming a fixed
-/// blob on screen.
+/// Under the 3D camera, before `set_default_camera()`, so the overlay is
+/// depth-tested against the cloud and still composites beneath the panel.
 pub fn draw_overlay(
     dig: &Digitise,
     origin: [f64; 3],
-    view_proj: &glam::Mat4,
+    view_dir: Vec3,
+    metres_per_pixel: f32,
     cursor: Option<[f64; 3]>,
     drawing: bool,
 ) {
-    let (sw, sh) = (screen_width(), screen_height());
-    let to_screen = |p: [f64; 3]| project_world(view_proj, p, origin, sw, sh);
-    let w = dig.width_px.max(0.5);
-
-    let pts: Vec<Option<(f32, f32)>> = dig.pending.iter().map(|p| to_screen(*p)).collect();
-    for pair in pts.windows(2) {
-        if let (Some(a), Some(b)) = (pair[0], pair[1]) {
-            draw_line(a.0, a.1, b.0, b.1, w, dig.color);
-        }
-    }
-    // Every committed vertex gets a marker: on a dense cloud the line alone
-    // does not show where the operator actually clicked.
-    for p in pts.iter().flatten() {
-        draw_circle_lines(p.0, p.1, (w * 1.6).max(3.0), 1.0, dig.color);
-    }
-    if drawing
-        && let (Some(Some(last)), Some(c)) = (pts.last(), cursor)
-        && let Some(cs) = to_screen(c) {
-        let faint = Color::new(dig.color.r, dig.color.g, dig.color.b, 0.5);
-        draw_line(last.0, last.1, cs.0, cs.1, w, faint);
-    }
-
-    if drawing { draw_snap_marker(dig, origin, view_proj); }
-}
-
-fn project_world(
-    vp: &glam::Mat4, p: [f64; 3], origin: [f64; 3], sw: f32, sh: f32,
-) -> Option<(f32, f32)> {
-    let v = glam::Vec4::new(
+    let to_view = |p: [f64; 3]| vec3(
         (p[0] - origin[0]) as f32,
         (p[1] - origin[1]) as f32,
         (p[2] - origin[2]) as f32,
-        1.0,
     );
-    let clip = *vp * v;
-    if clip.w <= 0.0 { return None; }
-    let (nx, ny) = (clip.x / clip.w, clip.y / clip.w);
-    if !nx.is_finite() || !ny.is_finite() || nx.abs() > 50.0 || ny.abs() > 50.0 { return None; }
-    Some(((nx + 1.0) / 2.0 * sw, (1.0 - ny) / 2.0 * sh))
+    let half = dig.width_px.max(0.5) * 0.5 * metres_per_pixel;
+
+    let pts: Vec<Vec3> = dig.pending.iter().map(|p| to_view(*p)).collect();
+    crate::polylines::draw_ribbon_3d(&pts, false, half, dig.color, view_dir);
+
+    // Every committed vertex gets a marker: on a dense cloud the line alone
+    // does not show where the operator actually clicked.
+    let tick = (half * 3.0).max(metres_per_pixel * 3.0);
+    for p in &pts {
+        draw_line_3d(*p - vec3(tick, 0.0, 0.0), *p + vec3(tick, 0.0, 0.0), dig.color);
+        draw_line_3d(*p - vec3(0.0, tick, 0.0), *p + vec3(0.0, tick, 0.0), dig.color);
+        draw_line_3d(*p - vec3(0.0, 0.0, tick), *p + vec3(0.0, 0.0, tick), dig.color);
+    }
+
+    if drawing
+        && let (Some(&last), Some(c)) = (pts.last(), cursor) {
+        let faint = Color::new(dig.color.r, dig.color.g, dig.color.b, 0.55);
+        crate::polylines::draw_ribbon_3d(&[last, to_view(c)], false, half, faint, view_dir);
+    }
+
+    if drawing { draw_snap_marker(dig, origin); }
 }
 
 /// Draw the snap marker and the radius circle at the candidate vertex.
 ///
 /// A cross, like `measure_a` / `measure_b`, so it reads the same way as the
 /// other precision tools. The circle sits at the *snapped* Z rather than at the
-/// cursor's, so what it encloses is what the percentile was taken over.
-fn draw_snap_marker(dig: &Digitise, origin: [f64; 3], view_proj: &glam::Mat4) {
+/// cursor's, so what it encloses is what the percentile was taken over — and
+/// it is built in world units, so it keeps showing the true radius in metres.
+fn draw_snap_marker(dig: &Digitise, origin: [f64; 3]) {
     let Some(hit) = &dig.hover else { return };
-    let (sw, sh) = (screen_width(), screen_height());
-    let to_screen = |p: [f64; 3]| project_world(view_proj, p, origin, sw, sh);
+    let to_view = |p: [f64; 3]| vec3(
+        (p[0] - origin[0]) as f32,
+        (p[1] - origin[1]) as f32,
+        (p[2] - origin[2]) as f32,
+    );
     let color = match hit.quality {
         SnapQuality::Good => dig.color,
         // Visibly different, not merely dimmer: a coarse snap is a refusal,
@@ -380,31 +367,98 @@ fn draw_snap_marker(dig: &Digitise, origin: [f64; 3], view_proj: &glam::Mat4) {
         SnapQuality::Empty => Color::new(0.9, 0.25, 0.25, 1.0),
     };
 
-    let r = dig.radius as f64;
-    let c = hit.world;
-    // Three world-space arms, so the cross shrinks with the radius and stays
-    // an honest indication of scale.
-    for axis in 0..3 {
-        let mut a = c;
-        let mut b = c;
-        a[axis] -= r * 0.6;
-        b[axis] += r * 0.6;
-        if let (Some(p), Some(q)) = (to_screen(a), to_screen(b)) {
-            draw_line(p.0, p.1, q.0, q.1, 1.5, color);
-        }
-    }
+    let c = to_view(hit.world);
+    let r = dig.radius;
+    let arm = r * 0.6;
+    draw_line_3d(c - vec3(arm, 0.0, 0.0), c + vec3(arm, 0.0, 0.0), color);
+    draw_line_3d(c - vec3(0.0, arm, 0.0), c + vec3(0.0, arm, 0.0), color);
+    draw_line_3d(c - vec3(0.0, 0.0, arm), c + vec3(0.0, 0.0, arm), color);
 
     const SEGMENTS: usize = 40;
     let faint = Color::new(color.r, color.g, color.b, 0.5);
-    let mut prev: Option<(f32, f32)> = None;
-    for i in 0..=SEGMENTS {
-        let a = i as f64 / SEGMENTS as f64 * std::f64::consts::TAU;
-        let here = to_screen([c[0] + r * a.cos(), c[1] + r * a.sin(), c[2]]);
-        if let (Some(p), Some(q)) = (prev, here) {
-            draw_line(p.0, p.1, q.0, q.1, 1.0, faint);
-        }
-        prev = here;
+    let mut prev = vec3(c.x + r, c.y, c.z);
+    for i in 1..=SEGMENTS {
+        let a = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+        let next = vec3(c.x + r * a.cos(), c.y + r * a.sin(), c.z);
+        draw_line_3d(prev, next, faint);
+        prev = next;
     }
+}
+
+/// Distance and height difference to the previous vertex, drawn beside the
+/// cursor.
+///
+/// The panel carries the same numbers, but reading them means looking away from
+/// the point being placed — and the whole job is placing it precisely. Drawn
+/// under the default camera, in screen space, so the text stays the same size
+/// at any zoom.
+pub fn draw_cursor_readout(dig: &Digitise, mx: f32, my: f32) {
+    let Some(hit) = &dig.hover else { return };
+
+    const SIZE: f32 = 16.0;
+    let mut lines: Vec<(String, Color)> = Vec::new();
+    let warn = Color::new(1.0, 0.65, 0.25, 1.0);
+
+    if hit.is_placeable() {
+        if let Some(prev) = dig.last() {
+            let run = ((hit.world[0] - prev[0]).powi(2)
+                     + (hit.world[1] - prev[1]).powi(2)).sqrt();
+            let dz = hit.world[2] - prev[2];
+            let d = (run * run + dz * dz).sqrt();
+            lines.push((format!("{d:.3} m   ΔZ {dz:+.3} m"), WHITE));
+            if run > 0.0 {
+                lines.push((format!("{:+.1}%   plan {run:.3} m", dz / run * 100.0), LIGHTGRAY));
+            } else {
+                lines.push(("vertical".to_string(), LIGHTGRAY));
+            }
+            let (total, _) = dig.lengths();
+            lines.push((
+                format!("total {:.3} m ({} pts)", total + d, dig.pending.len() + 1),
+                LIGHTGRAY,
+            ));
+        } else {
+            // Nothing to measure from yet, but the height being committed to is
+            // still worth seeing before the click.
+            lines.push((format!("Z {:.3} m", hit.world[2]), WHITE));
+        }
+    } else {
+        // A refusal is more use beside the cursor than buried in the panel.
+        let note = hit.note.clone().unwrap_or_else(|| "Cannot snap here.".to_string());
+        for chunk in wrap(&note, 44) { lines.push((chunk, warn)); }
+    }
+    if lines.is_empty() { return; }
+
+    let w = lines.iter()
+        .map(|(t, _)| measure_text(t, None, SIZE as u16, 1.0).width)
+        .fold(0.0_f32, f32::max);
+    let h = lines.len() as f32 * (SIZE + 2.0);
+
+    // Keep the box on screen and out from under the cursor.
+    let mut x = mx + 18.0;
+    let mut y = my + 18.0;
+    if x + w + 12.0 > screen_width() { x = mx - w - 24.0; }
+    if y + h + 10.0 > screen_height() { y = my - h - 18.0; }
+
+    draw_rectangle(x - 6.0, y - 4.0, w + 12.0, h + 8.0, Color::new(0.0, 0.0, 0.0, 0.62));
+    for (i, (text, color)) in lines.iter().enumerate() {
+        draw_text(text, x, y + SIZE + i as f32 * (SIZE + 2.0) - 3.0, SIZE, *color);
+    }
+}
+
+/// Break a message into lines of at most `width` characters, on word
+/// boundaries.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() { line.push(' '); }
+        line.push_str(word);
+    }
+    if !line.is_empty() { out.push(line); }
+    out
 }
 
 /// The digitising panel, called from all three per-mode egui blocks.

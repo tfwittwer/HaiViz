@@ -350,10 +350,52 @@ impl LassoKind {
 }*/
 
 /// Unproject screen coordinates to world XY plane at given Z height.
-fn screen_to_world_xy(sx: f32, sy: f32, view_proj: &glam::Mat4, z_plane: f32) -> Option<(f32, f32)> {
+/// The part of the window the 3D and section views render into.
+///
+/// The panel is docked to the left edge, and the views render to the right of
+/// it rather than underneath it — so the data is never hidden behind the panel
+/// and Zoom All frames into what can actually be seen. Everything that converts
+/// between window pixels and normalised device coordinates goes through this:
+/// a projection that still assumed the whole window would put every pick a
+/// panel-width out.
+#[derive(Clone, Copy)]
+struct ViewRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl ViewRect {
+    fn aspect(&self) -> f32 { self.w / self.h.max(1.0) }
+
+    /// Normalised device coordinates for a window pixel.
+    fn ndc(&self, sx: f32, sy: f32) -> (f32, f32) {
+        ((sx - self.x) / self.w.max(1.0) * 2.0 - 1.0,
+         1.0 - (sy - self.y) / self.h.max(1.0) * 2.0)
+    }
+
+    /// Window pixel for a normalised device position.
+    fn to_screen(self, nx: f32, ny: f32) -> (f32, f32) {
+        (self.x + (nx + 1.0) * 0.5 * self.w, self.y + (1.0 - ny) * 0.5 * self.h)
+    }
+
+    /// As GL wants it: origin at the bottom-left of the window.
+    fn gl(&self) -> (i32, i32, i32, i32) {
+        (
+            self.x.round() as i32,
+            (screen_height() - self.y - self.h).round() as i32,
+            self.w.max(1.0).round() as i32,
+            self.h.max(1.0).round() as i32,
+        )
+    }
+}
+
+fn screen_to_world_xy(
+    sx: f32, sy: f32, view_proj: &glam::Mat4, z_plane: f32, view: ViewRect,
+) -> Option<(f32, f32)> {
     let inv = view_proj.inverse();
-    let ndc_x = sx / screen_width() * 2.0 - 1.0;
-    let ndc_y = 1.0 - sy / screen_height() * 2.0;
+    let (ndc_x, ndc_y) = view.ndc(sx, sy);
 
     let near = inv * glam::Vec4::new(ndc_x, ndc_y, -1.0, 1.0);
     let far = inv * glam::Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
@@ -391,10 +433,9 @@ fn cloud_source_path(
 /// Under an orthographic camera the near plane sits far behind the data, so
 /// every point in front of the camera has a positive distance along this ray —
 /// which is what lets `nearest_ray` reject everything behind the operator.
-fn cursor_ray(view_proj: &glam::Mat4, mx: f32, my: f32) -> ([f32; 3], [f32; 3]) {
+fn cursor_ray(view_proj: &glam::Mat4, mx: f32, my: f32, view: ViewRect) -> ([f32; 3], [f32; 3]) {
     let inv = view_proj.inverse();
-    let ndc_x = mx / screen_width() * 2.0 - 1.0;
-    let ndc_y = 1.0 - my / screen_height() * 2.0;
+    let (ndc_x, ndc_y) = view.ndc(mx, my);
     let unproject = |z: f32| {
         let p = inv * glam::Vec4::new(ndc_x, ndc_y, z, 1.0);
         glam::Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w)
@@ -419,6 +460,7 @@ fn resolve_snap(
     view_proj: &glam::Mat4,
     mx: f32,
     my: f32,
+    view: ViewRect,
     data_offset: [f64; 3],
     dig: &vectorise::Digitise,
 ) -> vectorise::SnapHit {
@@ -432,7 +474,7 @@ fn resolve_snap(
         world: [0.0; 3], quality: SnapQuality::Empty, note: Some(note.to_string()),
     };
 
-    let (origin, dir) = cursor_ray(view_proj, mx, my);
+    let (origin, dir) = cursor_ray(view_proj, mx, my, view);
     let r = dig.radius;
 
     // Where on the surface the cursor is pointing. Every mode except
@@ -531,13 +573,9 @@ fn resolve_snap(
 }
 
 /// Project a world position to screen coordinates.
-fn world_to_screen(pos: glam::Vec3, view_proj: &glam::Mat4) -> (f32, f32) {
+fn world_to_screen(pos: glam::Vec3, view_proj: &glam::Mat4, view: ViewRect) -> (f32, f32) {
     let clip = *view_proj * glam::Vec4::new(pos.x, pos.y, pos.z, 1.0);
-    let ndc_x = clip.x / clip.w;
-    let ndc_y = clip.y / clip.w;
-    let sx = (ndc_x + 1.0) / 2.0 * screen_width();
-    let sy = (1.0 - ndc_y) / 2.0 * screen_height();
-    (sx, sy)
+    view.to_screen(clip.x / clip.w, clip.y / clip.w)
 }
 
 /// Draw the section corridor as 3D wireframe box.
@@ -2157,6 +2195,10 @@ async fn main() {
     let mut poly_files: Vec<polylines::PolylineFile> = Vec::new();
     let mut selected_poly: Option<polylines::PolyRef> = None;
     let mut poly_save_status: Option<String> = None;
+    // Width the docked panel actually took, in window pixels. Measured inside
+    // the egui pass, which runs after the view is rendered, so it lands one
+    // frame later — invisible except while dragging the panel edge.
+    let mut panel_px: f32 = 0.0;
     let mut digitise = vectorise::Digitise::default();
     // Set by the panel or by `P`, acted on once below rather than in each of
     // the three per-mode blocks.
@@ -2287,7 +2329,9 @@ async fn main() {
                 stages.push(s);
             }
             if was_empty {
-                let aspect = screen_width() / screen_height().max(1.0);
+                // Framed into the space beside the panel. This runs before `view_rect` is
+                // built for the frame, so the width is taken directly.
+                let aspect = (screen_width() - panel_px).max(32.0) / screen_height().max(1.0);
                 ortho_scale = (data_extent_y * 0.5).max(data_extent_x * 0.5 / aspect) * 1.05;
                 position = vec3(data_extent_x * 0.5, data_extent_y * 0.5, height_range * 0.5)
                     - front * (data_extent_x.max(data_extent_y) * 2.0);
@@ -2345,6 +2389,16 @@ async fn main() {
         // it here rather than assumed to be current. A no-op — one float
         // comparison per file — unless the origin actually moved.
         for pf in poly_files.iter_mut() { pf.refresh_view(data_offset); }
+
+        // The views render beside the panel, not under it. Computed once here
+        // because the section view and the 3D view both need it and the
+        // section view runs first.
+        let view_rect = ViewRect {
+            x: panel_px.clamp(0.0, (screen_width() - 32.0).max(0.0)),
+            y: 0.0,
+            w: (screen_width() - panel_px).max(32.0),
+            h: screen_height().max(1.0),
+        };
         // Same treatment for the visible class set. Unlike the height band this
         // is baked into the colour buffers, so a change — including a file
         // arriving unfiltered while a filter is on — has to force a rebuild.
@@ -2456,7 +2510,7 @@ async fn main() {
             let sec_mouse_delta = sec_mouse_pos - last_mouse_position;
             last_mouse_position = sec_mouse_pos;
             if is_mouse_button_down(MouseButton::Right) {
-                let units_per_pixel = section_zoom * 2.0 / screen_height();
+                let units_per_pixel = section_zoom * 2.0 / view_rect.h.max(1.0);
                 section_pan.x -= sec_mouse_delta.x * units_per_pixel;
                 section_pan.y += sec_mouse_delta.y * units_per_pixel;
             }
@@ -2519,7 +2573,7 @@ async fn main() {
             clear_background(background);
 
             if let Some(ref sec) = section_data {
-                let aspect = screen_width() / screen_height();
+                let aspect = view_rect.aspect();
                 let half_h = section_zoom;
                 let half_w = half_h * aspect;
                 let section_mvp = glam::Mat4::orthographic_rh_gl(
@@ -2532,6 +2586,8 @@ async fn main() {
                     let mut gl = unsafe { get_internal_gl() };
                     gl.flush();
                     gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
+                    let vp = view_rect.gl();
+                    gl.quad_context.apply_viewport(vp.0, vp.1, vp.2, vp.3);
                     if let Some(stg) = stages.first() {
                         stg.draw_section(&mut *gl.quad_context, sec, &section_mvp, point_size);
                     } else if let Some(ref mgr) = tile_mgr {
@@ -2545,22 +2601,22 @@ async fn main() {
                 set_default_camera();
 
                 let world_to_screen_x = |wx: f32| -> f32 {
-                    (wx - (section_pan.x - half_w)) / (2.0 * half_w) * screen_width()
+                    view_rect.x + (wx - (section_pan.x - half_w)) / (2.0 * half_w) * view_rect.w
                 };
                 let world_to_screen_y = |wy: f32| -> f32 {
-                    (1.0 - (wy - (section_pan.y - half_h)) / (2.0 * half_h)) * screen_height()
+                    view_rect.y + (1.0 - (wy - (section_pan.y - half_h)) / (2.0 * half_h)) * view_rect.h
                 };
 
                 let ground_sy = world_to_screen_y(0.0);
-                if ground_sy > 0.0 && ground_sy < screen_height() {
-                    draw_line(0.0, ground_sy, screen_width(), ground_sy, 1.0, Color::new(0.4, 0.4, 0.4, 0.5));
+                if ground_sy > view_rect.y && ground_sy < view_rect.y + view_rect.h {
+                    draw_line(view_rect.x, ground_sy, view_rect.x + view_rect.w, ground_sy, 1.0, Color::new(0.4, 0.4, 0.4, 0.5));
                     draw_text("0m", 5.0, ground_sy - 3.0, 16.0, GRAY);
                 }
 
                 let sx0 = world_to_screen_x(0.0);
                 let sx1 = world_to_screen_x(sec.length);
-                draw_line(sx0, 0.0, sx0, screen_height(), 1.0, Color::new(0.4, 0.4, 0.0, 0.5));
-                draw_line(sx1, 0.0, sx1, screen_height(), 1.0, Color::new(0.4, 0.4, 0.0, 0.5));
+                draw_line(sx0, view_rect.y, sx0, view_rect.y + view_rect.h, 1.0, Color::new(0.4, 0.4, 0.0, 0.5));
+                draw_line(sx1, view_rect.y, sx1, view_rect.y + view_rect.h, 1.0, Color::new(0.4, 0.4, 0.0, 0.5));
                 draw_text("start", sx0 + 3.0, 30.0, 16.0, YELLOW);
                 draw_text(&format!("{:.1}m", sec.length), sx1 + 3.0, 30.0, 16.0, YELLOW);
 
@@ -2570,7 +2626,7 @@ async fn main() {
                             &poly_files, start, end,
                             section_depth,
                             section_pan, section_zoom,
-                            screen_width(), screen_height(),
+                            (view_rect.x, view_rect.y, view_rect.w, view_rect.h),
                         );
 
                 }
@@ -2582,6 +2638,7 @@ async fn main() {
                             section_depth, sec.length,
                             section_pan, section_zoom,
                             selected_gcp,
+                            (view_rect.x, view_rect.y, view_rect.w, view_rect.h),
                         );
                 }
 
@@ -2663,13 +2720,18 @@ async fn main() {
             if let Some(msg) = &corridor_status {
                 let font_size = 20.0;
                 let dims = measure_text(msg, None, font_size as u16, 1.0);
-                let (bx, by) = ((screen_width() - dims.width) * 0.5, screen_height() * 0.5);
+                // Centred in the view, not the window — half of it would sit
+                // under the panel otherwise.
+                let (bx, by) = (
+                    view_rect.x + (view_rect.w - dims.width) * 0.5,
+                    view_rect.y + view_rect.h * 0.5,
+                );
                 draw_rectangle(bx - 14.0, by - dims.height - 10.0,
                     dims.width + 28.0, dims.height + 22.0, Color::new(0.0, 0.0, 0.0, 0.72));
                 draw_text(msg, bx, by, font_size, YELLOW);
                 let hint = "Esc to cancel";
                 let hd = measure_text(hint, None, 16, 1.0);
-                draw_text(hint, (screen_width() - hd.width) * 0.5, by + 22.0, 16.0, GRAY);
+                draw_text(hint, view_rect.x + (view_rect.w - hd.width) * 0.5, by + 22.0, 16.0, GRAY);
             }
 
             let prev_color_mode = section_color_mode;
@@ -2870,6 +2932,8 @@ panel_section(ui, "Controls", true, |ui| {
                 gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
                     });
                 });
+                // What the panel actually took, so the view renders beside it.
+                panel_px = egui_ctx.available_rect().min.x * egui_ctx.pixels_per_point();
             });
 
             // A narrowed band should drive the height ramp too: colouring
@@ -3127,12 +3191,12 @@ panel_section(ui, "Controls", true, |ui| {
 
             // ---- Section measure click handling ----
             if !egui_wants_sec_pointer && is_mouse_button_pressed(MouseButton::Left) {
-                let aspect = screen_width() / screen_height();
                 let half_h = section_zoom;
-                let half_w = half_h * aspect;
+                let half_w = half_h * view_rect.aspect();
                 let (mx, my) = mouse_position();
-                let wx = (mx / screen_width()) * 2.0 * half_w + (section_pan.x - half_w);
-                let wy = (1.0 - my / screen_height()) * 2.0 * half_h + (section_pan.y - half_h);
+                let (ndc_x, ndc_y) = view_rect.ndc(mx, my);
+                let wx = section_pan.x + ndc_x * half_w;
+                let wy = section_pan.y + ndc_y * half_h;
                 let pos = glam::Vec2::new(wx, wy);
                 match app_mode {
                     AppMode::SectionLasso => {
@@ -3424,7 +3488,7 @@ panel_section(ui, "Controls", true, |ui| {
             // 1:1 with the cursor — the point under the pointer stays under it.
             // Any multiplier here makes the cloud outrun the mouse and shoot
             // off screen on a short drag.
-            let units_per_pixel = ortho_scale * 2.0 / screen_height();
+            let units_per_pixel = ortho_scale * 2.0 / view_rect.h.max(1.0);
             position -= right * mouse_delta.x * units_per_pixel;
             position += up * mouse_delta.y * units_per_pixel;
         }
@@ -3437,6 +3501,10 @@ panel_section(ui, "Controls", true, |ui| {
             target: orbit_pivot,
             projection: Projection::Orthographics,
             fovy: ortho_scale * 2.0,
+            // Both are needed: `aspect` shapes the projection for the narrower
+            // rect, `viewport` puts macroquad's own drawing inside it.
+            aspect: Some(view_rect.aspect()),
+            viewport: Some(view_rect.gl()),
             z_far: 100000.0,
             z_near: -100000.0,
             ..Default::default()
@@ -3446,7 +3514,10 @@ panel_section(ui, "Controls", true, |ui| {
         //println!("{}",view_proj);
 
         let (mx, my) = macroquad::input::mouse_position();
-        let cursor_world = screen_to_world_xy(mx, my, &view_proj, mid_z);
+        let cursor_world = screen_to_world_xy(mx, my, &view_proj, mid_z, view_rect);
+        // World units one screen pixel spans, under the orthographic camera.
+        // Turns a pixel width into the world-space geometry that carries it.
+        let metres_per_pixel = ortho_scale * 2.0 / view_rect.h.max(1.0);
 
         if app_mode == AppMode::GroundLasso {
             if !ui_has_pointer && is_mouse_button_pressed(MouseButton::Left)
@@ -3475,7 +3546,7 @@ panel_section(ui, "Controls", true, |ui| {
                     let z_view = digitise.last()
                         .map(|p| (p[2] - data_offset[2]) as f32)
                         .unwrap_or(mid_z);
-                    if let Some((wx, wy)) = screen_to_world_xy(mx, my, &view_proj, z_view) {
+                    if let Some((wx, wy)) = screen_to_world_xy(mx, my, &view_proj, z_view, view_rect) {
                         digitise.push([
                             wx as f64 + data_offset[0],
                             wy as f64 + data_offset[1],
@@ -3490,7 +3561,7 @@ panel_section(ui, "Controls", true, |ui| {
                     // something the operator did not ask for.
                     let hit = resolve_snap(
                         &stages, &copc_stages, &tile_mgr, &poly_files,
-                        &view_proj, mx, my, data_offset, &digitise,
+                        &view_proj, mx, my, view_rect, data_offset, &digitise,
                     );
                     if hit.is_placeable() {
                         digitise.push(hit.world);
@@ -3516,7 +3587,7 @@ panel_section(ui, "Controls", true, |ui| {
         digitise.hover = if app_mode == AppMode::Digitise && !ui_has_pointer {
             Some(resolve_snap(
                 &stages, &copc_stages, &tile_mgr, &poly_files,
-                &view_proj, mx, my, data_offset, &digitise,
+                &view_proj, mx, my, view_rect, data_offset, &digitise,
             ))
         } else {
             None
@@ -3568,21 +3639,25 @@ panel_section(ui, "Controls", true, |ui| {
             let drawn = {
                 let mut gl = unsafe { get_internal_gl() };
                 gl.flush();
+                // Sized to the view rather than the window, so the EDL target
+                // is exactly the region it will be composited into.
+                let vp = view_rect.gl();
                 edl_renderer.resize_if_needed(
                     &mut *gl.quad_context,
-                    screen_width() as u32,
-                    screen_height() as u32,
+                    vp.2.max(1) as u32,
+                    vp.3.max(1) as u32,
                 );
                 if edl_enabled {
                     edl_renderer.begin(&mut *gl.quad_context);
                 } else {
                     gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
+                    gl.quad_context.apply_viewport(vp.0, vp.1, vp.2, vp.3);
                 }
                 let drawn: i32 = stages.iter()
                     .map(|s| s.draw_visible(&mut *gl.quad_context, &view_proj, point_size))
                     .sum();
                 if edl_enabled {
-                    edl_renderer.apply(&mut *gl.quad_context, edl_strength);
+                    edl_renderer.apply(&mut *gl.quad_context, edl_strength, vp);
                 } else {
                     gl.quad_context.end_render_pass();
                 }
@@ -3594,6 +3669,19 @@ panel_section(ui, "Controls", true, |ui| {
                 cursor_world, section_depth, mid_z, height_range, ortho_scale,
                 &ground_lasso, class_color_mq(classify_target, &class_defs),
             );
+            // Vector overlays are real 3D geometry, so they are occluded by the
+            // points in front of them — which is the only way to judge where a
+            // line actually sits. Drawn here, under the 3D camera and before
+            // the panel composites.
+            if !poly_files.is_empty() {
+                polylines::draw_3d(&poly_files, front, metres_per_pixel);
+            }
+            if app_mode == AppMode::Digitise || digitise.is_drawing() {
+                vectorise::draw_overlay(
+                    &digitise, data_offset, front, metres_per_pixel,
+                    digitise_cursor, app_mode == AppMode::Digitise,
+                );
+            }
 
             set_default_camera();
 
@@ -3835,6 +3923,8 @@ panel_section(ui, "Controls", true, |ui| {
                 gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
                     });
                 });
+                // What the panel actually took, so the view renders beside it.
+                panel_px = egui_ctx.available_rect().min.x * egui_ctx.pixels_per_point();
             });
 
             // A narrowed band should drive the height ramp too: colouring
@@ -3862,16 +3952,13 @@ panel_section(ui, "Controls", true, |ui| {
             // size at any zoom and are never swallowed by the cloud. Drawn
             // before egui so the panels still sit on top.
             if !gcp_files.is_empty() {
-                gcp::draw_3d(&gcp_files, data_offset, &view_proj, selected_gcp);
-            }
-            if !poly_files.is_empty() {
-                polylines::draw_3d(&poly_files, &view_proj);
-            }
-            if app_mode == AppMode::Digitise || digitise.is_drawing() {
-                vectorise::draw_overlay(
-                    &digitise, data_offset, &view_proj, digitise_cursor,
-                    app_mode == AppMode::Digitise,
+                gcp::draw_3d(
+                    &gcp_files, data_offset, &view_proj, selected_gcp,
+                    (view_rect.x, view_rect.y, view_rect.w, view_rect.h),
                 );
+            }
+            if app_mode == AppMode::Digitise && !ui_has_pointer {
+                vectorise::draw_cursor_readout(&digitise, mx, my);
             }
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
@@ -3887,7 +3974,7 @@ panel_section(ui, "Controls", true, |ui| {
             if do_zoom_all
                 && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr)
             {
-                let aspect = screen_width() / screen_height().max(1.0);
+                let aspect = view_rect.aspect();
                 let center = (lo + hi) * 0.5;
                 let ext = hi - lo;
                 ortho_scale = (ext.y * 0.5).max(ext.x * 0.5 / aspect) * 1.05;
@@ -3901,11 +3988,10 @@ panel_section(ui, "Controls", true, |ui| {
                 let mut best: Option<(usize, usize, f32)> = None;
                 for (si, s) in stages.iter().enumerate() {
                     if !s.visible { continue; }
-                    if let Some(idx) = s.find_nearest_point(view_proj, mx, my, screen_width(), screen_height()) {
+                    if let Some(idx) = s.find_nearest_point(view_proj, mx - view_rect.x, my - view_rect.y, view_rect.w, view_rect.h) {
                         let pos = s.positions[idx];
                         let p = *view_proj * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
-                        let ndc_x = mx / screen_width() * 2.0 - 1.0;
-                        let ndc_y = 1.0 - my / screen_height() * 2.0;
+                        let (ndc_x, ndc_y) = view_rect.ndc(mx, my);
                         let d = (p.x / p.w - ndc_x).powi(2) + (p.y / p.w - ndc_y).powi(2);
                         if best.map_or(true, |(_, _, bd)| d < bd) {
                             best = Some((si, idx, d));
@@ -3961,7 +4047,7 @@ panel_section(ui, "Controls", true, |ui| {
                         }
                     }
                     AppMode::View3D => {
-                        selected_poly = polylines::pick(&poly_files, &view_proj, mx, my, screen_width(), screen_height(), 12.0);
+                        selected_poly = polylines::pick(&poly_files, &view_proj, mx - view_rect.x, my - view_rect.y, view_rect.w, view_rect.h, 12.0);
                     }
                     _ => {}
                 }
@@ -4031,19 +4117,23 @@ panel_section(ui, "Controls", true, |ui| {
             let drawn = {
                 let mut gl = unsafe { get_internal_gl() };
                 gl.flush();
+                // Sized to the view rather than the window, so the EDL target
+                // is exactly the region it will be composited into.
+                let vp = view_rect.gl();
                 edl_renderer.resize_if_needed(
                     &mut *gl.quad_context,
-                    screen_width() as u32,
-                    screen_height() as u32,
+                    vp.2.max(1) as u32,
+                    vp.3.max(1) as u32,
                 );
                 if edl_enabled {
                     edl_renderer.begin(&mut *gl.quad_context);
                 } else {
                     gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
+                    gl.quad_context.apply_viewport(vp.0, vp.1, vp.2, vp.3);
                 }
                 let drawn: i32 = copc_stages.iter().map(|cs| cs.draw_visible(&mut *gl.quad_context, &view_proj, point_size)).sum();
                 if edl_enabled {
-                    edl_renderer.apply(&mut *gl.quad_context, edl_strength);
+                    edl_renderer.apply(&mut *gl.quad_context, edl_strength, vp);
                 } else {
                     gl.quad_context.end_render_pass();
                 }
@@ -4055,6 +4145,19 @@ panel_section(ui, "Controls", true, |ui| {
                 cursor_world, section_depth, mid_z, height_range, ortho_scale,
                 &ground_lasso, class_color_mq(classify_target, &class_defs),
             );
+            // Vector overlays are real 3D geometry, so they are occluded by the
+            // points in front of them — which is the only way to judge where a
+            // line actually sits. Drawn here, under the 3D camera and before
+            // the panel composites.
+            if !poly_files.is_empty() {
+                polylines::draw_3d(&poly_files, front, metres_per_pixel);
+            }
+            if app_mode == AppMode::Digitise || digitise.is_drawing() {
+                vectorise::draw_overlay(
+                    &digitise, data_offset, front, metres_per_pixel,
+                    digitise_cursor, app_mode == AppMode::Digitise,
+                );
+            }
 
             set_default_camera();
 
@@ -4208,7 +4311,7 @@ panel_section(ui, "Controls", true, |ui| {
                                 });
                             }
                         }
-                        let mpp = ortho_scale * 2.0 / screen_height().max(1.0);
+                        let mpp = ortho_scale * 2.0 / view_rect.h.max(1.0);
                         let spacing0 = copc_stages[0].spacing;
                         let target_depth = if mpp > 0.0 && spacing0 > 0.0 {
                             ((spacing0 as f32 / mpp).log2().ceil() as i32).max(0)
@@ -4283,6 +4386,8 @@ panel_section(ui, "Controls", true, |ui| {
                 gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
                     });
                 });
+                // What the panel actually took, so the view renders beside it.
+                panel_px = egui_ctx.available_rect().min.x * egui_ctx.pixels_per_point();
             });
 
             // A narrowed band should drive the height ramp too: colouring
@@ -4310,16 +4415,13 @@ panel_section(ui, "Controls", true, |ui| {
             // size at any zoom and are never swallowed by the cloud. Drawn
             // before egui so the panels still sit on top.
             if !gcp_files.is_empty() {
-                gcp::draw_3d(&gcp_files, data_offset, &view_proj, selected_gcp);
-            }
-            if !poly_files.is_empty() {
-                polylines::draw_3d(&poly_files, &view_proj);
-            }
-            if app_mode == AppMode::Digitise || digitise.is_drawing() {
-                vectorise::draw_overlay(
-                    &digitise, data_offset, &view_proj, digitise_cursor,
-                    app_mode == AppMode::Digitise,
+                gcp::draw_3d(
+                    &gcp_files, data_offset, &view_proj, selected_gcp,
+                    (view_rect.x, view_rect.y, view_rect.w, view_rect.h),
                 );
+            }
+            if app_mode == AppMode::Digitise && !ui_has_pointer {
+                vectorise::draw_cursor_readout(&digitise, mx, my);
             }
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
@@ -4340,7 +4442,7 @@ panel_section(ui, "Controls", true, |ui| {
             if do_zoom_all
                 && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr)
             {
-                let aspect = screen_width() / screen_height().max(1.0);
+                let aspect = view_rect.aspect();
                 let center = (lo + hi) * 0.5;
                 let ext = hi - lo;
                 ortho_scale = (ext.y * 0.5).max(ext.x * 0.5 / aspect) * 1.05;
@@ -4354,7 +4456,7 @@ panel_section(ui, "Controls", true, |ui| {
                     AppMode::PointPick => {
                         let mut best_dist = f32::MAX;
                         for cs in copc_stages.iter().filter(|cs| cs.visible) {
-                            if let Some((p, _vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) 
+                            if let Some((p, _vpos, dist)) = cs.find_nearest_point(&view_proj, mx - view_rect.x, my - view_rect.y, view_rect.w, view_rect.h) 
                                 && dist < best_dist { best_dist = dist; picked_copc_point = Some(p.clone()); 
                             }
                         }
@@ -4414,7 +4516,7 @@ panel_section(ui, "Controls", true, |ui| {
                     AppMode::MeasureFirst => {
                         let mut best_dist = f32::MAX;
                         for cs in copc_stages.iter().filter(|cs| cs.visible) {
-                            if let Some((_p, vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) 
+                            if let Some((_p, vpos, dist)) = cs.find_nearest_point(&view_proj, mx - view_rect.x, my - view_rect.y, view_rect.w, view_rect.h) 
                                 && dist < best_dist { best_dist = dist; measure_a = Some(vpos); measure_b = None; app_mode = AppMode::MeasureSecond; 
                             }
                         }
@@ -4422,13 +4524,13 @@ panel_section(ui, "Controls", true, |ui| {
                     AppMode::MeasureSecond => {
                         let mut best_dist = f32::MAX;
                         for cs in copc_stages.iter().filter(|cs| cs.visible) {
-                            if let Some((_p, vpos, dist)) = cs.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) 
+                            if let Some((_p, vpos, dist)) = cs.find_nearest_point(&view_proj, mx - view_rect.x, my - view_rect.y, view_rect.w, view_rect.h) 
                                 && dist < best_dist { best_dist = dist; measure_b = Some(vpos); 
                             }
                         }
                     }
                     AppMode::View3D => {
-                        selected_poly = polylines::pick(&poly_files, &view_proj, mx, my, screen_width(), screen_height(), 12.0);
+                        selected_poly = polylines::pick(&poly_files, &view_proj, mx - view_rect.x, my - view_rect.y, view_rect.w, view_rect.h, 12.0);
                     }
                     _ => {}
                 }
@@ -4486,19 +4588,23 @@ panel_section(ui, "Controls", true, |ui| {
             let (drawn, total) = {
                 let mut gl = unsafe { get_internal_gl() };
                 gl.flush();
+                // Sized to the view rather than the window, so the EDL target
+                // is exactly the region it will be composited into.
+                let vp = view_rect.gl();
                 edl_renderer.resize_if_needed(
                     &mut *gl.quad_context,
-                    screen_width() as u32,
-                    screen_height() as u32,
+                    vp.2.max(1) as u32,
+                    vp.3.max(1) as u32,
                 );
                 if edl_enabled {
                     edl_renderer.begin(&mut *gl.quad_context);
                 } else {
                     gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
+                    gl.quad_context.apply_viewport(vp.0, vp.1, vp.2, vp.3);
                 }
                 let result = mgr.draw_visible(&mut *gl.quad_context, &view_proj, point_size);
                 if edl_enabled {
-                    edl_renderer.apply(&mut *gl.quad_context, edl_strength);
+                    edl_renderer.apply(&mut *gl.quad_context, edl_strength, vp);
                 } else {
                     gl.quad_context.end_render_pass();
                 }
@@ -4538,14 +4644,28 @@ panel_section(ui, "Controls", true, |ui| {
                 cursor_world, section_depth, mid_z, height_range, ortho_scale,
                 &ground_lasso, class_color_mq(classify_target, &class_defs),
             );
+            // Vector overlays are real 3D geometry, so they are occluded by the
+            // points in front of them — which is the only way to judge where a
+            // line actually sits. Drawn here, under the 3D camera and before
+            // the panel composites.
+            if !poly_files.is_empty() {
+                polylines::draw_3d(&poly_files, front, metres_per_pixel);
+            }
+            if app_mode == AppMode::Digitise || digitise.is_drawing() {
+                vectorise::draw_overlay(
+                    &digitise, data_offset, front, metres_per_pixel,
+                    digitise_cursor, app_mode == AppMode::Digitise,
+                );
+            }
 
             set_default_camera();
 
             // Draw tile labels (2D overlay)
             for i in 0..mgr.tiles.len() {
                 let center = mgr.tile_center(i);
-                let (sx, sy) = world_to_screen(vec3(center.0, center.1, 0.0), &view_proj);
-                if sx > 0.0 && sx < screen_width() && sy > 0.0 && sy < screen_height() {
+                let (sx, sy) = world_to_screen(vec3(center.0, center.1, 0.0), &view_proj, view_rect);
+                if sx > view_rect.x && sx < view_rect.x + view_rect.w
+                    && sy > view_rect.y && sy < view_rect.y + view_rect.h {
                     let is_loaded = mgr.loaded[i].is_some();
                     let label_color = if is_loaded { GREEN } else { Color::new(1.0, 0.4, 0.4, 0.8) };
                     let name = &mgr.tiles[i].filename;
@@ -4781,6 +4901,8 @@ panel_section(ui, "Controls", true, |ui| {
                 gcp_section(ui, &mut gcp_files, &mut selected_gcp, &mut gcp_load_error, background);
                     });
                 });
+                // What the panel actually took, so the view renders beside it.
+                panel_px = egui_ctx.available_rect().min.x * egui_ctx.pixels_per_point();
             });
 
             // A narrowed band should drive the height ramp too: colouring
@@ -4808,16 +4930,13 @@ panel_section(ui, "Controls", true, |ui| {
             // size at any zoom and are never swallowed by the cloud. Drawn
             // before egui so the panels still sit on top.
             if !gcp_files.is_empty() {
-                gcp::draw_3d(&gcp_files, data_offset, &view_proj, selected_gcp);
-            }
-            if !poly_files.is_empty() {
-                polylines::draw_3d(&poly_files, &view_proj);
-            }
-            if app_mode == AppMode::Digitise || digitise.is_drawing() {
-                vectorise::draw_overlay(
-                    &digitise, data_offset, &view_proj, digitise_cursor,
-                    app_mode == AppMode::Digitise,
+                gcp::draw_3d(
+                    &gcp_files, data_offset, &view_proj, selected_gcp,
+                    (view_rect.x, view_rect.y, view_rect.w, view_rect.h),
                 );
+            }
+            if app_mode == AppMode::Digitise && !ui_has_pointer {
+                vectorise::draw_cursor_readout(&digitise, mx, my);
             }
             egui_macroquad::draw();
             egui_wants_pointer_prev = egui_wants_pointer;
@@ -4833,7 +4952,7 @@ panel_section(ui, "Controls", true, |ui| {
             if do_zoom_all
                 && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr)
             {
-                let aspect = screen_width() / screen_height().max(1.0);
+                let aspect = view_rect.aspect();
                 let center = (lo + hi) * 0.5;
                 let ext = hi - lo;
                 ortho_scale = (ext.y * 0.5).max(ext.x * 0.5 / aspect) * 1.05;
@@ -4847,7 +4966,7 @@ panel_section(ui, "Controls", true, |ui| {
                     let ext_y = (t.ymax - t.ymin) as f32;
                     let cx = ((t.xmin + t.xmax) / 2.0 - mgr.global_min[0]) as f32;
                     let cy = ((t.ymin + t.ymax) / 2.0 - mgr.global_min[1]) as f32;
-                    let aspect = screen_width() / screen_height().max(1.0);
+                    let aspect = view_rect.aspect();
                     ortho_scale = (ext_y * 0.5).max(ext_x * 0.5 / aspect) * 1.2;
                     position = vec3(cx, cy, height_range * 0.5)
                         - front * (ext_x.max(ext_y) * 2.0);
@@ -4858,7 +4977,7 @@ panel_section(ui, "Controls", true, |ui| {
             if !egui_wants_pointer && is_mouse_button_pressed(MouseButton::Left) {
                 match app_mode {
                     AppMode::PointPick => {
-                        picked_tile_point = mgr.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height());
+                        picked_tile_point = mgr.find_nearest_point(&view_proj, mx - view_rect.x, my - view_rect.y, view_rect.w, view_rect.h);
                     }
                     AppMode::SectionPickStart => {
                         if let Some(world) = cursor_world {
@@ -4887,19 +5006,19 @@ panel_section(ui, "Controls", true, |ui| {
                         }
                     }
                     AppMode::MeasureFirst => {
-                        if let Some((tile_idx, pt_idx)) = mgr.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
+                        if let Some((tile_idx, pt_idx)) = mgr.find_nearest_point(&view_proj, mx - view_rect.x, my - view_rect.y, view_rect.w, view_rect.h) {
                             measure_a = Some(glam::Vec3::from(mgr.loaded[tile_idx].as_ref().unwrap().positions[pt_idx]));
                             measure_b = None;
                             app_mode = AppMode::MeasureSecond;
                         }
                     }
                     AppMode::MeasureSecond => {
-                        if let Some((tile_idx, pt_idx)) = mgr.find_nearest_point(&view_proj, mx, my, screen_width(), screen_height()) {
+                        if let Some((tile_idx, pt_idx)) = mgr.find_nearest_point(&view_proj, mx - view_rect.x, my - view_rect.y, view_rect.w, view_rect.h) {
                             measure_b = Some(glam::Vec3::from(mgr.loaded[tile_idx].as_ref().unwrap().positions[pt_idx]));
                         }
                     }
                     AppMode::View3D => {
-                        if let Some((wx, wy)) = screen_to_world_xy(mx, my, &view_proj, 0.0) {
+                        if let Some((wx, wy)) = screen_to_world_xy(mx, my, &view_proj, 0.0, view_rect) {
                             selected_tile = mgr.tile_at(wx, wy);
                         }
                     }
@@ -4989,6 +5108,8 @@ panel_section(ui, "Controls", true, |ui| {
 });
                     });
                 });
+                // What the panel actually took, so the view renders beside it.
+                panel_px = egui_ctx.available_rect().min.x * egui_ctx.pixels_per_point();
             });
             egui_macroquad::draw();
         }

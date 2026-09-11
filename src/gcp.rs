@@ -357,14 +357,18 @@ fn detect_columns(
 
 // ---------------------------------------------------------------- rendering
 
-fn project(vp: &glam::Mat4, p: glam::Vec3) -> Option<(f32, f32)> {
+/// Project into `view`, the `(x, y, w, h)` rect the 3D view renders into.
+///
+/// Not the whole window: the docked panel takes the left edge, and a marker
+/// placed against the window would sit a panel-width off the point it marks.
+fn project(vp: &glam::Mat4, p: glam::Vec3, view: (f32, f32, f32, f32)) -> Option<(f32, f32)> {
     let clip = *vp * glam::Vec4::new(p.x, p.y, p.z, 1.0);
     if clip.w <= 1e-6 {
         return None; // behind the camera
     }
     Some((
-        (clip.x / clip.w + 1.0) / 2.0 * screen_width(),
-        (1.0 - clip.y / clip.w) / 2.0 * screen_height(),
+        view.0 + (clip.x / clip.w + 1.0) / 2.0 * view.2,
+        view.1 + (1.0 - clip.y / clip.w) / 2.0 * view.3,
     ))
 }
 
@@ -407,8 +411,9 @@ pub fn draw_3d(
     offset: [f64; 3],
     view_proj: &glam::Mat4,
     selected: Option<(usize, usize)>,
+    view: (f32, f32, f32, f32),
 ) {
-    let (sw, sh) = (screen_width(), screen_height());
+    let (sw, sh) = (view.2, view.3);
     for (fi, f) in files.iter().enumerate() {
         if !f.visible {
             continue;
@@ -419,8 +424,9 @@ pub fn draw_3d(
                 (p.world[1] - offset[1]) as f32,
                 (p.world[2] - offset[2]) as f32,
             );
-            let Some((sx, sy)) = project(view_proj, v) else { continue };
-            if sx < -50.0 || sy < -50.0 || sx > sw + 50.0 || sy > sh + 50.0 {
+            let Some((sx, sy)) = project(view_proj, v, view) else { continue };
+            if sx < view.0 - 50.0 || sy < view.1 - 50.0
+                || sx > view.0 + sw + 50.0 || sy > view.1 + sh + 50.0 {
                 continue;
             }
             let is_sel = selected == Some((fi, pi));
@@ -447,8 +453,9 @@ pub fn draw_section(
     section_pan: glam::Vec2,
     section_zoom: f32,
     selected: Option<(usize, usize)>,
+    view: (f32, f32, f32, f32),
 ) {
-    let (sw, sh) = (screen_width(), screen_height());
+    let (sw, sh) = (view.2, view.3);
     let dx = section_end.0 - section_start.0;
     let dy = section_end.1 - section_start.1;
     let len = (dx * dx + dy * dy).sqrt();
@@ -460,8 +467,8 @@ pub fn draw_section(
 
     let half_h = section_zoom;
     let half_w = half_h * (sw / sh);
-    let to_sx = |wx: f32| (wx - (section_pan.x - half_w)) / (2.0 * half_w) * sw;
-    let to_sy = |wy: f32| (1.0 - (wy - (section_pan.y - half_h)) / (2.0 * half_h)) * sh;
+    let to_sx = |wx: f32| view.0 + (wx - (section_pan.x - half_w)) / (2.0 * half_w) * sw;
+    let to_sy = |wy: f32| view.1 + (1.0 - (wy - (section_pan.y - half_h)) / (2.0 * half_h)) * sh;
 
     for (fi, f) in files.iter().enumerate() {
         if !f.visible {
