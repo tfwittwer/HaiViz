@@ -13,6 +13,7 @@
     use crate::ColorMode;
     use crate::classify::{ClassEdits, ClassMask, effective_class};
     use crate::spatial::{RayHit, SpatialGrid};
+    use crate::edge_follow::Sample;
 
     const CHUNK_SIZE: f32 = 50.0;
 
@@ -826,6 +827,29 @@
             self.index.points_in_radius(&self.positions, x, y, r, self.snap_filter(), out);
         }
 
+        /// Every visible point inside a viewer-space XY box, as edge-following
+        /// samples — the raster feed. Through the same filter as the snaps, so
+        /// class visibility steers the tracer exactly as it steers a snap.
+        pub fn edge_samples(&self, min: [f32; 2], max: [f32; 2], out: &mut Vec<Sample>) {
+            let filter = self.snap_filter();
+            self.index.cells_in_box(min, max, |cell| {
+                for &i in cell.points {
+                    let p = self.positions[i as usize];
+                    if p[0] < min[0] || p[0] > max[0] || p[1] < min[1] || p[1] > max[1] || !filter(i) {
+                        continue;
+                    }
+                    let pt = &self.cloud.points[i as usize];
+                    out.push(Sample { pos: p, intensity: pt.intensity, class: effective_class(pt) });
+                }
+            });
+        }
+
+        /// Points held by the grids that meet a viewer-space box. Constant for a
+        /// stage; see `CopcStage::resident_in_box` for why it is asked at all.
+        pub fn resident_in_box(&self, min: [f32; 2], max: [f32; 2]) -> usize {
+            if self.index.box_overlaps(min, max) { self.index.len() } else { 0 }
+        }
+
         pub fn height_range(&self) -> f32 {
             (self.cloud.max[2] - self.cloud.min[2]) as f32
         }
@@ -1324,6 +1348,35 @@
                     (p[2], p)
                 }));
             }
+        }
+
+        /// Every visible point inside a viewer-space XY box, as edge-following
+        /// samples. See `Stage::edge_samples`.
+        pub fn edge_samples(&self, min: [f32; 2], max: [f32; 2], out: &mut Vec<Sample>) {
+            let (z_clip, class_vis) = (self.z_clip, self.class_vis);
+            for loaded in self.loaded.iter().flatten() {
+                if !loaded.index.box_overlaps(min, max) { continue; }
+                loaded.index.cells_in_box(min, max, |cell| {
+                    for &i in cell.points {
+                        let p = loaded.positions[i as usize];
+                        let pt = &loaded.cloud.points[i as usize];
+                        if p[0] < min[0] || p[0] > max[0] || p[1] < min[1] || p[1] > max[1]
+                            || !z_clip.contains(p[2]) || !class_vis.contains(effective_class(pt)) {
+                            continue;
+                        }
+                        out.push(Sample { pos: p, intensity: pt.intensity, class: effective_class(pt) });
+                    }
+                });
+            }
+        }
+
+        /// Points held by the loaded tiles that meet a viewer-space box. Changes
+        /// when a tile is loaded or unloaded there.
+        pub fn resident_in_box(&self, min: [f32; 2], max: [f32; 2]) -> usize {
+            self.loaded.iter().flatten()
+                .filter(|t| t.index.box_overlaps(min, max))
+                .map(|t| t.index.len())
+                .sum()
         }
 
         /// Append every resident point inside the XY box and Z band, in
@@ -2567,6 +2620,39 @@
                     (p[2], p)
                 }));
             }
+        }
+
+        /// Every visible resident point inside a viewer-space XY box, as
+        /// edge-following samples. See `Stage::edge_samples`.
+        pub fn edge_samples(&self, min: [f32; 2], max: [f32; 2], out: &mut Vec<Sample>) {
+            let (z_clip, class_vis) = (self.z_clip, self.class_vis);
+            for node in self.loaded_nodes.values() {
+                if !node.index.box_overlaps(min, max) { continue; }
+                node.index.cells_in_box(min, max, |cell| {
+                    for &i in cell.points {
+                        let p = node.positions[i as usize];
+                        let pt = &node.points[i as usize];
+                        if p[0] < min[0] || p[0] > max[0] || p[1] < min[1] || p[1] > max[1]
+                            || !z_clip.contains(p[2]) || !class_vis.contains(effective_class(pt)) {
+                            continue;
+                        }
+                        out.push(Sample { pos: p, intensity: pt.intensity, class: effective_class(pt) });
+                    }
+                });
+            }
+        }
+
+        /// Points held by the resident nodes that meet a viewer-space box.
+        ///
+        /// The edge-following raster is built when a vertex is placed, which on
+        /// COPC is usually before the full-resolution nodes around it have
+        /// streamed in. This number changes as they arrive, and that is how the
+        /// raster learns it was built over a thinned sample.
+        pub fn resident_in_box(&self, min: [f32; 2], max: [f32; 2]) -> usize {
+            self.loaded_nodes.values()
+                .filter(|n| n.index.box_overlaps(min, max))
+                .map(|n| n.index.len())
+                .sum()
         }
 
         /// Point spacing, in metres, of the finest resident node near a

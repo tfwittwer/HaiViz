@@ -1,8 +1,7 @@
 # Manual vectorisation in HaiViz — implementation plan
 
-Status: **phases 0–4 implemented and driven on real data; phase 6 implemented
-but not yet driven; phase 5 is still plan only.** Written 2026-09-10, last
-updated 2026-09-11.
+Status: **phases 0–4 implemented and driven on real data; phases 5 and 6
+implemented but not yet driven.** Written 2026-09-10, last updated 2026-09-11.
 
 See [§15](#15-where-this-stands) for what is done, what was learned from using
 it, and what a next session would pick up.
@@ -642,6 +641,96 @@ rubber band. The tool must never block.
 **Edge-strength heatmap overlay, toggleable.** Not a nicety — without seeing
 what the tracer sees, tuning channel weights is guesswork.
 
+### Status: built (5)
+
+`haiviz/src/edge_follow.rs` holds the raster, the field, Dijkstra, the route,
+the heatmap and the settings panel, and depends on nothing else in the crate so
+`benches/edge_follow.rs` can include it by path. All three backends gained
+`edge_samples` (the raster feed, through the snap filter) and
+`resident_in_box`; `main.rs` holds the wiring. `E` toggles tracing, `H` the
+heatmap, and the weights sit in the Digitising panel. **Off by default.**
+
+Where it differs from the sketch above:
+
+- **The cell size follows the density** — about four points per occupied cell,
+  between window/512 and window/16 — rather than being window/512. A fixed
+  7.8 cm cell on airborne data at 20 pts/m² leaves almost every cell empty.
+- **The channels, concretely.** Step is the largest |Δ z_min| to a
+  4-neighbour, with a fifth of `step_m` ignored as noise; spread is
+  z_max − z_min over `range_m`; intensity is the largest |Δ mean| to a
+  neighbour, scaled by the window's own 95th percentile because intensity has
+  no physical scale; class is the fraction of neighbours with a different
+  majority class; occupancy the fraction with different occupancy. The
+  majority class is a Boyer–Moore vote, not a histogram — 256 bins × 262 k
+  cells would dwarf the raster it describes.
+- **Combined by the largest weight, not the sum**, then a [1 2 1] blur. A kerb
+  that shows only as a step is a full-strength edge.
+- **Cost** is `step × (0.05 + 0.05 / (edge + 0.05))`: the plan's `1/(edge+ε)`
+  plus a length term, scaled so a cell with no edge costs about one.
+- **Every traced vertex is re-snapped on commit** (step 6's "optionally"
+  became always), through `height_at`, which re-drape shares. The raster's
+  z_min / z_max only place the ghost path. If any vertex has no answer the
+  whole click is refused — interpolating a few would be the silent
+  degradation the snap refuses everywhere else.
+- **What rebuilds what.** A new anchor, window size or viewer origin rebuilds
+  the raster; a weight change recomputes only the field and paths. A data
+  signature — the points held by grids meeting the window, folded with the
+  height band and the visible classes — rebuilds at most every 0.5 s, so COPC
+  nodes streaming in after the click and a class hidden to steer the tracer
+  both reach it.
+- **Backspace takes back a whole traced click**, not one vertex of it
+  (`Digitise::clicks`).
+- **The heatmap is a flat translucent quad above the window's highest point**,
+  drawn after every other overlay so its depth hides nothing. Draping it on
+  z_min would take 262 k quads.
+- On COPC the pinned neighbourhood widens to the window while tracing — centred
+  on the cursor, not the anchor.
+- **Step 5, the corridor constraint, is not built.**
+
+### Measured
+
+`cargo bench -p haiviz --bench edge_follow`, release: a synthetic 40 m window
+at 1000 pts/m² with kerbs, stripes and a building, which hits the 512² cap.
+
+| Step | First run | Second run, machine loaded |
+|---|---|---|
+| raster, 1.6 M points | 9.2 ms | 18.4 ms |
+| edge field | 3.0 ms | 6.8 ms |
+| Dijkstra | 25.7 ms (float-keyed heap) | 24.3 ms (integer-keyed) |
+| route to the cursor, per frame | — (bench bug) | 7.9 µs |
+
+The second run was taken while another job held ~22 of 32 cores, which doubled
+the raster and field times that had not changed; so whether the integer-keyed
+heap helped is **not** cleanly measured. On real data under the same load
+(below), a 512² trace over 4.6 M points took 35 ms.
+
+**The plan's "a few ms per anchor" does not hold: it is 35–40 ms in release**,
+and a debug build is several times that. It is paid on a click, and on every
+frame a weight slider moves — never while the cursor moves, where the route is
+microseconds. If it shows as a hitch: move the build off the main thread, or
+lower the cap to 384².
+
+### A first look on real data
+
+Rendered offline, channel by channel, with a throwaway example (not committed):
+
+- **LCMS rail scan** (`testdata/`): the two rails are the brightest thing in
+  the field — step, spread, intensity and class all agree — and sleeper
+  outlines show faintly in intensity.
+- **Classified mobile mapping** (`ams1_127000_486000.laz`, 40 m window, 4.6 M
+  points, 512² at 7.8 cm): the kerb line is one continuous bright edge, and a
+  trace across the window jumped to it and followed it. Trees and parked cars
+  are just as bright, through spread and step. A zebra crossing is obvious in
+  raw intensity but faint in the intensity channel, because the window's 95th
+  percentile is set by façades and vegetation.
+- **Vegetated tile** (`wk36/125500_481700.laz`, mostly class 3): vegetation
+  dominates every channel, and occupancy is noisy where coverage is uneven.
+
+So: promising for kerbs and rails; vegetation and cars need classes hidden,
+which is the design; **road markings probably need the intensity scaling
+revisited** — a threshold in intensity units, or a percentile over ground
+cells only. Driving it is what should confirm or refute all three.
+
 ## 11. Work package G — editing and section view
 
 - Vertex-level pick (`polylines::pick` only resolves to a whole polyline), then
@@ -744,7 +833,7 @@ line then re-draping again fills them in.
 | **2b** | C — GeoPackage read + write, EPSG detection, differential tests | ~1400 | **yes — overlay any GPKG — done** |
 | **3** | D — digitising mode, free vertex placement, panel wiring | ~450 | yes — **done** |
 | **4** | E — snapping, radius control, feedback, COPC guard + pinning | ~450 | yes, the core tool — **done** |
-| **5** | F — edge following, cost channels, livewire, heatmap | ~600 | yes |
+| **5** | F — edge following, cost channels, livewire, heatmap | ~600 | yes — **done** |
 | **6** | G — vertex editing, section-view digitising, re-drape | ~400 | yes — **done** |
 
 Phase 1 is worth doing early and independently: it is useful on its own, it
@@ -784,8 +873,8 @@ classification — including that it does not affect export — the GeoPackage
 format in the Polylines section, the controls cheat-sheet, and an explicit note
 on why digitising works from oblique views when the plan-view lassos do not.
 
-All of that is written **except the edge-following part of the Vectorisation
-section**, which waits on phase 5. The README also gained two sections the plan
+All of that is written, the edge-following part included since phase 5. The
+README also gained two sections the plan
 did not anticipate: *The panel* and *Class visibility*. Phase 6 added *Editing
 lines* and *Digitising in a section* under Vectorisation, with their keys in the
 cheat-sheet.
@@ -794,8 +883,8 @@ cheat-sheet.
 
 ## 15. Where this stands
 
-Branch `vectorisation`, twelve commits off `master`. `cargo test -p haiviz` is
-green (120 tests) and `cargo clippy --all-targets` adds no warnings beyond the
+Branch `vectorisation`, thirteen commits off `master`. `cargo test -p haiviz`
+is green (129 tests) and `cargo clippy --all-targets` adds no warnings beyond the
 two that predate this work.
 
 ### Done
@@ -809,18 +898,13 @@ two that predate this work.
 | 3 | digitising mode |
 | 4 | snapping |
 | 6 | vertex editing, section-view digitising, re-drape |
+| 5 | edge following |
 
 Plus four follow-ups after the tool was actually driven on a cloud: a ray-based
 fix to the existing-polyline snap, and three rounds of UI work — one docked
 panel instead of five floating windows, depth-tested lines with real width, a
 view that renders beside the panel rather than under it, a cursor readout, and
 fixes to pointer and keyboard capture.
-
-### Not done, by decision
-
-**Phase 5 — edge following.** §13 risk 5 calls it the speculative one, and its
-value cannot be judged until the heatmap can be seen on real data. Deferred
-deliberately so phases 0–4 could be used first, not because it ran out of road.
 
 ### Built, not yet driven
 
@@ -836,6 +920,18 @@ used. What most likely needs a second round, in the order worth trying:
 - section digitising on COPC, which goes through the corridor force-load;
 - re-drape of a long COPC line, where vertices away from the loaded
   neighbourhood are kept and counted rather than draped.
+
+**Phase 5.** Built after phases 0–4 had been driven, so the heatmap could
+finally be judged on real data — which §13 risk 5 said was the only way to
+judge it. The offline look in §10 is encouraging for kerbs and rails and
+doubtful for road markings. Driving it should answer, in order:
+
+- does the heatmap light up the features actually wanted, once the obvious
+  classes (vegetation, cars) are hidden — and if markings stay faint, is it the
+  intensity scaling;
+- does the ghost route stick to them, or jump to a stronger edge nearby (the
+  corridor constraint, step 5, is the fix if it jumps);
+- is a 35–40 ms build per click noticeable, especially in a debug build.
 
 ### Things worth knowing before touching this again
 

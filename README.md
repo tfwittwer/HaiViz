@@ -345,6 +345,44 @@ digitising on a COPC file, haiviz also force-loads the octree nodes in a 20 m
 box around the cursor, so there is full-resolution data to snap to; if that box
 would pull in more than 5 million points it is skipped and the panel says so.
 
+### Edge following
+
+Press `E` while digitising, or tick **Edge following** in the panel, and the
+segment from the last vertex to the cursor stops being straight: it follows the
+strongest edge in the data — a kerb, a breakline, a painted line, a wall foot. A
+click commits the traced route, simplified to a handful of vertices, and ends
+wherever the snap mode puts it, exactly as without tracing. Every traced vertex
+is snapped at full resolution as it is placed; if any of them has nothing within
+the radius the click is refused and says why, rather than committing a route
+with invented heights. `Backspace` takes back the whole traced click.
+
+Around each new vertex, the points in a square window (40 m by default) are
+binned into a grid of cells holding about four points each, at most 512 × 512.
+Five channels are measured per cell and combined into an edge strength, with a
+weight each in the panel:
+
+| Channel | Finds |
+|---------|-------|
+| **Height step** | Kerbs, breaklines, ditch edges, embankment tops |
+| **Height spread** | Walls, building footprints — anything vertical |
+| **Intensity** | Painted road markings |
+| **Class change** | Vegetation or buildings against ground |
+| **Data edge** | Where the points stop: the cloud's boundary, roof outlines |
+
+The cheapest route from the vertex to every cell in the window is worked out
+once, so following the cursor afterwards costs nothing.
+
+The **edge heatmap** (`H`) draws that strength over the window: nothing where
+there is no edge, violet through orange to yellow as it strengthens. Use it to
+tune the weights — if the kerb you want is not bright, the tracer cannot see it
+either. Hidden classes and the height band are left out of the grid entirely, so
+hiding vegetation is often the quickest way to make a kerb stand out.
+
+Edge following is a 3D-view tool. Shift-click still places a free, straight
+vertex, and with the cursor outside the window the rubber band is straight
+again. On a COPC file the force-loaded neighbourhood widens to the window while
+tracing, and the grid is rebuilt as full-resolution nodes arrive.
+
 **Digitising works from any camera angle**, unlike the plan-view lassos, which
 insist on a top view. That is not an oversight: a lasso drawn obliquely is
 ambiguous because a screen polygon says nothing about depth, whereas a digitised
@@ -631,7 +669,9 @@ If no `classes.txt` is present, built-in default labels and colours are used.
 | Shift + left-click | Place a vertex freely, at the previous vertex's height |
 | `N` | Cycle the snap mode |
 | Ctrl + mouse wheel | Change the snap radius |
-| `Backspace` | Remove the last vertex |
+| `E` | Toggle edge following |
+| `H` | Toggle the edge heatmap (while edge following) |
+| `Backspace` | Remove the last vertex, or the last traced segment |
 | `Enter` | Finish the line and save |
 | `Shift` + `Enter` | Finish as a closed ring and save |
 | `Ctrl` + `Z` | Mid-line: remove the last vertex. Between lines: undo the last change |

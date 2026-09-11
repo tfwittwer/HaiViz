@@ -42,6 +42,7 @@
 use macroquad::prelude::*;
 use std::path::Path;
 
+use crate::edge_follow::EdgeFollow;
 use crate::polylines::{Layer, Polyline, PolylineFile, VectorFormat};
 use crate::spatial::{NO_FILTER, SpatialGrid, percentile_by_z};
 
@@ -183,6 +184,13 @@ pub struct Digitise {
     pub hover: Option<SnapHit>,
     /// Vertices placed so far this session, for the readout.
     pub committed_lines: usize,
+    /// Where each click's vertices start in `pending`. A traced click places
+    /// several vertices at once, and Backspace should take back what the click
+    /// did — not one cell's worth of it.
+    clicks: Vec<usize>,
+    /// Edge following: tracing a feature between clicks instead of drawing a
+    /// straight segment. 3D view only (decision 8).
+    pub edge: EdgeFollow,
 }
 
 impl Default for Digitise {
@@ -201,6 +209,8 @@ impl Default for Digitise {
             high_pct: 95.0,
             hover: None,
             committed_lines: 0,
+            clicks: Vec::new(),
+            edge: EdgeFollow::default(),
         }
     }
 }
@@ -208,11 +218,29 @@ impl Default for Digitise {
 impl Digitise {
     pub fn is_drawing(&self) -> bool { !self.pending.is_empty() }
 
-    pub fn push(&mut self, v: [f64; 3]) { self.pending.push(v); }
+    pub fn push(&mut self, v: [f64; 3]) { self.push_click(&[v]); }
 
-    pub fn pop(&mut self) -> Option<[f64; 3]> { self.pending.pop() }
+    /// Place the vertices one click produced — one, or a traced route.
+    pub fn push_click(&mut self, vs: &[[f64; 3]]) {
+        if vs.is_empty() { return; }
+        self.clicks.push(self.pending.len());
+        self.pending.extend_from_slice(vs);
+    }
 
-    pub fn clear(&mut self) { self.pending.clear(); }
+    /// Take back the last click, however many vertices it placed. Returns the
+    /// last vertex removed.
+    pub fn pop(&mut self) -> Option<[f64; 3]> {
+        let last = *self.pending.last()?;
+        let start = self.clicks.pop().unwrap_or(self.pending.len() - 1);
+        self.pending.truncate(start.min(self.pending.len() - 1));
+        Some(last)
+    }
+
+    pub fn clear(&mut self) {
+        self.pending.clear();
+        self.clicks.clear();
+        self.edge.clear();
+    }
 
     /// The vertex a rubber band or a "same Z as previous" snap works from.
     pub fn last(&self) -> Option<[f64; 3]> { self.pending.last().copied() }
@@ -271,6 +299,7 @@ impl Digitise {
         let name = self.name_template.replace("{n}", &n.to_string());
 
         let mut line = Polyline::from_points(name, self.color, std::mem::take(&mut self.pending));
+        self.clicks.clear();
         line.closed = closed;
         if !self.code.is_empty() {
             line.attrs.insert("code".to_string(), self.code.clone());
@@ -348,6 +377,9 @@ pub fn target_label(files: &[PolylineFile], fi: usize, li: usize) -> String {
 ///
 /// Under the 3D camera, before `set_default_camera()`, so the overlay is
 /// depth-tested against the cloud and still composites beneath the panel.
+///
+/// `ghost` is the edge-following route from the last vertex to the cursor,
+/// drawn instead of the straight rubber band when there is one.
 pub fn draw_overlay(
     dig: &Digitise,
     origin: [f64; 3],
@@ -355,6 +387,7 @@ pub fn draw_overlay(
     metres_per_pixel: f32,
     cursor: Option<[f64; 3]>,
     drawing: bool,
+    ghost: Option<&[[f64; 3]]>,
 ) {
     let to_view = |p: [f64; 3]| vec3(
         (p[0] - origin[0]) as f32,
@@ -378,7 +411,12 @@ pub fn draw_overlay(
     if drawing
         && let (Some(&last), Some(c)) = (pts.last(), cursor) {
         let faint = Color::new(dig.color.r, dig.color.g, dig.color.b, 0.55);
-        crate::polylines::draw_ribbon_3d(&[last, to_view(c)], false, half, faint, view_dir);
+        let band: Vec<Vec3> = match ghost {
+            // The route already starts at the last vertex and ends at the cursor.
+            Some(route) if route.len() >= 2 => route.iter().map(|p| to_view(*p)).collect(),
+            _ => vec![last, to_view(c)],
+        };
+        crate::polylines::draw_ribbon_3d(&band, false, half, faint, view_dir);
     }
 
     if drawing { draw_snap_marker(dig, origin); }
@@ -651,6 +689,9 @@ pub fn controls(
     files: &[PolylineFile],
     drawing: bool,
     have_cloud: bool,
+    // Edge following is a 3D-view tool (decision 8); the section view's panel
+    // leaves it out.
+    offer_edge_following: bool,
 ) -> Option<Request> {
     use egui_macroquad::egui;
     let mut request = None;
@@ -722,6 +763,10 @@ pub fn controls(
             ui.add(egui::Slider::new(pct, 0.0..=100.0).max_decimals(0))
                 .on_hover_text("0 and 100 give the raw minimum and maximum back");
         });
+    }
+
+    if offer_edge_following {
+        crate::edge_follow::controls(ui, &mut dig.edge);
     }
 
     ui.horizontal(|ui| {
@@ -885,6 +930,20 @@ mod tests {
         assert!((last - 5.0).abs() < 1e-9);
         let (slope, dz) = dig.last_slope().unwrap();
         assert!(slope.abs() < 1e-9 && dz.abs() < 1e-9);
+    }
+
+    #[test]
+    fn backspace_takes_back_a_whole_traced_click() {
+        let mut dig = Digitise::default();
+        dig.push([0.0, 0.0, 0.0]);
+        dig.push_click(&[[1.0, 0.1, 0.0], [2.0, 0.3, 0.0], [3.0, 0.2, 0.0]]);
+        dig.push([4.0, 0.0, 0.0]);
+        assert_eq!(dig.pop(), Some([4.0, 0.0, 0.0]));
+        assert_eq!(dig.pending.len(), 4);
+        assert_eq!(dig.pop(), Some([3.0, 0.2, 0.0]), "the whole trace goes in one step");
+        assert_eq!(dig.pending, vec![[0.0, 0.0, 0.0]]);
+        assert_eq!(dig.pop(), Some([0.0, 0.0, 0.0]));
+        assert_eq!(dig.pop(), None);
     }
 
     #[test]

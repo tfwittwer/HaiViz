@@ -26,3 +26,8 @@ criterion = "0.7"
 [[bench]]
 name = "spatial"
 harness = false
+
+# Phase 5: whether a 512² trace really is a few milliseconds per anchor.
+[[bench]]
+name = "edge_follow"
+harness = false

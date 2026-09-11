@@ -291,6 +291,15 @@ impl SpatialGrid {
         dx * dx + dy * dy <= r * r
     }
 
+    /// True when a viewer-space XY box can touch this grid at all — the
+    /// rectangle counterpart of [`SpatialGrid::circle_overlaps`], for the
+    /// edge-following raster window.
+    pub fn box_overlaps(&self, min: [f32; 2], max: [f32; 2]) -> bool {
+        if self.nx == 0 { return false; }
+        let (lo, hi) = self.bounds_xy();
+        min[0] <= hi[0] && max[0] >= lo[0] && min[1] <= hi[1] && max[1] >= lo[1]
+    }
+
     /// The points in one cell, as indices into the source slice.
     #[inline]
     fn bucket(&self, c: usize) -> &[u32] {

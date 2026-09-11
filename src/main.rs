@@ -31,6 +31,7 @@ mod polylines;
 mod gpkg;
 mod vectorise;
 mod vector_edit;
+mod edge_follow;
 mod gcp;
 mod classify;
 mod export;
@@ -706,30 +707,122 @@ fn redrape_line(
     data_offset: [f64; 3],
     dig: &vectorise::Digitise,
 ) -> Option<vector_edit::Drape> {
-    use vector_edit::DrapeMiss;
-    use vectorise::SnapMode;
     let pl = poly_files.get(line.file)?.get(line.line_ref())?;
-    let r = dig.radius;
     let mut zs: Vec<(f32, [f32; 3])> = Vec::new();
     Some(vector_edit::drape(pl.points(), |p| {
-        let v = [
-            (p[0] - data_offset[0]) as f32,
-            (p[1] - data_offset[1]) as f32,
-            (p[2] - data_offset[2]) as f32,
-        ];
-        if matches!(dig.snap_mode, SnapMode::LowZ | SnapMode::HighZ)
-            && copc_stages.iter().filter(|c| c.visible)
-                .any(|c| c.lod_spacing_near(v[0], v[1], r).is_some_and(|s| s > r as f64)) {
-            return Err(DrapeMiss::Coarse);
-        }
-        zs.clear();
-        for st in stages.iter().filter(|s| s.visible) { st.snap_z_candidates(v[0], v[1], r, &mut zs); }
-        for cs in copc_stages.iter().filter(|c| c.visible) { cs.snap_z_candidates(v[0], v[1], r, &mut zs); }
-        if let Some(mgr) = tile_mgr { mgr.snap_z_candidates(v[0], v[1], r, &mut zs); }
-        vector_edit::drape_z(dig.snap_mode, v, &mut zs, dig.low_pct, dig.high_pct)
-            .map(|z| z as f64 + data_offset[2])
-            .ok_or(DrapeMiss::Empty)
+        height_at(stages, copc_stages, tile_mgr, p, data_offset, dig.snap_mode, dig, &mut zs)
     }))
+}
+
+/// The height `mode` gives a vertex at `p`'s plan position, taking `p`'s own
+/// height as the reference for Nearest. Shared by re-drape and by edge
+/// following, which both have a plan position and need the cloud's height
+/// there, through the same filters and COPC spacing guard as a snap.
+///
+/// `zs` is a scratch buffer, so a whole line costs one allocation.
+#[allow(clippy::too_many_arguments)]
+fn height_at(
+    stages: &[Stage],
+    copc_stages: &[CopcStage],
+    tile_mgr: &Option<TileStageManager>,
+    p: [f64; 3],
+    data_offset: [f64; 3],
+    mode: vectorise::SnapMode,
+    dig: &vectorise::Digitise,
+    zs: &mut Vec<(f32, [f32; 3])>,
+) -> Result<f64, vector_edit::DrapeMiss> {
+    use vector_edit::DrapeMiss;
+    use vectorise::SnapMode;
+    let r = dig.radius;
+    let v = [
+        (p[0] - data_offset[0]) as f32,
+        (p[1] - data_offset[1]) as f32,
+        (p[2] - data_offset[2]) as f32,
+    ];
+    if matches!(mode, SnapMode::LowZ | SnapMode::HighZ)
+        && copc_stages.iter().filter(|c| c.visible)
+            .any(|c| c.lod_spacing_near(v[0], v[1], r).is_some_and(|s| s > r as f64)) {
+        return Err(DrapeMiss::Coarse);
+    }
+    zs.clear();
+    for st in stages.iter().filter(|s| s.visible) { st.snap_z_candidates(v[0], v[1], r, zs); }
+    for cs in copc_stages.iter().filter(|c| c.visible) { cs.snap_z_candidates(v[0], v[1], r, zs); }
+    if let Some(mgr) = tile_mgr { mgr.snap_z_candidates(v[0], v[1], r, zs); }
+    vector_edit::drape_z(mode, v, zs, dig.low_pct, dig.high_pct)
+        .map(|z| z as f64 + data_offset[2])
+        .ok_or(DrapeMiss::Empty)
+}
+
+/// Heights for a traced route, at full resolution.
+///
+/// The route's interior vertices come off the raster, whose heights are only
+/// good enough to draw; each is re-snapped here as a click would be. The ends
+/// are real already — the last vertex, and the snapped target. If any interior
+/// vertex has no answer the whole route is refused: a trace that fell back to
+/// interpolated heights part of the way along would be exactly the silent
+/// degradation the snap refuses.
+fn drape_route(
+    stages: &[Stage],
+    copc_stages: &[CopcStage],
+    tile_mgr: &Option<TileStageManager>,
+    route: &[[f64; 3]],
+    data_offset: [f64; 3],
+    dig: &vectorise::Digitise,
+) -> Result<Vec<[f64; 3]>, String> {
+    use vector_edit::DrapeMiss;
+    use vectorise::SnapMode;
+    // Same Z holds the height already committed to, and the route carries it.
+    if dig.snap_mode == SnapMode::SameZ { return Ok(route.to_vec()); }
+    // Tying into a line means something at the end of the route; along it, the
+    // nearest real point is the honest height.
+    let mode = if dig.snap_mode == SnapMode::Existing { SnapMode::Nearest } else { dig.snap_mode };
+    let mut zs = Vec::new();
+    let (mut empty, mut coarse) = (0usize, 0usize);
+    let last = route.len().saturating_sub(1);
+    let draped: Vec<[f64; 3]> = route.iter().enumerate().map(|(i, &p)| {
+        if i == 0 || i == last { return p; }
+        match height_at(stages, copc_stages, tile_mgr, p, data_offset, mode, dig, &mut zs) {
+            Ok(z) => [p[0], p[1], z],
+            Err(DrapeMiss::Empty) => { empty += 1; p }
+            Err(DrapeMiss::Coarse) => { coarse += 1; p }
+        }
+    }).collect();
+    match (empty, coarse) {
+        (0, 0) => Ok(draped),
+        (n, 0) => Err(format!(
+            "{n} traced vertices have nothing within the snap radius — widen it, \
+             press E for a straight segment, or Shift-click.",
+        )),
+        _ => Err(format!(
+            "The loaded data is sparser than the snap radius at {} traced vertices — \
+             zoom in, or press E for a straight segment.",
+            empty + coarse,
+        )),
+    }
+}
+
+/// Where a traced vertex's *display* height comes from, for the snap mode in
+/// force. The committed height is re-snapped by `drape_route`.
+fn edge_z_source(dig: &vectorise::Digitise) -> edge_follow::ZSource {
+    use edge_follow::ZSource;
+    use vectorise::SnapMode;
+    match dig.snap_mode {
+        SnapMode::Nearest | SnapMode::LowZ => ZSource::Lowest,
+        SnapMode::HighZ => ZSource::Highest,
+        SnapMode::SameZ => dig.last().map_or(ZSource::Interpolated, |p| ZSource::Fixed(p[2])),
+        SnapMode::Existing => ZSource::Interpolated,
+    }
+}
+
+/// A cheap fingerprint of the height band and the visible classes, folded into
+/// the edge-following data signature so that hiding a class to steer the
+/// tracer rebuilds its raster.
+fn filter_signature(z_clip: crate::raw_miniquad::ZClip, class_vis: ClassVis) -> usize {
+    let mut h = (z_clip.min.to_bits() as usize).wrapping_mul(0x9E37_79B9) ^ z_clip.max.to_bits() as usize;
+    for id in 0..=255u8 {
+        if class_vis.contains(id) { h = h.rotate_left(5) ^ (id as usize + 1); }
+    }
+    h
 }
 
 /// Auto-save a vector file after a committed change.
@@ -817,20 +910,21 @@ fn finish_digitised_line(
 }
 
 /// Everything vector-shaped drawn under the 3D camera: the loaded lines, the
-/// line being digitised, and a vertex drag in progress. Before
-/// `set_default_camera()`, so all of it is depth-tested against the cloud and
-/// still composites beneath the panel.
+/// line being digitised with its traced route, a vertex drag in progress, and
+/// the edge-following heatmap. Before `set_default_camera()`, so all of it is
+/// depth-tested against the cloud and still composites beneath the panel.
 #[allow(clippy::too_many_arguments)]
 fn draw_vector_overlays_3d(
     poly_files: &[polylines::PolylineFile],
     selected: Option<polylines::PolyRef>,
-    digitise: &vectorise::Digitise,
+    digitise: &mut vectorise::Digitise,
     editor: &vector_edit::Editor,
     app_mode: AppMode,
     data_offset: [f64; 3],
     view_dir: Vec3,
     metres_per_pixel: f32,
     snap_target: Option<[f64; 3]>,
+    edge_route: Option<&[[f64; 3]]>,
 ) {
     if !poly_files.is_empty() {
         polylines::draw_3d(poly_files, view_dir, metres_per_pixel, selected);
@@ -838,7 +932,7 @@ fn draw_vector_overlays_3d(
     if app_mode == AppMode::Digitise || digitise.is_drawing() {
         vectorise::draw_overlay(
             digitise, data_offset, view_dir, metres_per_pixel,
-            snap_target, app_mode == AppMode::Digitise,
+            snap_target, app_mode == AppMode::Digitise, edge_route,
         );
     }
     if app_mode == AppMode::EditLines && editor.drag.as_ref().is_some_and(|d| d.moving) {
@@ -846,6 +940,13 @@ fn draw_vector_overlays_3d(
             editor, poly_files, data_offset, view_dir, metres_per_pixel, snap_target,
         );
         vectorise::draw_snap_marker(digitise, data_offset);
+    }
+    // Last: it covers the whole window, and its depth must not hide the lines
+    // already drawn beneath it — they show through, since it is translucent.
+    if app_mode == AppMode::Digitise && digitise.edge.enabled && digitise.edge.show_heatmap
+        && let Some(trace) = digitise.edge.trace.as_mut() {
+        let z = trace.top() + 0.05;
+        trace.draw_heatmap(z);
     }
 }
 
@@ -892,7 +993,7 @@ fn vector_tools_section(
 ) {
     panel_section(ui, "Digitising", false, |ui| {
         if let Some(r) = vectorise::controls(
-            ui, digitise, poly_files, app_mode == AppMode::Digitise, have_cloud,
+            ui, digitise, poly_files, app_mode == AppMode::Digitise, have_cloud, true,
         ) { *digitise_request = Some(r); }
         if let Some(r) = vector_edit::controls(
             ui, editor, poly_files, selected, app_mode == AppMode::EditLines, digitise.snap_mode,
@@ -3333,7 +3434,7 @@ async fn main() {
                 panel_section(ui, "Digitising", false, |ui| {
                     if let Some(r) = vectorise::controls(
                         ui, &mut digitise, &poly_files,
-                        app_mode == AppMode::SectionDigitise, have_cloud,
+                        app_mode == AppMode::SectionDigitise, have_cloud, false,
                     ) { sec_digitise_request = Some(r); }
                     ui.label("In a section, vertices land on the section plane.");
                     ui.label("Editing existing lines is in the 3D view.");
@@ -3854,6 +3955,15 @@ async fn main() {
         // keys adjust them there.
         let snap_tool = matches!(app_mode, AppMode::Digitise | AppMode::EditLines);
         if snap_tool && !egui_wants_keyboard_prev {
+            if app_mode == AppMode::Digitise && is_key_pressed(KeyCode::E) {
+                digitise.edge.enabled = !digitise.edge.enabled;
+                digitise.status = Some(format!(
+                    "Edge following {}", if digitise.edge.enabled { "on" } else { "off" },
+                ));
+            }
+            if app_mode == AppMode::Digitise && digitise.edge.enabled && is_key_pressed(KeyCode::H) {
+                digitise.edge.show_heatmap = !digitise.edge.show_heatmap;
+            }
             if is_key_pressed(KeyCode::N) {
                 digitise.snap_mode = digitise.snap_mode.next();
                 digitise.status = Some(format!("Snap: {}", digitise.snap_mode.label()));
@@ -4089,8 +4199,29 @@ async fn main() {
                         &view_proj, mx, my, view_rect, data_offset, &digitise, digitise.last(), None,
                     );
                     if hit.is_placeable() {
-                        digitise.push(hit.world);
-                        digitise.status = None;
+                        // With edge following on, the click commits the traced
+                        // route to the snap rather than a straight segment —
+                        // from the trace grown at this same anchor, so what is
+                        // placed is what the ghost path showed.
+                        let traced = digitise.edge.trace.as_ref()
+                            .filter(|t| digitise.edge.enabled && Some(t.anchor) == digitise.last())
+                            .and_then(|t| t.route(hit.world, edge_z_source(&digitise)))
+                            .filter(|route| route.len() > 2);
+                        match traced {
+                            Some(route) => match drape_route(
+                                &stages, &copc_stages, &tile_mgr, &route, data_offset, &digitise,
+                            ) {
+                                Ok(route) => {
+                                    digitise.push_click(&route[1..]);
+                                    digitise.status = None;
+                                }
+                                Err(e) => digitise.status = Some(e),
+                            },
+                            None => {
+                                digitise.push(hit.world);
+                                digitise.status = None;
+                            }
+                        }
                     } else {
                         digitise.status = hit.note.clone();
                     }
@@ -4226,6 +4357,39 @@ async fn main() {
             .filter(|h| h.is_placeable())
             .map(|h| h.world);
 
+        // ---- Edge following ----
+        // Grown once per anchor; after that the route to the cursor is a walk
+        // back along the parent pointers. 3D view only (decision 8), and only
+        // from the second vertex on — the first has nothing to trace from.
+        let edge_route: Option<Vec<[f64; 3]>> = match digitise.last() {
+            Some(anchor) if app_mode == AppMode::Digitise && digitise.edge.enabled => {
+                let (lo, hi) = digitise.edge.window_box(anchor, data_offset);
+                // Anything that changes which points the window holds: COPC
+                // nodes arriving, a tile loading, the height band, and the
+                // visible classes — hiding a class to steer the tracer has to
+                // reach the raster.
+                let resident = stages.iter().filter(|s| s.visible).map(|s| s.resident_in_box(lo, hi)).sum::<usize>()
+                    + copc_stages.iter().filter(|c| c.visible).map(|c| c.resident_in_box(lo, hi)).sum::<usize>()
+                    + tile_mgr.as_ref().map_or(0, |m| m.resident_in_box(lo, hi));
+                let data_sig = resident ^ filter_signature(z_clip, class_vis);
+                digitise.edge.update(anchor, data_offset, data_sig, get_time(), |(lo, hi)| {
+                    let mut samples = Vec::new();
+                    for st in stages.iter().filter(|s| s.visible) { st.edge_samples(lo, hi, &mut samples); }
+                    for cs in copc_stages.iter().filter(|c| c.visible) { cs.edge_samples(lo, hi, &mut samples); }
+                    if let Some(mgr) = &tile_mgr { mgr.edge_samples(lo, hi, &mut samples); }
+                    samples
+                });
+                let z = edge_z_source(&digitise);
+                digitise_cursor.and_then(|target| digitise.edge.trace.as_ref()?.route(target, z))
+            }
+            _ => {
+                // Nothing to trace from: let the raster go rather than hold a
+                // few megabytes for a line that is not being drawn.
+                if !(digitise.edge.enabled && digitise.is_drawing()) { digitise.edge.clear(); }
+                None
+            }
+        };
+
         // ---- COPC neighbourhood pinning ----
         // The spacing guard alone would only ever say "no". This is the other
         // half: force-load the octree nodes around the cursor so there is
@@ -4237,7 +4401,13 @@ async fn main() {
                 .map(|h| ((h.world[0] - data_offset[0]) as f32, (h.world[1] - data_offset[1]) as f32))
                 .or(cursor_world);
             if let Some((cx, cy)) = centre {
-                let half = (4.0 * digitise.radius as f64).max(SNAP_NEIGHBOURHOOD_M) / 2.0;
+                let mut side = (4.0 * digitise.radius as f64).max(SNAP_NEIGHBOURHOOD_M);
+                // While tracing, the raster window wants full-resolution data
+                // too, not only the snap radius under the cursor.
+                if app_mode == AppMode::Digitise && digitise.edge.enabled {
+                    side = side.max(digitise.edge.params.window_m as f64);
+                }
+                let half = side / 2.0;
                 let mut refused = 0i64;
                 for cs in copc_stages.iter_mut() {
                     let (n, pts) = cs.pin_neighbourhood(cx, cy, half);
@@ -4302,8 +4472,8 @@ async fn main() {
             // line actually sits. Drawn here, under the 3D camera and before
             // the panel composites.
             draw_vector_overlays_3d(
-                &poly_files, selected_poly, &digitise, &editor, app_mode,
-                data_offset, front, metres_per_pixel, digitise_cursor,
+                &poly_files, selected_poly, &mut digitise, &editor, app_mode,
+                data_offset, front, metres_per_pixel, digitise_cursor, edge_route.as_deref(),
             );
 
             set_default_camera();
@@ -4784,8 +4954,8 @@ async fn main() {
             // line actually sits. Drawn here, under the 3D camera and before
             // the panel composites.
             draw_vector_overlays_3d(
-                &poly_files, selected_poly, &digitise, &editor, app_mode,
-                data_offset, front, metres_per_pixel, digitise_cursor,
+                &poly_files, selected_poly, &mut digitise, &editor, app_mode,
+                data_offset, front, metres_per_pixel, digitise_cursor, edge_route.as_deref(),
             );
 
             set_default_camera();
@@ -5289,8 +5459,8 @@ async fn main() {
             // line actually sits. Drawn here, under the 3D camera and before
             // the panel composites.
             draw_vector_overlays_3d(
-                &poly_files, selected_poly, &digitise, &editor, app_mode,
-                data_offset, front, metres_per_pixel, digitise_cursor,
+                &poly_files, selected_poly, &mut digitise, &editor, app_mode,
+                data_offset, front, metres_per_pixel, digitise_cursor, edge_route.as_deref(),
             );
 
             set_default_camera();
