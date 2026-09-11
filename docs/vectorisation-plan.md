@@ -1,7 +1,10 @@
 # Manual vectorisation in HaiViz — implementation plan
 
-Status: **phases 0–4 implemented; 5 and 6 are still plan only.**
-Written 2026-09-10.
+Status: **phases 0–4 implemented and driven on real data; 5 and 6 are still
+plan only.** Written 2026-09-10, last updated 2026-09-11.
+
+See [§15](#15-where-this-stands) for what is done, what was learned from using
+it, and what a next session would pick up.
 
 Paths below are relative to the workspace root (`haicloudrs/`).
 
@@ -699,3 +702,63 @@ following, auto-save and where a new layer lands), class visibility under Manual
 classification — including that it does not affect export — the GeoPackage
 format in the Polylines section, the controls cheat-sheet, and an explicit note
 on why digitising works from oblique views when the plan-view lassos do not.
+
+All of that is written **except the edge-following part of the Vectorisation
+section**, which waits on phase 5. The README also gained two sections the plan
+did not anticipate: *The panel* and *Class visibility*.
+
+---
+
+## 15. Where this stands
+
+Branch `vectorisation`, ten commits off `master`. `cargo test -p haiviz` is
+green (107 tests) and `cargo clippy --all-targets` adds no warnings beyond the
+two that predate this work.
+
+### Done
+
+| Phase | Commit subject |
+|---|---|
+| 0 | spatial index for snap queries |
+| 1 | class visibility |
+| 2a | polyline model, layers, mutability, undo |
+| 2b | GeoPackage read and write |
+| 3 | digitising mode |
+| 4 | snapping |
+
+Plus four follow-ups after the tool was actually driven on a cloud: a ray-based
+fix to the existing-polyline snap, and three rounds of UI work — one docked
+panel instead of five floating windows, depth-tested lines with real width, a
+view that renders beside the panel rather than under it, a cursor readout, and
+fixes to pointer and keyboard capture.
+
+### Not done, by decision
+
+**Phase 5 — edge following.** §13 risk 5 calls it the speculative one, and its
+value cannot be judged until the heatmap can be seen on real data. Deferred
+deliberately so phases 0–4 could be used first, not because it ran out of road.
+
+**Phase 6 — vertex editing, section-view digitising, re-drape.** Not
+speculative, just next. `polylines::pick_vertex` and the mutation API it needs
+already exist and are tested (phase 2a); nothing has been built on them yet.
+
+### Things worth knowing before touching this again
+
+- **Eye-dome lighting breaks overlay depth testing.** EDL composites through an
+  offscreen target whose depth the default framebuffer does not share, so with
+  EDL on the polylines draw over the cloud. Pre-existing, documented in the
+  README, not fixed. The fixes are to blit the EDL depth back, or to render the
+  overlays inside the EDL pass.
+- **macroquad's screen and mouse coordinates are logical pixels;
+  `apply_viewport` takes physical ones.** `ViewRect::gl` is the only place that
+  crosses that boundary, and it cost a session to find. Any new viewport work
+  goes through it.
+- **egui's `is_pointer_over_area` is only true over a `SidePanel` after the
+  panel has been laid out**, because a panel is `Order::Background` and the
+  check falls back to `unused_rect`. Read the capture flags at the *end* of the
+  ui closure, never the start.
+- **The panel width lags one frame.** It is measured from egui after layout,
+  which happens after the view renders. Only visible while dragging the panel
+  edge.
+- The phase-0 bench numbers in §5 were re-measured after the
+  `MAX_CELLS_PER_POINT` fix and still hold.
