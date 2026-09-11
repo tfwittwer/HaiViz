@@ -4463,10 +4463,14 @@ async fn main() {
                     gl.quad_context.apply_viewport(vp.0, vp.1, vp.2, vp.3);
                 }
                 let drawn: i32 = stages.iter()
-                    .map(|s| s.draw_visible(&mut *gl.quad_context, &view_proj, point_size))
+                    .map(|s| s.draw_visible(&mut *gl.quad_context, &view_proj, point_size, false))
                     .sum();
                 if edl_enabled {
                     edl_renderer.apply(&mut *gl.quad_context, edl_strength, vp);
+                    // Or every overlay below draws over the cloud.
+                    edl_renderer.restore_depth(&mut *gl.quad_context, vp, |ctx| {
+                        for s in &stages { s.draw_visible(ctx, &view_proj, point_size, true); }
+                    });
                 } else {
                     gl.quad_context.end_render_pass();
                 }
@@ -4946,9 +4950,13 @@ async fn main() {
                     gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
                     gl.quad_context.apply_viewport(vp.0, vp.1, vp.2, vp.3);
                 }
-                let drawn: i32 = copc_stages.iter().map(|cs| cs.draw_visible(&mut *gl.quad_context, &view_proj, point_size)).sum();
+                let drawn: i32 = copc_stages.iter().map(|cs| cs.draw_visible(&mut *gl.quad_context, &view_proj, point_size, false)).sum();
                 if edl_enabled {
                     edl_renderer.apply(&mut *gl.quad_context, edl_strength, vp);
+                    // Or every overlay below draws over the cloud.
+                    edl_renderer.restore_depth(&mut *gl.quad_context, vp, |ctx| {
+                        for cs in &copc_stages { cs.draw_visible(ctx, &view_proj, point_size, true); }
+                    });
                 } else {
                     gl.quad_context.end_render_pass();
                 }
@@ -5423,9 +5431,13 @@ async fn main() {
                     gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
                     gl.quad_context.apply_viewport(vp.0, vp.1, vp.2, vp.3);
                 }
-                let result = mgr.draw_visible(&mut *gl.quad_context, &view_proj, point_size);
+                let result = mgr.draw_visible(&mut *gl.quad_context, &view_proj, point_size, false);
                 if edl_enabled {
                     edl_renderer.apply(&mut *gl.quad_context, edl_strength, vp);
+                    // Or every overlay below draws over the cloud.
+                    edl_renderer.restore_depth(&mut *gl.quad_context, vp, |ctx| {
+                        mgr.draw_visible(ctx, &view_proj, point_size, true);
+                    });
                 } else {
                     gl.quad_context.end_render_pass();
                 }

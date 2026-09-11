@@ -301,9 +301,10 @@ far.
 
 Lines are drawn as real 3D geometry, so they are hidden by the points in front
 of them. That is what lets you tell where a line actually sits rather than
-merely where it projects to. **Eye-dome lighting is the exception** — it
-composites through an offscreen buffer that the overlays do not share a depth
-buffer with, so with **EDL: ON** the lines draw over the cloud.
+merely where it projects to. That holds with **EDL: ON** too: eye-dome lighting
+shades the cloud in an offscreen buffer, and the cloud's depth is replayed into
+the view afterwards so the lines can still be hidden by it — at the cost of
+drawing the points twice while EDL is on.
 
 ### Snapping
 

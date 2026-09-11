@@ -945,11 +945,13 @@ doubtful for road markings. Driving it should answer, in order:
 
 ### Things worth knowing before touching this again
 
-- **Eye-dome lighting breaks overlay depth testing.** EDL composites through an
-  offscreen target whose depth the default framebuffer does not share, so with
-  EDL on the polylines draw over the cloud. Pre-existing, documented in the
-  README, not fixed. The fixes are to blit the EDL depth back, or to render the
-  overlays inside the EDL pass.
+- **Eye-dome lighting used to break overlay depth testing.** EDL composites
+  through an offscreen target whose depth the default framebuffer never gets,
+  so with EDL on every overlay drew over the cloud. Fixed by replaying the cloud
+  depth-only into the default framebuffer after the composite
+  (`EdlRenderer::restore_depth`). Chosen over writing `gl_FragDepth` in the
+  composite shader, which GLSL ES 100 has only behind an extension; it costs a
+  second vertex pass while EDL is on.
 - **macroquad's screen and mouse coordinates are logical pixels;
   `apply_viewport` takes physical ones.** `ViewRect::gl` is the only place that
   crosses that boundary, and it cost a session to find. Any new viewport work

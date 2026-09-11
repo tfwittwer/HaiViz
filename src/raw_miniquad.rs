@@ -295,6 +295,9 @@
 
     pub struct Stage {
         pipeline: Pipeline,
+        /// The same point pipeline with colour writes off — see
+        /// `EdlRenderer::restore_depth`.
+        depth_pipeline: Pipeline,
         /// Source file path — used as the UI label and to identify the stage.
         pub filepath: String,
         pub chunks: Vec<Chunk>,
@@ -487,7 +490,9 @@
         false
     }
 
-    fn create_pipeline(ctx: &mut dyn RenderingBackend) -> Pipeline {
+    /// The point pipeline. `depth_only` builds the same thing with colour
+    /// writes off, for `EdlRenderer::restore_depth`.
+    fn create_pipeline(ctx: &mut dyn RenderingBackend, depth_only: bool) -> Pipeline {
         // On desktop OpenGL, gl_PointSize in the vertex shader is only respected
         // when GL_PROGRAM_POINT_SIZE (0x8642) is enabled. This is always active in
         // OpenGL ES / WebGL so no guard is needed, but on desktop it must be set.
@@ -517,6 +522,7 @@
                 primitive_type: PrimitiveType::Points,
                 depth_test: Comparison::LessOrEqual,
                 depth_write: true,
+                color_write: if depth_only { (false, false, false, false) } else { (true, true, true, true) },
                 ..Default::default()
             },
         )
@@ -648,7 +654,7 @@
                 .map(|(i, p)| color_for_point(p, positions[i][2], 0.0, height_range, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &class_defs, None, ClassVis::ALL))
                 .collect();
 
-            let pipeline = create_pipeline(ctx);
+            let (pipeline, depth_pipeline) = (create_pipeline(ctx, false), create_pipeline(ctx, true));
             let total_points = colors.len() as i32;
             let chunks = build_chunks(ctx, &positions, &colors);
             let index = SpatialGrid::build(&positions);
@@ -658,6 +664,7 @@
 
             let mut stage = Stage {
                 pipeline,
+                depth_pipeline,
                 filepath: filename.to_string(),
                 chunks,
                 total_points,
@@ -931,13 +938,15 @@
             ctx.draw(0, section.num_points, 1);
         }
 
-        pub fn draw_visible(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4, point_size: f32) -> i32 {
+        /// Draw the chunks in view. `depth_only` writes depth and no colour,
+        /// for `EdlRenderer::restore_depth`.
+        pub fn draw_visible(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4, point_size: f32, depth_only: bool) -> i32 {
             if !self.visible { return 0; }
             let planes = extract_frustum_planes(view_proj);
             let mut drawn = 0;
             let height_range = self.height_range();
 
-            ctx.apply_pipeline(&self.pipeline);
+            ctx.apply_pipeline(if depth_only { &self.depth_pipeline } else { &self.pipeline });
             for chunk in &self.chunks {
                 if aabb_outside_frustum(&planes, &chunk.aabb_min, &chunk.aabb_max) {
                     continue;
@@ -979,6 +988,9 @@
 
     pub struct TileStageManager {
         pipeline: Pipeline,
+        /// The same point pipeline with colour writes off — see
+        /// `EdlRenderer::restore_depth`.
+        depth_pipeline: Pipeline,
         pub tiles: Vec<TileInfo>,
         pub loaded: Vec<Option<LoadedTile>>,
         pub global_min: [f64; 3],
@@ -1098,10 +1110,11 @@
                 n, global_min[0], global_max[0], global_min[1], global_max[1], global_min[2], global_max[2]);
             }
             
-            let pipeline = create_pipeline(ctx);
+            let (pipeline, depth_pipeline) = (create_pipeline(ctx, false), create_pipeline(ctx, true));
 
             TileStageManager {
                 pipeline,
+                depth_pipeline,
                 tiles,
                 loaded,
                 global_min,
@@ -1199,13 +1212,14 @@
             }
         }
 
-        pub fn draw_visible(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4, point_size: f32) -> (i32, i32) {
+        /// Draw the loaded tiles in view; see `Stage::draw_visible`.
+        pub fn draw_visible(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4, point_size: f32, depth_only: bool) -> (i32, i32) {
             let planes = extract_frustum_planes(view_proj);
             let mut drawn = 0;
             let mut total = 0;
             let height_range = self.height_range();
 
-            ctx.apply_pipeline(&self.pipeline);
+            ctx.apply_pipeline(if depth_only { &self.depth_pipeline } else { &self.pipeline });
             for loaded in self.loaded.iter().flatten() {
                 total += loaded.total_points;
                 for chunk in &loaded.chunks {
@@ -1600,6 +1614,31 @@
             ctx.draw(0, 6, 1);
             ctx.end_render_pass();
         }
+
+        /// Put the cloud's depth into the default framebuffer, after `apply`.
+        ///
+        /// The composite is a flat image: the points' depth stays behind in the
+        /// offscreen target. Without this, everything drawn afterwards under
+        /// the 3D camera — polylines, snap markers, measure crosses — passes
+        /// its depth test everywhere and lands on top of points that are in
+        /// front of it. `draw` replays the cloud through the depth-only
+        /// pipeline, colour writes off.
+        ///
+        /// Replayed rather than written from the composite shader: that would
+        /// need `gl_FragDepth`, which GLSL ES 100 only has behind an extension
+        /// that is not everywhere. The cost is a second vertex pass while EDL
+        /// is on, and nothing while it is off.
+        pub fn restore_depth(
+            &self,
+            ctx: &mut dyn RenderingBackend,
+            viewport: (i32, i32, i32, i32),
+            draw: impl FnOnce(&mut dyn RenderingBackend),
+        ) {
+            ctx.begin_default_pass(PassAction::Nothing);
+            ctx.apply_viewport(viewport.0, viewport.1, viewport.2, viewport.3);
+            draw(ctx);
+            ctx.end_render_pass();
+        }
     }
 
     pub mod edl_shader {
@@ -1730,6 +1769,9 @@
 
     pub struct CopcStage {
         pipeline: Pipeline,
+        /// The same point pipeline with colour writes off — see
+        /// `EdlRenderer::restore_depth`.
+        depth_pipeline: Pipeline,
         /// Source file path — used as the UI label and to identify the stage.
         pub filepath: String,
         /// Root spacing in metres (halved at each level)
@@ -2029,7 +2071,7 @@
                 global_min[2], global_max[2],
             );
 
-            let pipeline = create_pipeline(ctx);
+            let (pipeline, depth_pipeline) = (create_pipeline(ctx, false), create_pipeline(ctx, true));
 
             let (load_tx, load_rx) = std::sync::mpsc::channel::<CopcLoadReq>();
             let (result_tx, result_rx) = std::sync::mpsc::channel::<CopcLoadResult>();
@@ -2037,6 +2079,7 @@
 
             let mut stage = CopcStage {
                 pipeline,
+                depth_pipeline,
                 filepath: filepath.to_string(),
                 spacing: root_spacing,
                 entries,
@@ -2485,13 +2528,15 @@
             ctx: &mut dyn RenderingBackend,
             view_proj: &glam::Mat4,
             point_size: f32,
+            // See `Stage::draw_visible`.
+            depth_only: bool,
         ) -> i32 {
             if !self.visible { return 0; }
             let planes = extract_frustum_planes(view_proj);
             let height_range = self.height_range();
             let mut drawn = 0;
 
-            ctx.apply_pipeline(&self.pipeline);
+            ctx.apply_pipeline(if depth_only { &self.depth_pipeline } else { &self.pipeline });
             for node in self.loaded_nodes.values() {
                 for chunk in &node.chunks {
                     if aabb_outside_frustum(&planes, &chunk.aabb_min, &chunk.aabb_max) {
