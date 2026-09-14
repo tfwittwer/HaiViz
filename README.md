@@ -98,14 +98,17 @@ Everything lives in one panel docked to the left of the window, with
 collapsible sections:
 
 - **Controls** — camera, colouring, height filter, cross sections, measure;
-- **Classification** — the lasso tools, the **Classes** table and **Export**,
-  which are one job;
+- **Classes** — labels, colours and visibility per class, and the class
+  definition files;
+- **Classification** — the lasso tools, **Undo last op** and **Export**, which
+  are one job;
 - **Digitising** — snap mode, radius and the line being drawn, and editing the
   lines already there;
 - **Polylines** and **Ground Control Points** — the overlays.
 
 Drag the panel's inner edge to resize it. It is docked left so that the view
-cube in the top-right corner stays clear.
+cube in the top-right corner stays clear. With the pointer over the panel, the
+mouse wheel scrolls the panel rather than zooming the view.
 
 The 3D and section views render **beside** the panel rather than underneath it,
 so nothing is hidden behind it and **Zoom All** frames into the space you can
@@ -120,10 +123,10 @@ The 3D view uses an orthographic camera shared across all modes:
 | `W` `A` `S` `D` / arrow keys | Move the camera |
 | Left-drag | Orbit around the screen centre |
 | Right-drag | Pan |
-| Mouse wheel | Zoom (orthographic scale) |
+| Mouse wheel | Zoom (orthographic scale); over the panel, scroll the panel |
 | `Tab` | Toggle mouse-look (cursor grab) |
 | `C` | Start a cross section (press again to cancel) |
-| `G` | Start the ground lasso (press again to cancel) |
+| `G` / `V` | Start the above-ground / inside lasso (press again to cancel) |
 | `P` | Start digitising a polyline (press again to cancel) |
 | `T` `F` `B` `L` `R` | Snap to top / front / back / left / right view |
 | `Esc` | Cancel the current pick / measure / section action |
@@ -282,7 +285,7 @@ before whatever the other program last wrote. Close the file there, or run
 
 ## Vectorisation
 
-Press `P` or use **Digitise** in the classification panel to draw polylines
+Press `P` or use **Digitise** in the Digitising panel to draw polylines
 straight onto the cloud. Click to place a vertex and it is *snapped* onto real
 data — the elevation is measured, not invented. Shift-click places one freely
 instead, at the previous vertex's height, which is what lets you draw across a
@@ -562,7 +565,8 @@ cloud's own extent is recorded.
 
 After applying, the status line reports the fit's RMS residual and slope — worth
 a glance. A large RMS on ground you expect to be flat means the plane did not
-find a real surface, and **Undo last op** puts it back.
+find a real surface, and **Undo last op**, below the lasso buttons, puts it
+back.
 
 The plane is fitted from the points currently loaded. That is deliberate: a
 plane is a low-order fit and the ground is dense, so the streamed sample defines
@@ -630,7 +634,9 @@ a `gop` or `vop` line holding the footprint. One drawn from any other angle
 records the view plane it was drawn in, as a `gvop` or `vvop` line — new in
 sidecar v3, and skipped with a warning by older versions.
 
-**Undo last op** removes the most recent op and re-derives the affected clouds
+**Undo last op**, in the classification controls of both the 3D view and the
+section view, removes the most recent op — whichever view it was drawn in — and
+re-derives the affected clouds
 from disk — an op records what it assigns, not what it overwrote, so there is
 no shortcut back. For COPC that means the corridor streams in again.
 
@@ -702,10 +708,11 @@ If no `classes.txt` is present, built-in default labels and colours are used.
 | `W` `A` `S` `D` / arrows | Move camera |
 | Left-drag | Orbit around screen centre |
 | Right-drag | Pan |
-| Mouse wheel | Zoom |
+| Mouse wheel | Zoom (scrolls the panel when over it) |
 | `Tab` | Toggle mouse-look (cursor grab) |
 | `C` | Start / cancel a cross section |
-| `G` | Start / cancel the ground lasso |
+| `G` | Start / cancel the above-ground lasso |
+| `V` | Start / cancel the inside lasso |
 | `P` | Start / cancel digitising |
 | `M` | Start / stop editing lines |
 | `T` `F` `B` `L` `R` | Top / front / back / left / right view |
@@ -754,7 +761,7 @@ If no `classes.txt` is present, built-in default labels and colours are used.
 
 | Input | Action |
 |-------|--------|
-| Mouse wheel | Zoom the slice |
+| Mouse wheel | Zoom the slice (scrolls the panel when over it) |
 | `O` | Start the classification lasso |
 | `P` | Start / cancel digitising in the slice (keys as in 3D) |
 | **Measure** → click ×2 | Distance + slope between two points |

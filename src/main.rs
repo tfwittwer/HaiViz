@@ -2209,6 +2209,48 @@ fn class_picker(
     ui.add(egui_macroquad::egui::DragValue::new(value).range(0..=255));
 }
 
+/// Takes back the most recent classification op, from whichever view it was
+/// drawn in. An op does not record the classes it overwrote, so undoing means
+/// re-deriving from the source: resident points are re-read, and streamed COPC
+/// nodes are dropped so they arrive again with the shortened op list applied.
+///
+/// An op is only recorded against the files it overlaps, so "the last op" is
+/// the highest sequence number anywhere, and it is removed from exactly the
+/// files that carry it. Returns whether there was one, then whether in-memory
+/// files and COPC files were touched — the section view rebuilds its slice
+/// from those.
+fn undo_last_class_op(
+    stages: &mut [Stage],
+    copc_stages: &mut [CopcStage],
+    color_mode: ColorMode,
+) -> (bool, bool, bool) {
+    let last_seq = stages.iter().filter_map(|s| s.edits.ops.last().map(|o| o.seq))
+        .chain(copc_stages.iter().filter_map(|c| c.edits.ops.last().map(|o| o.seq)))
+        .max();
+    let Some(seq) = last_seq else { return (false, false, false) };
+    let mut stages_touched = false;
+    let mut copc_touched = false;
+    let mut gl = unsafe { get_internal_gl() };
+    gl.flush();
+    for st in stages.iter_mut() {
+        if st.edits.ops.last().map(|o| o.seq) != Some(seq) { continue; }
+        st.edits.undo();
+        st.reload_points(&mut *gl.quad_context, color_mode);
+        let path = st.filepath.clone();
+        let _ = st.edits.save(&path);
+        stages_touched = true;
+    }
+    for cs in copc_stages.iter_mut() {
+        if cs.edits.ops.last().map(|o| o.seq) != Some(seq) { continue; }
+        cs.edits.undo();
+        cs.invalidate_loaded(&mut *gl.quad_context);
+        let path = cs.filepath.clone();
+        let _ = cs.edits.save(&path);
+        copc_touched = true;
+    }
+    (true, stages_touched, copc_touched)
+}
+
 /// Controls for the plan-view lasso tools, shared by the three 3D panels.
 /// Returns the flavour of lasso the operator asked to start, if any.
 #[allow(clippy::too_many_arguments)]
@@ -2224,6 +2266,9 @@ fn ground_tool_controls(
     class_defs: &Option<ClassDefs>,
     hidden_classes: usize,
     status: &Option<String>,
+    // Ops in the most-edited file, which is what the undo button can reach.
+    op_count: usize,
+    undo: &mut bool,
     apply: &mut bool,
     cancel: &mut bool,
 ) -> Option<LassoKind> {
@@ -2295,6 +2340,13 @@ fn ground_tool_controls(
         // only the surface they can see.
         ui.label("An outline selects everything behind it, through the whole");
         ui.label("depth of the view, within the height filter.");
+        // The same op list the section view's button works on, so a lasso
+        // drawn in either view can be taken back from either.
+        if ui.add_enabled(op_count > 0, egui::Button::new("Undo last op"))
+            .on_hover_text("Take back the most recent classification, from this view or a section")
+            .clicked() {
+            *undo = true;
+        }
     }
     if let Some(msg) = status {
         ui.label(msg.as_str());
@@ -3877,41 +3929,11 @@ async fn main() {
             }
 
             // ---- Undo the last op ----
-            // An op does not record the classes it overwrote, so undoing means
-            // re-deriving from the source: resident points are re-read, and
-            // streamed COPC nodes are dropped so they arrive again with the
-            // shortened op list applied.
             if do_undo_op {
-                // An op is only recorded against the files it overlaps, so
-                // "the last op" is the highest sequence number anywhere, and it
-                // is removed from exactly the files that carry it.
-                let last_seq = stages.iter().filter_map(|s| s.edits.ops.last().map(|o| o.seq))
-                    .chain(copc_stages.iter().filter_map(|c| c.edits.ops.last().map(|o| o.seq)))
-                    .max();
-                let mut stages_touched = false;
-                let mut copc_touched = false;
-                if let Some(seq) = last_seq {
-                    let mut gl = unsafe { get_internal_gl() };
-                    gl.flush();
-                    for st in stages.iter_mut() {
-                        if st.edits.ops.last().map(|o| o.seq) != Some(seq) { continue; }
-                        st.edits.undo();
-                        st.reload_points(&mut *gl.quad_context, color_mode);
-                        let path = st.filepath.clone();
-                        let _ = st.edits.save(&path);
-                        stages_touched = true;
-                    }
-                    for cs in copc_stages.iter_mut() {
-                        if cs.edits.ops.last().map(|o| o.seq) != Some(seq) { continue; }
-                        cs.edits.undo();
-                        cs.invalidate_loaded(&mut *gl.quad_context);
-                        let path = cs.filepath.clone();
-                        let _ = cs.edits.save(&path);
-                        copc_touched = true;
-                    }
-                }
+                let (undone, stages_touched, copc_touched) =
+                    undo_last_class_op(&mut stages, &mut copc_stages, color_mode);
 
-                classify_status = Some(if last_seq.is_some() {
+                classify_status = Some(if undone {
                     "Last op undone".to_string()
                 } else {
                     "Nothing to undo".to_string()
@@ -4097,6 +4119,11 @@ async fn main() {
         // ---- 3D view modes (shared navigation) ----
         let mut start_ground_lasso: Option<LassoKind> = None;
         let mut apply_ground_lasso = false;
+        let mut undo_class_op = false;
+        // Counted as the section view counts it: the ops in the most-edited file.
+        let class_op_count: usize = stages.iter().map(|s| s.edits.ops.len())
+            .chain(copc_stages.iter().map(|cs| cs.edits.ops.len()))
+            .max().unwrap_or(0);
         let mut cancel_ground_lasso = false;
         // `C` mirrors the Cross Section button, including its toggle-to-cancel
         // behaviour, so the two stay interchangeable.
@@ -4913,6 +4940,7 @@ async fn main() {
                         ui, &mut app_mode, ground_lasso.len(), lasso_kind,
                         &mut classify_target, &mut classify_from, &mut ground_offset,
                         max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
+                        class_op_count, &mut undo_class_op,
                         &mut apply_ground_lasso, &mut cancel_ground_lasso,
                     ) { start_ground_lasso = Some(kind); }
                     export_request = export_section(
@@ -5389,6 +5417,7 @@ async fn main() {
                         ui, &mut app_mode, ground_lasso.len(), lasso_kind,
                         &mut classify_target, &mut classify_from, &mut ground_offset,
                         max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
+                        class_op_count, &mut undo_class_op,
                         &mut apply_ground_lasso, &mut cancel_ground_lasso,
                     ) { start_ground_lasso = Some(kind); }
                     export_request = export_section(
@@ -5917,6 +5946,7 @@ async fn main() {
                         ui, &mut app_mode, ground_lasso.len(), lasso_kind,
                         &mut classify_target, &mut classify_from, &mut ground_offset,
                         max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
+                        class_op_count, &mut undo_class_op,
                         &mut apply_ground_lasso, &mut cancel_ground_lasso,
                     ) { start_ground_lasso = Some(kind); }
                     export_request = export_section(
@@ -6446,6 +6476,12 @@ async fn main() {
                 ground_lasso.clear();
                 app_mode = AppMode::View3D;
             }
+        }
+        if undo_class_op {
+            // Nothing to rebuild here: re-read files redraw as they are, and
+            // dropped COPC nodes stream back in on their own.
+            let (undone, _, _) = undo_last_class_op(&mut stages, &mut copc_stages, color_mode);
+            ground_status = Some(if undone { "Last op undone" } else { "Nothing to undo" }.to_string());
         }
 
         next_frame().await
