@@ -2869,6 +2869,12 @@ async fn main() {
     #[cfg(target_os = "windows")]
     let mut last_dropped_count: usize = 0;
 
+    // egui-macroquad divides every wheel delta by 90 before handing it to egui
+    // as lines, and miniquad's X11 backend reports one per notch — so at egui's
+    // default speed a notch scrolls the panel less than a point. Undo the
+    // division to get egui's native 40 points a notch.
+    egui_macroquad::cfg(|ctx| ctx.options_mut(|o| o.line_scroll_speed = 40.0 * 90.0));
+
     loop {
         //println!("{} {}",yaw,pitch);
         //println!("{}",app_mode.label());
@@ -3168,7 +3174,8 @@ async fn main() {
                 section_pan.y += sec_mouse_delta.y * units_per_pixel;
             }
 
-            let (_mwx, mwy) = mouse_wheel();
+            // Over the panel the wheel scrolls it, and must not zoom as well.
+            let (_mwx, mwy) = if egui_wants_pointer_prev { (0.0, 0.0) } else { mouse_wheel() };
             let ctrl_down = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
             if mwy.abs() > 0.001 && ctrl_down && app_mode == AppMode::SectionDigitise {
                 // The snap radius, as in the 3D view; the plain wheel keeps zooming.
@@ -3610,8 +3617,8 @@ async fn main() {
                             ui.label("Classification editing is not available in tile mode.");
                         }
                 });
+                class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
                 panel_section(ui, "Classification", false, |ui| {
-                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
                     export_request = export_section(
                         ui, &mut reveal_export, &mut export_filter,
                         &mut export_job, &mut export_status, &export_sources,
@@ -3662,6 +3669,9 @@ async fn main() {
                 }
             }
             egui_macroquad::draw();
+            // The section view never reaches the 3D path that records this, and
+            // its wheel handling reads it before the panel is laid out.
+            egui_wants_pointer_prev = egui_wants_sec_pointer;
 
             // ---- Lasso keyboard shortcuts ----
             if !egui_wants_sec_keyboard {
@@ -4153,7 +4163,7 @@ async fn main() {
             // divergence from `SectionAdjustDepth`, which takes the plain
             // wheel — this is a tool the operator sits in for minutes at a
             // time, and losing zoom for that whole time would be worse.
-            let wheel = mouse_wheel().1;
+            let wheel = if egui_wants_pointer_prev { 0.0 } else { mouse_wheel().1 };
             if wheel != 0.0 && (is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl)) {
                 let step = if wheel > 0.0 { 1.25 } else { 1.0 / 1.25 };
                 digitise.radius = (digitise.radius * step)
@@ -4220,7 +4230,8 @@ async fn main() {
             }
         }
 
-        let (_mwx, mwy) = mouse_wheel();
+        // Over the panel the wheel scrolls it, and must not zoom as well.
+        let (_mwx, mwy) = if egui_wants_pointer_prev { (0.0, 0.0) } else { mouse_wheel() };
         if app_mode == AppMode::SectionAdjustDepth {
             if mwy.abs() > 0.001 {
                 let factor = if mwy > 0.0 { 1.2 } else { 0.8 };
@@ -4894,8 +4905,9 @@ async fn main() {
                             point_info_ui(ui, "Point Info:", p, &class_defs);
                         }
                 });
-                // Classification: the lasso tools, the class table and the
-                // export that consumes them, together because they are one job.
+                class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
+                // Classification: the lasso tools and the export that consumes
+                // them, together because they are one job.
                 panel_section(ui, "Classification", false, |ui| {
                     if let Some(kind) = ground_tool_controls(
                         ui, &mut app_mode, ground_lasso.len(), lasso_kind,
@@ -4903,7 +4915,6 @@ async fn main() {
                         max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                         &mut apply_ground_lasso, &mut cancel_ground_lasso,
                     ) { start_ground_lasso = Some(kind); }
-                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
                     export_request = export_section(
                         ui, &mut reveal_export, &mut export_filter,
                         &mut export_job, &mut export_status, &export_sources,
@@ -5370,8 +5381,9 @@ async fn main() {
                             point_info_ui(ui, "Point Info:", p, &class_defs);
                         }
                 });
-                // Classification: the lasso tools, the class table and the
-                // export that consumes them, together because they are one job.
+                class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
+                // Classification: the lasso tools and the export that consumes
+                // them, together because they are one job.
                 panel_section(ui, "Classification", false, |ui| {
                     if let Some(kind) = ground_tool_controls(
                         ui, &mut app_mode, ground_lasso.len(), lasso_kind,
@@ -5379,7 +5391,6 @@ async fn main() {
                         max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                         &mut apply_ground_lasso, &mut cancel_ground_lasso,
                     ) { start_ground_lasso = Some(kind); }
-                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
                     export_request = export_section(
                         ui, &mut reveal_export, &mut export_filter,
                         &mut export_job, &mut export_status, &export_sources,
@@ -5898,8 +5909,9 @@ async fn main() {
                             
                         }
                 });
-                // Classification: the lasso tools, the class table and the
-                // export that consumes them, together because they are one job.
+                class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
+                // Classification: the lasso tools and the export that consumes
+                // them, together because they are one job.
                 panel_section(ui, "Classification", false, |ui| {
                     if let Some(kind) = ground_tool_controls(
                         ui, &mut app_mode, ground_lasso.len(), lasso_kind,
@@ -5907,7 +5919,6 @@ async fn main() {
                         max_class, &class_defs, class_vis.inverted().count() as usize, &ground_status,
                         &mut apply_ground_lasso, &mut cancel_ground_lasso,
                     ) { start_ground_lasso = Some(kind); }
-                    class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
                     export_request = export_section(
                         ui, &mut reveal_export, &mut export_filter,
                         &mut export_job, &mut export_status, &export_sources,
