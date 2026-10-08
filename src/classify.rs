@@ -456,9 +456,28 @@ pub struct ClassEdits {
 impl ClassEdits {
     pub fn is_empty(&self) -> bool { self.ops.is_empty() }
 
+    #[cfg(test)]
     pub fn push(&mut self, mut op: ClassOp) {
         op.seq = self.next_seq;
         self.next_seq += 1;
+        self.ops.push(op);
+        self.dirty = true;
+    }
+
+    /// The seq the next [`push`](Self::push) would assign.
+    pub fn next_seq(&self) -> u64 { self.next_seq }
+
+    /// Push with a seq chosen by the caller.
+    ///
+    /// With several files loaded, one lasso is one change however many files
+    /// it lands in, and undo finds "the last change" by comparing seqs across
+    /// files. That only works if the seqs come from one counter: per-file
+    /// counters make file A's 25th op outrank file B's newer 4th, and undo
+    /// takes back an edit from the wrong file. The caller passes the highest
+    /// [`next_seq`](Self::next_seq) over every loaded file.
+    pub fn push_at(&mut self, mut op: ClassOp, seq: u64) {
+        op.seq = seq;
+        self.next_seq = self.next_seq.max(seq + 1);
         self.ops.push(op);
         self.dirty = true;
     }
@@ -993,6 +1012,27 @@ mod tests {
     /// A 20 m box around a section line running due east from (100, 200).
     fn box_op(target: u8, from: Option<u8>) -> ClassOp {
         box_op_mask(target, from.into())
+    }
+
+    #[test]
+    fn a_shared_seq_orders_ops_across_files() {
+        // File A arrives with a long history, file B with a short one.
+        let mut a = ClassEdits::default();
+        for _ in 0..25 { a.push(box_op(6, None)); }
+        let mut b = ClassEdits::default();
+        for _ in 0..3 { b.push(box_op(6, None)); }
+
+        let seq = a.next_seq().max(b.next_seq());
+        b.push_at(box_op(7, None), seq);
+        assert_eq!(b.ops.last().unwrap().seq, 25, "past A's history, not B's own");
+        assert!(b.dirty);
+        let newest = [&a, &b].iter().filter_map(|e| e.ops.last().map(|o| o.seq)).max();
+        assert_eq!(newest, Some(25));
+        assert_eq!(a.ops.last().unwrap().seq, 24, "so undo picks B's op, not A's");
+
+        // Later plain pushes carry on from the shared number.
+        b.push(box_op(2, None));
+        assert_eq!(b.ops.last().unwrap().seq, 26);
     }
 
     fn box_op_mask(target: u8, from: ClassMask) -> ClassOp {

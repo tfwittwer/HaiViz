@@ -2209,6 +2209,21 @@ fn class_picker(
     ui.add(egui_macroquad::egui::DragValue::new(value).range(0..=255));
 }
 
+/// The seq for a new classification op: past every op in every loaded file.
+///
+/// Each file's sidecar numbers its own ops, so on their own the counters say
+/// nothing about order across files — a file loaded with 25 ops would outrank
+/// the op just drawn on a file with 3, and `undo_last_class_op` would take
+/// back the wrong one. Drawing from one counter makes the newest op the
+/// highest seq everywhere, and gives an op that spans files the same seq in
+/// each, so it is undone from all of them together.
+fn next_class_seq(stages: &[Stage], copc_stages: &[CopcStage]) -> u64 {
+    stages.iter().map(|s| s.edits.next_seq())
+        .chain(copc_stages.iter().map(|c| c.edits.next_seq()))
+        .max()
+        .unwrap_or(0)
+}
+
 /// Takes back the most recent classification op, from whichever view it was
 /// drawn in. An op does not record the classes it overwrote, so undoing means
 /// re-deriving from the source: resident points are re-read, and streamed COPC
@@ -3857,6 +3872,8 @@ async fn main() {
                         op_from_mask(classify_from, class_vis),
                     );
 
+                    // One seq for every file the op lands in; see `next_class_seq`.
+                    let seq = next_class_seq(&stages, &copc_stages);
                     let mut changed = 0usize;
                     let mut touched = 0usize;
                     {
@@ -3865,14 +3882,14 @@ async fn main() {
                         for st in stages.iter_mut() {
                             if !op.intersects_aabb(&st.cloud.min, &st.cloud.max) { continue; }
                             let from = st.edits.ops.len();
-                            st.edits.push(op.clone());
+                            st.edits.push_at(op.clone(), seq);
                             changed += st.apply_edits(&mut *gl.quad_context, color_mode, from);
                             touched += 1;
                         }
                         for cs in copc_stages.iter_mut() {
                             if !op.intersects_aabb(&cs.global_min, &cs.global_max) { continue; }
                             let from = cs.edits.ops.len();
-                            cs.edits.push(op.clone());
+                            cs.edits.push_at(op.clone(), seq);
                             changed += cs.apply_edits_to_loaded(&mut *gl.quad_context, color_mode, from);
                             touched += 1;
                         }
@@ -6414,6 +6431,8 @@ async fn main() {
                     op_from_mask(classify_from, class_vis),
                 );
 
+                // One seq for every file the op lands in; see `next_class_seq`.
+                let seq = next_class_seq(&stages, &copc_stages);
                 let mut changed = 0usize;
                 let mut touched = 0usize;
                 {
@@ -6422,14 +6441,14 @@ async fn main() {
                     for st in stages.iter_mut() {
                         if !op.intersects_aabb(&st.cloud.min, &st.cloud.max) { continue; }
                         let from = st.edits.ops.len();
-                        st.edits.push(op.clone());
+                        st.edits.push_at(op.clone(), seq);
                         changed += st.apply_edits(&mut *gl.quad_context, color_mode, from);
                         touched += 1;
                     }
                     for cs in copc_stages.iter_mut() {
                         if !op.intersects_aabb(&cs.global_min, &cs.global_max) { continue; }
                         let from = cs.edits.ops.len();
-                        cs.edits.push(op.clone());
+                        cs.edits.push_at(op.clone(), seq);
                         changed += cs.apply_edits_to_loaded(&mut *gl.quad_context, color_mode, from);
                         touched += 1;
                     }
