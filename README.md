@@ -5,7 +5,8 @@ A point-cloud viewer for LAS / LAZ data, built with
 [egui](https://github.com/emilk/egui). It renders large clouds with an
 orthographic camera, extracts vertical cross sections, overlays polylines, lets
 you reclassify points by hand, and exports the result with chosen classes
-filtered out.
+filtered out. Alongside the clouds it shows 3D Tiles meshes and Gaussian
+splats, for looking at — see [Meshes and splats](#meshes-and-splats).
 
 ![haiviz screenshot](docs/haiviz.png)
 
@@ -92,12 +93,63 @@ own **Unload** control.
 
 You can create COPC files out of conventional LAZ files with [copc-converter](https://github.com/360-geo/copc-converter).
 
+A 3D Tiles `tileset.json` (or the folder holding it, if the folder has no
+LAS/LAZ in it) or a Gaussian-splat `.ply` can be passed as `PATH` too, and is
+loaded as in [Meshes and splats](#meshes-and-splats).
+
+## Meshes and splats
+
+```sh
+cargo run --release -- /path/to/tiles/tileset.json
+cargo run --release -- /path/to/splats.ply
+```
+
+Both are layers beside the point clouds, in any loading mode: open them with
+**Open tileset / splats…** in the **Meshes & splats** section, **Open file…**,
+drag & drop or `PATH`, and they land in the clouds' coordinate frame. They are
+depth-tested against the points both ways, cut by the **Height filter**, and
+framed by **Zoom All**. They are for looking at only: Point Info, Measure,
+snapping, sections, classification and export all work on the points alone.
+
+**3D Tiles** (1.1, and 1.0's `b3dm` and `cmpt` content) stream by
+screen-space error: finer tiles load as you zoom in, on background threads, and
+tiles not on screen are released once the **GPU budget** is exceeded. **Mesh
+detail** is the error, in screen pixels, allowed before a finer tile is
+loaded — lower is sharper and loads more. Content is glTF 2.0, binary or JSON,
+with vertex colours and/or PNG / JPEG / WebP textures; quantised meshes
+(`KHR_mesh_quantization`) and `KHR_texture_transform` are read.
+**Lighting** follows the material (`KHR_materials_unlit` is drawn as is, the way
+`haires amesh` bakes its sun into the colours), or can be forced on or off.
+
+- A tileset in a projected CRS — as `haires amesh` writes them, in RD/NAP —
+  lands on clouds in that CRS directly. A tileset in ECEF (EPSG:4978, as most
+  published tilesets are) is shown in a local east-north-up frame at its
+  centre: upright, but not aligned with projected clouds.
+- Not supported: Draco and meshopt compression, KTX2 / Basis textures (the
+  mesh is drawn without them), implicit tiling, and `i3dm` / `pnts` content.
+  A tile that cannot be read is counted under the tileset with the reason.
+
+**Gaussian splats** are read from the uncompressed PLY that 3DGS trainers
+write (Inria, Brush, gsplat, nerfstudio). They are drawn as ellipses, sorted
+back to front whenever the view turns. Colour is the base (DC) colour; the
+view-dependent spherical-harmonic bands are not used. A `scene.json` with
+`origin_rd` (and `horizontal_scale`) beside the PLY or up to three folders
+above it — what the haires splat pipeline trains from — places the splats in
+RD/NAP; without one the PLY's coordinates are used as they are.
+
+**Crop floaters** (on by default) hides splats centred well outside the scene:
+training surrounds a scene with large, faint background splats, and under an
+orthographic camera every one along the line of sight lands in front of it.
+SuperSplat's compressed PLY is not read yet.
+
 ## The panel
 
 Everything lives in one panel docked to the left of the window, with
 collapsible sections:
 
 - **Controls** — camera, colouring, height filter, cross sections, measure;
+- **Meshes & splats** — 3D Tiles and Gaussian splats, with their detail,
+  budget and lighting;
 - **Classes** — labels, colours and visibility per class, and the class
   definition files;
 - **Classification** — the lasso tools, **Undo last op** and **Export**, which

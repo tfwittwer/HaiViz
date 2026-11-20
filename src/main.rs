@@ -41,6 +41,10 @@ mod edge_follow;
 mod gcp;
 mod classify;
 mod export;
+mod gltf_load;
+mod tiles3d;
+mod splats;
+mod layers;
 
 mod view_cube {
     use macroquad::prelude::*;
@@ -385,6 +389,13 @@ impl LassoKind {
     }
 }*/
 
+/// What a queued path turned out to be, once read far enough to know its
+/// world box.
+enum LoadSource {
+    Cloud { copc: bool },
+    Layer(layers::Prepared),
+}
+
 /// Unproject screen coordinates to world XY plane at given Z height.
 /// The part of the window the 3D and section views render into.
 ///
@@ -616,7 +627,8 @@ fn resolve_snap(
     // the distances along and across the ray become small numbers that f32 —
     // which the grids work in — resolves to well under a millimetre. From the
     // near plane, the tube test itself had centimetres of noise in it.
-    let start = loaded_aabb_viewer(stages, copc_stages, tile_mgr)
+    // Clouds only: snapping never lands on a mesh or a splat.
+    let start = loaded_aabb_viewer(stages, copc_stages, tile_mgr, None)
         .and_then(|(lo, hi)| {
             let pad = glam::DVec3::splat(r as f64 + 1.0);
             ray_box_entry(ray_o, ray_d, lo.as_dvec3() - pad, hi.as_dvec3() + pad)
@@ -1256,6 +1268,28 @@ fn height_color_controls(
 /// the quad discards, which is exactly where there are no points. Drawn first,
 /// these overlays vanish over the cloud — precisely where they are needed.
 #[allow(clippy::too_many_arguments)]
+/// Draw the meshes and splats over the cloud just rendered — once a frame,
+/// whichever render block gets there first.
+#[allow(clippy::too_many_arguments)]
+fn draw_layers(
+    layers: &layers::Layers,
+    drawn: &mut bool,
+    view_proj: &glam::Mat4,
+    front: Vec3,
+    right: Vec3,
+    up: Vec3,
+    view: ViewRect,
+    z_clip: crate::raw_miniquad::ZClip,
+) {
+    if *drawn || layers.is_empty() {
+        return;
+    }
+    *drawn = true;
+    let mut gl = unsafe { get_internal_gl() };
+    gl.flush();
+    layers.draw(&mut *gl.quad_context, view_proj, front, right, up, view.gl(), z_clip);
+}
+
 fn draw_3d_overlays(
     app_mode: AppMode,
     measure_a: Option<Vec3>,
@@ -2567,10 +2601,17 @@ fn loaded_aabb_viewer(
     stages: &[Stage],
     copc_stages: &[CopcStage],
     tile_mgr: &Option<TileStageManager>,
+    layers: Option<(Vec3, Vec3)>,
 ) -> Option<(Vec3, Vec3)> {
     let mut lo = [f32::MAX; 3];
     let mut hi = [f32::MIN; 3];
     let mut any = false;
+    // Meshes and splats, already in viewer space.
+    if let Some((l, h)) = layers {
+        lo = l.to_array();
+        hi = h.to_array();
+        any = true;
+    }
     for s in stages {
         for k in 0..3 {
             lo[k] = lo[k].min((s.cloud.min[k] - s.viewer_origin[k]) as f32);
@@ -2604,7 +2645,14 @@ async fn main() {
     info!(" *** HaiViz {} ***",env!("CARGO_PKG_VERSION"));
     let args: Vec<String> = env::args().collect();
     let input_path: Option<&str> = if args.len() >= 2 { Some(args[1].as_str()) } else { None };
-    if input_path.is_none() {
+    // A tileset or splat file on the command line goes through the same
+    // queue as a dropped one, in the first frame; the startup modes below
+    // are all point-cloud modes.
+    let startup_layer: Option<String> = input_path
+        .filter(|p| !matches!(layers::classify(Path::new(p)), layers::LoadKind::PointCloud))
+        .map(str::to_string);
+    let input_path = if startup_layer.is_some() { None } else { input_path };
+    if input_path.is_none() && startup_layer.is_none() {
         info!("Launched with no input — drag .laz / .copc.laz files onto the window to load.");
     }
     let is_tile_mode = input_path.map(|p| Path::new(p).is_dir()).unwrap_or(false);
@@ -2929,7 +2977,12 @@ async fn main() {
     let mut stage_unload_request: Option<usize> = None;
     // File paths queued for loading. Populated by the drag-and-drop handler
     // and by the "Open file…" button; drained at the top of each frame.
-    let mut pending_loads: Vec<String> = Vec::new();
+    let mut pending_loads: Vec<String> = startup_layer.into_iter().collect();
+    // 3D Tiles tilesets and Gaussian splats, drawn with the clouds.
+    let mut layers = layers::Layers::default();
+    // Set once the layers have been drawn this frame. With both LAZ and COPC
+    // files loaded two render blocks run, and the layers belong to the first.
+    let mut layers_drawn;
 
     // Windows-only: number of entries already taken from miniquad's drop list
     // (the list only grows on Windows, so we track how many we've consumed).
@@ -2971,11 +3024,29 @@ async fn main() {
 
         // ---- Drain the pending-load queue ----
         for path_str in pending_loads.drain(..) {
-            let header = match las::Reader::from_path(&path_str) {
-                Ok(r) => r.header().clone(),
-                Err(e) => { error!("Cannot open file {}: {}", path_str, e); continue; }
+            // What the file is decides its loader; its world box pins the
+            // frame if it is the first thing loaded.
+            let (source, lo, hi) = match layers::classify(Path::new(&path_str)) {
+                layers::LoadKind::PointCloud => {
+                    let header = match las::Reader::from_path(&path_str) {
+                        Ok(r) => r.header().clone(),
+                        Err(e) => { error!("Cannot open file {}: {}", path_str, e); continue; }
+                    };
+                    let b = header.bounds();
+                    (LoadSource::Cloud { copc: header.copc_info_vlr().is_some() }, [b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z])
+                }
+                kind => match layers::prepare(kind) {
+                    Ok(p) => {
+                        let (lo, hi) = p.world_bounds();
+                        (LoadSource::Layer(p), lo, hi)
+                    }
+                    Err(e) => {
+                        error!("Cannot load {}: {}", path_str, e);
+                        layers.status = Some(e);
+                        continue;
+                    }
+                },
             };
-            let is_copc = header.copc_info_vlr().is_some();
             // A drop into a previously-empty viewer should also re-fit the camera;
             // otherwise the default startup framing (sized for the 100×100 placeholder
             // extents) leaves the new data way off-screen until the user clicks Zoom All.
@@ -2983,12 +3054,11 @@ async fn main() {
             // Seed the session's viewer origin from the first load; reuse
             // afterwards so every stage lives in the same coordinate space.
             let origin = pinned_viewer_origin.unwrap_or_else(|| {
-                let b = header.bounds();
-                let o = [b.min.x, b.min.y, b.min.z];
+                let o = lo;
                 info!("Pinning viewer origin to first loaded file: {:?}", o);
-                let dx = (b.max.x - b.min.x) as f32;
-                let dy = (b.max.y - b.min.y) as f32;
-                let dz = (b.max.z - b.min.z) as f32;
+                let dx = (hi[0] - lo[0]) as f32;
+                let dy = (hi[1] - lo[1]) as f32;
+                let dz = (hi[2] - lo[2]) as f32;
                 if data_extent_x <= 100.5 && data_extent_y <= 100.5 {
                     data_extent_x = dx.max(1.0);
                     data_extent_y = dy.max(1.0);
@@ -3008,14 +3078,22 @@ async fn main() {
                 z_clip_enabled = false;
             }
             let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
-            if is_copc {
+            let is_copc = match source {
+                LoadSource::Layer(layer) => {
+                    layers.attach(ctx, layer, origin, front);
+                    info!("Loaded {}", path_str);
+                    None
+                }
+                LoadSource::Cloud { copc } => Some(copc),
+            };
+            if is_copc == Some(true) {
                 let mut cs = CopcStage::new(ctx, &path_str, Some(origin), color_mode, class_defs.clone());
                 cs.color_h_min = height_color_min;
                 cs.color_h_max = height_color_max;
                 cs.rebuild_colors(ctx, color_mode);
                 info!("Loaded COPC file: {}", path_str);
                 copc_stages.push(cs);
-            } else {
+            } else if is_copc == Some(false) {
                 let mut s = Stage::new(ctx, &path_str, Some(origin), color_mode, class_defs.clone());
                 s.color_h_min = height_color_min;
                 s.color_h_max = height_color_max;
@@ -3076,12 +3154,17 @@ async fn main() {
                 s => s,
             };
         }
+        {
+            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+            layers.apply_unload(ctx);
+        }
+        layers_drawn = false;
 
         // If everything has been unloaded, forget the pinned coordinate frame and
         // reset the placeholder extents. The next load then re-pins the viewer origin
         // to the new data's location and re-fits the camera (the `was_empty` path),
         // so loading clouds in a different place frames correctly.
-        if stages.is_empty() && copc_stages.is_empty() && tile_mgr.is_none() {
+        if stages.is_empty() && copc_stages.is_empty() && tile_mgr.is_none() && layers.is_empty() {
             pinned_viewer_origin = None;
             data_extent_x = 100.0;
             data_extent_y = 100.0;
@@ -4391,6 +4474,13 @@ async fn main() {
         set_camera(&camera);
         let view_proj: glam::Mat4 = camera.matrix();
         //println!("{}",view_proj);
+        if !layers.is_empty() {
+            // Tile selection is in physical pixels, the ones the screen-space
+            // error is actually seen in.
+            let mpp_phys = ortho_scale * 2.0 / (view_rect.gl().3.max(1) as f32);
+            let InternalGlContext { quad_context: ctx, .. } = unsafe { get_internal_gl() };
+            layers.update(ctx, &view_proj, front, mpp_phys);
+        }
 
         let (mx, my) = macroquad::input::mouse_position();
         let cursor_world = screen_to_world_xy(mx, my, &view_proj, mid_z, view_rect);
@@ -4684,7 +4774,9 @@ async fn main() {
         // after the cloud has been composited. See `draw_3d_overlays`.
 
         // ---- Single-file (multi-Stage) mode rendering ----
-        if !stages.is_empty() {
+        // Also the block for meshes and splats loaded on their own: it is the
+        // one with no cloud of its own to require.
+        if !stages.is_empty() || (copc_stages.is_empty() && tile_mgr.is_none() && !layers.is_empty()) {
             // Render points across all stages (with optional EDL post-process)
             let drawn = {
                 let mut gl = unsafe { get_internal_gl() };
@@ -4717,6 +4809,9 @@ async fn main() {
                 }
                 drawn
             };
+            // Meshes and splats over the cloud, depth-tested against it, and
+            // under the overlays.
+            draw_layers(&layers, &mut layers_drawn, &view_proj, front, right, up, view_rect, z_clip);
 
             draw_3d_overlays(
                 app_mode, measure_a, measure_b, section_start, section_end,
@@ -4892,7 +4987,10 @@ async fn main() {
                             ui.label("Loaded files:");
                             if ui.button("Open file…").clicked()
                                 && let Some(paths) = rfd::FileDialog::new()
+                                    .add_filter("All supported", &["laz", "las", "json", "ply"])
                                     .add_filter("LAS / LAZ", &["laz", "las"])
+                                    .add_filter("3D Tiles tileset", &["json"])
+                                    .add_filter("Gaussian splats", &["ply"])
                                     .pick_files()
                             {
                                 for p in paths {
@@ -4952,6 +5050,7 @@ async fn main() {
                 class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
                 // Classification: the lasso tools and the export that consumes
                 // them, together because they are one job.
+                panel_section(ui, "Meshes & splats", true, |ui| layers.ui(ui, &mut pending_loads));
                 panel_section(ui, "Classification", false, |ui| {
                     if let Some(kind) = ground_tool_controls(
                         ui, &mut app_mode, ground_lasso.len(), lasso_kind,
@@ -5036,7 +5135,7 @@ async fn main() {
             }
 
             if do_zoom_all
-                && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr)
+                && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr, layers.aabb_viewer(data_offset))
             {
                 let aspect = view_rect.aspect();
                 let center = (lo + hi) * 0.5;
@@ -5207,6 +5306,9 @@ async fn main() {
                 }
                 drawn
             };
+            // Meshes and splats over the cloud, depth-tested against it, and
+            // under the overlays.
+            draw_layers(&layers, &mut layers_drawn, &view_proj, front, right, up, view_rect, z_clip);
 
             draw_3d_overlays(
                 app_mode, measure_a, measure_b, section_start, section_end,
@@ -5381,7 +5483,10 @@ async fn main() {
                             ui.label("Loaded COPC files:");
                             if ui.button("Open file…").clicked()
                                 && let Some(paths) = rfd::FileDialog::new()
+                                    .add_filter("All supported", &["laz", "las", "json", "ply"])
                                     .add_filter("LAS / LAZ", &["laz", "las"])
+                                    .add_filter("3D Tiles tileset", &["json"])
+                                    .add_filter("Gaussian splats", &["ply"])
                                     .pick_files()
                             {
                                 for p in paths {
@@ -5429,6 +5534,7 @@ async fn main() {
                 class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
                 // Classification: the lasso tools and the export that consumes
                 // them, together because they are one job.
+                panel_section(ui, "Meshes & splats", true, |ui| layers.ui(ui, &mut pending_loads));
                 panel_section(ui, "Classification", false, |ui| {
                     if let Some(kind) = ground_tool_controls(
                         ui, &mut app_mode, ground_lasso.len(), lasso_kind,
@@ -5518,7 +5624,7 @@ async fn main() {
             }
 
             if do_zoom_all
-                && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr)
+                && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr, layers.aabb_viewer(data_offset))
             {
                 let aspect = view_rect.aspect();
                 let center = (lo + hi) * 0.5;
@@ -5692,6 +5798,7 @@ async fn main() {
                 }
                 result
             };
+            draw_layers(&layers, &mut layers_drawn, &view_proj, front, right, up, view_rect, z_clip);
 
             // Tile footprints, after the composite for the same reason as the
             // overlays: a footprint over loaded points would otherwise be
@@ -5958,6 +6065,7 @@ async fn main() {
                 class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
                 // Classification: the lasso tools and the export that consumes
                 // them, together because they are one job.
+                panel_section(ui, "Meshes & splats", true, |ui| layers.ui(ui, &mut pending_loads));
                 panel_section(ui, "Classification", false, |ui| {
                     if let Some(kind) = ground_tool_controls(
                         ui, &mut app_mode, ground_lasso.len(), lasso_kind,
@@ -6042,7 +6150,7 @@ async fn main() {
             }
 
             if do_zoom_all
-                && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr)
+                && let Some((lo, hi)) = loaded_aabb_viewer(&stages, &copc_stages, &tile_mgr, layers.aabb_viewer(data_offset))
             {
                 let aspect = view_rect.aspect();
                 let center = (lo + hi) * 0.5;
@@ -6181,7 +6289,7 @@ async fn main() {
 
         // ---- Empty state: no data loaded ----
         // Show a minimal Controls window so the user knows how to load files.
-        if stages.is_empty() && copc_stages.is_empty() && tile_mgr.is_none() {
+        if stages.is_empty() && copc_stages.is_empty() && tile_mgr.is_none() && layers.is_empty() {
             egui_macroquad::ui(|egui_ctx| {
                 egui_macroquad::egui::SidePanel::left("haiviz_panel")
                     .resizable(true)
@@ -6192,14 +6300,20 @@ async fn main() {
                         ui.label("No point cloud loaded.");
                         if ui.button("Open file…").clicked()
                             && let Some(paths) = rfd::FileDialog::new()
+                                .add_filter("All supported", &["laz", "las", "json", "ply"])
                                 .add_filter("LAS / LAZ", &["laz", "las"])
+                                .add_filter("3D Tiles tileset", &["json"])
+                                .add_filter("Gaussian splats", &["ply"])
                                 .pick_files()
                         {
                             for p in paths {
                                 pending_loads.push(p.to_string_lossy().to_string());
                             }
                         }
-                        ui.label("…or drag a .laz / .copc.laz file onto the window (Windows / X11).");
+                        ui.label("…or drag a .laz / .copc.laz file, a 3D Tiles tileset.json or a Gaussian-splat .ply onto the window (Windows / X11).");
+                        if let Some(e) = &layers.status {
+                            ui.colored_label(egui_macroquad::egui::Color32::LIGHT_RED, e);
+                        }
                         // Nothing is loaded, so there is nothing to classify,
                         // digitise or export; the panel stays a single group.
                 });

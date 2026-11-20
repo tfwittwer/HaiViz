@@ -1,6 +1,6 @@
 [package]
 name = "haiviz"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 
 [dependencies]
@@ -16,6 +16,11 @@ rfd = "0.15"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 env_logger = "0.11"
 log = "0.4"
+# 3D Tiles: tileset.json and glTF JSON, and the textures in the tiles.
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# Gaussian splats: PLY decoding and the back-to-front sort.
+rayon = "1"
 
 [dev-dependencies]
 criterion = "0.7"

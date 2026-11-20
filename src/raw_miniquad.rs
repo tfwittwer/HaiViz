@@ -485,7 +485,7 @@
         }
     }
 
-    fn extract_frustum_planes(vp: &glam::Mat4) -> [[f32; 4]; 6] {
+    pub(crate) fn extract_frustum_planes(vp: &glam::Mat4) -> [[f32; 4]; 6] {
         let c = vp.to_cols_array_2d();
         let mut planes = [[0.0f32; 4]; 6];
         for i in 0..4 {
@@ -507,7 +507,7 @@
         planes
     }
 
-    fn aabb_outside_frustum(planes: &[[f32; 4]; 6], amin: &[f32; 3], amax: &[f32; 3]) -> bool {
+    pub(crate) fn aabb_outside_frustum(planes: &[[f32; 4]; 6], amin: &[f32; 3], amax: &[f32; 3]) -> bool {
         for plane in planes {
             let px = if plane[0] >= 0.0 { amax[0] } else { amin[0] };
             let py = if plane[1] >= 0.0 { amax[1] } else { amin[1] };
