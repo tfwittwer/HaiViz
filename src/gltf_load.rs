@@ -1,10 +1,12 @@
-//! Decoding 3D Tiles content into triangle meshes, CPU side.
+//! Decoding 3D Tiles content into triangle meshes and points, CPU side.
 //!
 //! Content is glTF 2.0 — binary (GLB) or JSON — as 3D Tiles 1.1 has it, or
-//! one of the 1.0 wrappers around it that tilesets in the wild still carry:
-//! `b3dm` (a GLB behind a feature table that may hold `RTC_CENTER`) and
-//! `cmpt` (several tiles back to back). Instanced (`i3dm`) and point-cloud
-//! (`pnts`) content are refused with a reason rather than drawn wrong.
+//! one of the 1.0 formats tilesets in the wild still carry: `b3dm` (a GLB
+//! behind a feature table that may hold `RTC_CENTER`), `pnts` (a point cloud
+//! in a feature table) and `cmpt` (several tiles back to back). Points come
+//! from `pnts` and from glTF `POINTS` primitives, 1.1's way of storing them.
+//! Instanced (`i3dm`) content is refused with a reason rather than drawn
+//! wrong.
 //!
 //! Everything a worker thread can do happens here: the vertices leave in
 //! viewer space (world minus the session's viewer origin) as `f32`, already
@@ -59,9 +61,20 @@ pub struct CpuPrimitive {
     pub alpha_cutoff: Option<f32>,
 }
 
+/// A point cloud: one point per entry, drawn as haiviz draws its own points.
+pub struct CpuPoints {
+    /// Viewer space.
+    pub positions: Vec<[f32; 3]>,
+    /// sRGB; alpha is not drawn.
+    pub colors: Vec<[u8; 4]>,
+}
+
+/// One tile's content. A tile may hold triangles, points, or — inside a
+/// `cmpt` — both.
 #[derive(Default)]
 pub struct CpuMesh {
     pub primitives: Vec<CpuPrimitive>,
+    pub points: Vec<CpuPoints>,
     pub images: Vec<CpuImage>,
     /// Things that were dropped rather than drawn wrong — an undecodable
     /// texture, a line primitive. The tile still shows.
@@ -73,7 +86,13 @@ impl CpuMesh {
         self.primitives.iter().map(|p| p.indices.len() / 3).sum()
     }
 
-    fn append(&mut self, mut other: CpuMesh) {
+    pub fn point_count(&self) -> usize {
+        self.points.iter().map(|p| p.positions.len()).sum()
+    }
+
+    /// Merge another tile's content in, keeping texture indices pointing at
+    /// the right images.
+    pub fn append(&mut self, mut other: CpuMesh) {
         let base = self.images.len();
         for p in &mut other.primitives {
             if let Some(t) = p.texture.as_mut() {
@@ -82,6 +101,7 @@ impl CpuMesh {
         }
         self.images.append(&mut other.images);
         self.primitives.append(&mut other.primitives);
+        self.points.append(&mut other.points);
         self.warnings.append(&mut other.warnings);
     }
 }
@@ -114,7 +134,7 @@ pub fn decode_content(bytes: &[u8], base_dir: &Path, tile_to_world: &DMat4, orig
         b"b3dm" => decode_b3dm(bytes, base_dir, tile_to_world, origin),
         b"cmpt" => decode_cmpt(bytes, base_dir, tile_to_world, origin),
         b"i3dm" => Err("instanced content (i3dm) is not supported".into()),
-        b"pnts" => Err("point-cloud content (pnts) is not supported".into()),
+        b"pnts" => decode_pnts(bytes, tile_to_world, origin),
         _ => {
             let first = bytes.iter().find(|b| !b.is_ascii_whitespace()).copied();
             if first == Some(b'{') {
@@ -186,6 +206,80 @@ fn decode_b3dm(bytes: &[u8], base_dir: &Path, tile_to_world: &DMat4, origin: [f6
         return Err("b3dm does not embed a binary glTF".into());
     }
     decode_glb(glb, base_dir, tile_to_world, rtc, origin)
+}
+
+/// A 1.0 point cloud. Positions are in the tile's own z-up frame — no glTF
+/// axis swap — optionally relative to `RTC_CENTER`, and either plain floats or
+/// 16-bit quantised over `QUANTIZED_VOLUME_OFFSET` / `_SCALE`. Colours are
+/// sRGB, as viewers display them, and kept as they are. Normals and the batch
+/// table are not read: points are drawn unlit.
+fn decode_pnts(bytes: &[u8], tile_to_world: &DMat4, origin: [f64; 3]) -> Result<CpuMesh, String> {
+    let ft_json = u32_at(bytes, 12)? as usize;
+    let ft_bin = u32_at(bytes, 16)? as usize;
+    let json = bytes.get(28..28 + ft_json).ok_or("pnts feature table runs past the end")?;
+    let ft: Value = serde_json::from_slice(json).map_err(|e| format!("pnts feature table: {e}"))?;
+    let bin = bytes
+        .get(28 + ft_json..28 + ft_json + ft_bin)
+        .ok_or("pnts feature table binary runs past the end")?;
+    if ft.get("extensions").and_then(|e| e.get("3DTILES_draco_point_compression")).is_some() {
+        return Err("3DTILES_draco_point_compression is not supported".into());
+    }
+    let n = ft.get("POINTS_LENGTH").and_then(Value::as_u64).ok_or("pnts without POINTS_LENGTH")? as usize;
+
+    // A per-point semantic is `{"byteOffset": k}` into the binary body.
+    let section = |key: &str, size: usize| -> Result<Option<&[u8]>, String> {
+        let Some(v) = ft.get(key) else { return Ok(None) };
+        let off = usize_of(v, "byteOffset").ok_or_else(|| format!("pnts {key} has no byteOffset"))?;
+        bin.get(off..off + n * size)
+            .map(Some)
+            .ok_or_else(|| format!("pnts {key} runs past the feature table"))
+    };
+    let f32_at = |c: &[u8], k: usize| f32::from_le_bytes([c[k], c[k + 1], c[k + 2], c[k + 3]]) as f64;
+    let u16_at = |c: &[u8], k: usize| u16::from_le_bytes([c[k], c[k + 1]]);
+
+    let rtc = f64s::<3>(ft.get("RTC_CENTER")).map(DVec3::from).unwrap_or(DVec3::ZERO);
+    let m = *tile_to_world * DMat4::from_translation(rtc);
+    let o = DVec3::from(origin);
+    let to_viewer = |p: DVec3| {
+        let w = m.transform_point3(p) - o;
+        [w.x as f32, w.y as f32, w.z as f32]
+    };
+    let positions: Vec<[f32; 3]> = if let Some(p) = section("POSITION", 12)? {
+        p.chunks_exact(12).map(|c| to_viewer(DVec3::new(f32_at(c, 0), f32_at(c, 4), f32_at(c, 8)))).collect()
+    } else if let Some(q) = section("POSITION_QUANTIZED", 6)? {
+        let off = f64s::<3>(ft.get("QUANTIZED_VOLUME_OFFSET")).ok_or("pnts POSITION_QUANTIZED without QUANTIZED_VOLUME_OFFSET")?;
+        let scale = f64s::<3>(ft.get("QUANTIZED_VOLUME_SCALE")).ok_or("pnts POSITION_QUANTIZED without QUANTIZED_VOLUME_SCALE")?;
+        let (off, step) = (DVec3::from(off), DVec3::from(scale) / 65535.0);
+        q.chunks_exact(6)
+            .map(|c| to_viewer(off + DVec3::new(u16_at(c, 0) as f64, u16_at(c, 2) as f64, u16_at(c, 4) as f64) * step))
+            .collect()
+    } else {
+        return Err("pnts without POSITION or POSITION_QUANTIZED".into());
+    };
+
+    let colors: Vec<[u8; 4]> = if let Some(c) = section("RGBA", 4)? {
+        c.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+    } else if let Some(c) = section("RGB", 3)? {
+        c.chunks_exact(3).map(|c| [c[0], c[1], c[2], 255]).collect()
+    } else if let Some(c) = section("RGB565", 2)? {
+        c.chunks_exact(2)
+            .map(|c| {
+                let v = u16_at(c, 0) as u32;
+                let (r, g, b) = ((v >> 11) & 31, (v >> 5) & 63, v & 31);
+                [(r * 255 / 31) as u8, (g * 255 / 63) as u8, (b * 255 / 31) as u8, 255]
+            })
+            .collect()
+    } else if let Some(c) = f64s::<4>(ft.get("CONSTANT_RGBA")) {
+        vec![[c[0] as u8, c[1] as u8, c[2] as u8, c[3] as u8]; n]
+    } else {
+        vec![[255; 4]; n]
+    };
+
+    let mut out = CpuMesh::default();
+    if n > 0 {
+        out.points.push(CpuPoints { positions, colors });
+    }
+    Ok(out)
 }
 
 fn decode_cmpt(bytes: &[u8], base_dir: &Path, tile_to_world: &DMat4, origin: [f64; 3]) -> Result<CpuMesh, String> {
@@ -302,6 +396,17 @@ fn read_uri(uri: &str, base_dir: &Path) -> Result<Vec<u8>, String> {
 struct Attr {
     data: Vec<f32>,
     ncomp: usize,
+}
+
+/// A `POSITION` accessor through the full transform, into viewer space.
+fn viewer_positions(pos: &Attr, full: &DMat4, origin: DVec3) -> Vec<[f32; 3]> {
+    (0..pos.len())
+        .map(|i| {
+            let p = pos.get::<3>(i, [0.0; 3]);
+            let w = full.transform_point3(DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64)) - origin;
+            [w.x as f32, w.y as f32, w.z as f32]
+        })
+        .collect()
 }
 
 impl Attr {
@@ -563,6 +668,24 @@ impl<'a> Gltf<'a> {
         })
     }
 
+    /// `COLOR_0` as sRGB bytes (glTF stores it linear), or white.
+    fn colors(&self, attrs: &Value, n: usize) -> Result<Vec<[u8; 4]>, String> {
+        Ok(match usize_of(attrs, "COLOR_0").map(|i| self.accessor(i)).transpose()? {
+            Some(a) if a.len() == n => (0..n)
+                .map(|i| {
+                    let c = a.get::<4>(i, [1.0; 4]);
+                    [
+                        (linear_to_srgb(c[0]) * 255.0 + 0.5) as u8,
+                        (linear_to_srgb(c[1]) * 255.0 + 0.5) as u8,
+                        (linear_to_srgb(c[2]) * 255.0 + 0.5) as u8,
+                        (c[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                    ]
+                })
+                .collect(),
+            _ => vec![[255; 4]; n],
+        })
+    }
+
     fn to_mesh(&self, tile_to_world: &DMat4, rtc: DVec3, origin: [f64; 3]) -> Result<CpuMesh, String> {
         let mut out = CpuMesh::default();
         // CESIUM_RTC is the glTF-side spelling of b3dm's RTC_CENTER.
@@ -590,9 +713,10 @@ impl<'a> Gltf<'a> {
                 if prim.get("extensions").and_then(|e| e.get("KHR_draco_mesh_compression")).is_some() {
                     return Err("KHR_draco_mesh_compression is not supported".into());
                 }
+                // 0 is POINTS; 4, 5 and 6 are triangles, strips and fans.
                 let mode = usize_of(prim, "mode").unwrap_or(4);
-                if !(4..=6).contains(&mode) {
-                    out.warnings.push(format!("primitive mode {mode} (points/lines) skipped"));
+                if mode != 0 && !(4..=6).contains(&mode) {
+                    out.warnings.push(format!("primitive mode {mode} (lines) skipped"));
                     continue;
                 }
                 let attrs = prim.get("attributes").ok_or("primitive without attributes")?;
@@ -620,6 +744,36 @@ impl<'a> Gltf<'a> {
                     Some("MASK") => Some(material.and_then(|m| m.get("alphaCutoff")).and_then(Value::as_f64).unwrap_or(0.5) as f32),
                     _ => None,
                 };
+
+                if mode == 0 {
+                    // A point cloud, 1.1 style: no normals, no texture. The
+                    // material's factor tints the points as it would a mesh;
+                    // indices, if any, pick which vertices are points.
+                    let positions = viewer_positions(&pos, &full, origin);
+                    let mut colors = self.colors(attrs, n)?;
+                    if base_color[..3] != [1.0; 3] {
+                        for c in &mut colors {
+                            for k in 0..3 {
+                                c[k] = (c[k] as f32 * base_color[k] + 0.5) as u8;
+                            }
+                        }
+                    }
+                    let (positions, colors) = match usize_of(prim, "indices") {
+                        Some(i) => {
+                            let sel = self.indices(i)?;
+                            if sel.iter().any(|&k| k as usize >= n) {
+                                return Err("index out of range of the vertices".into());
+                            }
+                            (
+                                sel.iter().map(|&k| positions[k as usize]).collect(),
+                                sel.iter().map(|&k| colors[k as usize]).collect(),
+                            )
+                        }
+                        None => (positions, colors),
+                    };
+                    out.points.push(CpuPoints { positions, colors });
+                    continue;
+                }
 
                 // Base colour texture, with its texCoord set and transform.
                 let tex_info = pbr.and_then(|p| p.get("baseColorTexture"));
@@ -669,12 +823,7 @@ impl<'a> Gltf<'a> {
                     }
                 }
 
-                let mut positions = Vec::with_capacity(n);
-                for i in 0..n {
-                    let p = pos.get::<3>(i, [0.0; 3]);
-                    let w = full.transform_point3(DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64)) - origin;
-                    positions.push([w.x as f32, w.y as f32, w.z as f32]);
-                }
+                let positions = viewer_positions(&pos, &full, origin);
 
                 let normals_attr = usize_of(attrs, "NORMAL").map(|i| self.accessor(i)).transpose()?;
                 let has_normals = normals_attr.as_ref().is_some_and(|a| a.len() == n);
@@ -689,20 +838,7 @@ impl<'a> Gltf<'a> {
                     None => vec![[0.0; 3]; n],
                 };
 
-                let colors = match usize_of(attrs, "COLOR_0").map(|i| self.accessor(i)).transpose()? {
-                    Some(a) if a.len() == n => (0..n)
-                        .map(|i| {
-                            let c = a.get::<4>(i, [1.0; 4]);
-                            [
-                                (linear_to_srgb(c[0]) * 255.0 + 0.5) as u8,
-                                (linear_to_srgb(c[1]) * 255.0 + 0.5) as u8,
-                                (linear_to_srgb(c[2]) * 255.0 + 0.5) as u8,
-                                (c[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
-                            ]
-                        })
-                        .collect(),
-                    _ => vec![[255; 4]; n],
-                };
+                let colors = self.colors(attrs, n)?;
 
                 let uvs = match (texture, usize_of(attrs, &format!("TEXCOORD_{uv_set}"))) {
                     (Some(_), Some(i)) => {
@@ -790,7 +926,8 @@ mod tests {
 
     /// A one-triangle GLB, laid out by hand: positions f32, colours
     /// normalised u16 (as `haires amesh` writes them), u16 indices.
-    fn triangle_glb(extra_json: &str) -> Vec<u8> {
+    /// `prim_extra` is spliced into the primitive, `extra_json` into the root.
+    fn triangle_glb(prim_extra: &str, extra_json: &str) -> Vec<u8> {
         let mut bin = Vec::new();
         for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, -3.0]] {
             for c in p {
@@ -807,7 +944,7 @@ mod tests {
         }
         let json = format!(
             r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
-            "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0,"COLOR_0":1}},"indices":2,"material":0}}]}}],
+            "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0,"COLOR_0":1}},"indices":2,"material":0{prim_extra}}}]}}],
             "materials":[{{"extensions":{{"KHR_materials_unlit":{{}}}}}}],
             "accessors":[{{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}},
                          {{"bufferView":1,"componentType":5123,"normalized":true,"count":3,"type":"VEC4"}},
@@ -836,7 +973,7 @@ mod tests {
 
     #[test]
     fn glb_turns_y_up_into_z_up_and_applies_transform_and_origin() {
-        let glb = triangle_glb("");
+        let glb = triangle_glb("", "");
         let t = DMat4::from_translation(DVec3::new(1000.0, 2000.0, 10.0));
         let m = decode_content(&glb, Path::new("."), &t, [1000.0, 2000.0, 0.0]).unwrap();
         assert_eq!(m.primitives.len(), 1);
@@ -851,7 +988,7 @@ mod tests {
 
     #[test]
     fn b3dm_rtc_center_is_added_in_the_tile_frame() {
-        let glb = triangle_glb("");
+        let glb = triangle_glb("", "");
         let ft = br#"{"BATCH_LENGTH":0,"RTC_CENTER":[5.0,6.0,7.0]}"#;
         let mut ftj = ft.to_vec();
         while (28 + ftj.len()) % 8 != 0 {
@@ -871,8 +1008,83 @@ mod tests {
 
     #[test]
     fn draco_is_refused_with_its_name() {
-        let glb = triangle_glb(r#","extensionsRequired":["KHR_draco_mesh_compression"]"#);
+        let glb = triangle_glb("", r#","extensionsRequired":["KHR_draco_mesh_compression"]"#);
         let e = decode_content(&glb, Path::new("."), &DMat4::IDENTITY, [0.0; 3]).err().unwrap();
+        assert!(e.contains("draco"), "{e}");
+    }
+
+    #[test]
+    fn gltf_points_primitives_become_points() {
+        let glb = triangle_glb(r#","mode":0"#, "");
+        let m = decode_content(&glb, Path::new("."), &DMat4::IDENTITY, [0.0; 3]).unwrap();
+        assert!(m.primitives.is_empty());
+        assert_eq!(m.point_count(), 3);
+        assert_eq!(m.points[0].positions[2], [0.0, 3.0, 2.0]);
+        assert_eq!(m.points[0].colors[1], [255, 0, 0, 255]);
+    }
+
+    /// A `pnts` tile around a feature table, laid out as the spec pads it.
+    fn pnts(ft: &str, body: &[u8]) -> Vec<u8> {
+        let mut ftj = ft.as_bytes().to_vec();
+        while (28 + ftj.len()) % 8 != 0 {
+            ftj.push(b' ');
+        }
+        let mut b = Vec::new();
+        b.extend_from_slice(b"pnts");
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&((28 + ftj.len() + body.len()) as u32).to_le_bytes());
+        b.extend_from_slice(&(ftj.len() as u32).to_le_bytes());
+        b.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        b.extend_from_slice(&[0u8; 8]);
+        b.extend_from_slice(&ftj);
+        b.extend_from_slice(body);
+        b
+    }
+
+    #[test]
+    fn pnts_quantised_positions_land_in_the_tile_frame_without_an_axis_swap() {
+        let mut body = Vec::new();
+        for q in [[0u16, 0, 0], [65535, 0, 65535]] {
+            for c in q {
+                body.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        body.extend_from_slice(&[10, 20, 30, 40, 50, 60]);
+        let ft = r#"{"POINTS_LENGTH":2,"RTC_CENTER":[1,2,3],"QUANTIZED_VOLUME_OFFSET":[-10,-20,5],
+            "QUANTIZED_VOLUME_SCALE":[100,50,10],"POSITION_QUANTIZED":{"byteOffset":0},"RGB":{"byteOffset":12}}"#;
+        let t = DMat4::from_translation(DVec3::new(185735.0, 428319.0, 0.0));
+        let m = decode_content(&pnts(ft, &body), Path::new("."), &t, [185000.0, 428000.0, 0.0]).unwrap();
+        assert!(m.primitives.is_empty());
+        let p = &m.points[0];
+        assert_eq!(p.positions, vec![[726.0, 301.0, 8.0], [826.0, 301.0, 18.0]]);
+        assert_eq!(p.colors, vec![[10, 20, 30, 255], [40, 50, 60, 255]]);
+    }
+
+    #[test]
+    fn pnts_float_positions_and_packed_or_constant_colours() {
+        let mut body = Vec::new();
+        for c in [1.5f32, 2.5, 3.5] {
+            body.extend_from_slice(&c.to_le_bytes());
+        }
+        body.extend_from_slice(&0xF800u16.to_le_bytes());
+        let ft = r#"{"POINTS_LENGTH":1,"POSITION":{"byteOffset":0},"RGB565":{"byteOffset":12}}"#;
+        let m = decode_content(&pnts(ft, &body), Path::new("."), &DMat4::IDENTITY, [0.0; 3]).unwrap();
+        assert_eq!(m.points[0].positions, vec![[1.5, 2.5, 3.5]]);
+        assert_eq!(m.points[0].colors, vec![[255, 0, 0, 255]]);
+
+        let ft = r#"{"POINTS_LENGTH":1,"POSITION":{"byteOffset":0},"CONSTANT_RGBA":[0,128,255,255]}"#;
+        let m = decode_content(&pnts(ft, &body[..12]), Path::new("."), &DMat4::IDENTITY, [0.0; 3]).unwrap();
+        assert_eq!(m.points[0].colors, vec![[0, 128, 255, 255]]);
+    }
+
+    #[test]
+    fn pnts_that_lie_about_their_length_or_use_draco_are_refused() {
+        let ft = r#"{"POINTS_LENGTH":5,"POSITION":{"byteOffset":0}}"#;
+        let e = decode_content(&pnts(ft, &[0u8; 12]), Path::new("."), &DMat4::IDENTITY, [0.0; 3]).err().unwrap();
+        assert!(e.contains("runs past"), "{e}");
+        let ft = r#"{"POINTS_LENGTH":1,"POSITION":{"byteOffset":0},
+            "extensions":{"3DTILES_draco_point_compression":{"properties":{"POSITION":0},"byteOffset":0,"byteLength":12}}}"#;
+        let e = decode_content(&pnts(ft, &[0u8; 12]), Path::new("."), &DMat4::IDENTITY, [0.0; 3]).err().unwrap();
         assert!(e.contains("draco"), "{e}");
     }
 

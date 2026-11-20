@@ -7,9 +7,11 @@
 //! on points: picking, snapping, sections, classification and export all see
 //! only the clouds.
 //!
-//! Draw order, after the cloud's pass (and after EDL's composite and depth
-//! replay, when EDL is on): opaque meshes, then splats blended back to front
-//! over everything, testing depth but not writing it.
+//! Draw order: a tileset's points go in the cloud's own point pass, so EDL
+//! and the point size apply to them as to the clouds. After that pass (and
+//! after EDL's composite and depth replay, when EDL is on): opaque meshes,
+//! then splats blended back to front over everything, testing depth but not
+//! writing it.
 
 use std::path::{Path, PathBuf};
 
@@ -105,6 +107,9 @@ pub struct Layers {
     /// the orthographic view shows the whole screen at the nearest LOD, where
     /// 16 looked blobby on `haires amesh` tiles, so the default is sharper.
     pub max_sse: f32,
+    /// The same for point tiles. Their geometric error is about their point
+    /// spacing, so 1 px streams them as densely as a COPC cloud is.
+    pub point_sse: f32,
     pub budget_mb: f32,
     pub lighting: Lighting,
     /// The last load that failed, for the panel.
@@ -119,6 +124,7 @@ impl Default for Layers {
             tilesets: Vec::new(),
             splats: Vec::new(),
             max_sse: 8.0,
+            point_sse: 1.0,
             budget_mb: 2048.0,
             lighting: Lighting::Material,
             status: None,
@@ -185,10 +191,18 @@ impl Layers {
         let budget = (self.budget_mb as usize) << 20;
         let per = budget / self.tilesets.len().max(1);
         for t in &mut self.tilesets {
-            t.update(ctx, view_proj, mpp as f64, self.max_sse as f64, per, self.frame);
+            t.update(ctx, view_proj, mpp as f64, self.max_sse as f64, self.point_sse as f64, per, self.frame);
         }
         for s in &mut self.splats {
             s.update(ctx, front);
+        }
+    }
+
+    /// Draw the tilesets' points into the point pass that is current — the
+    /// EDL target or the default framebuffer — beside the clouds' own.
+    pub fn draw_points(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4, point_size: f32, z_clip: ZClip, depth_only: bool) {
+        for t in &self.tilesets {
+            t.draw_points(ctx, view_proj, point_size, z_clip, depth_only);
         }
     }
 
@@ -239,14 +253,24 @@ impl Layers {
                 }
             });
             let st = &t.stats;
+            let mut drawn = Vec::new();
+            if st.drawn_triangles > 0 || !t.has_points {
+                drawn.push(format!("{:.1} M triangles", st.drawn_triangles as f64 / 1e6));
+            }
+            if st.drawn_points > 0 || t.has_points {
+                drawn.push(format!("{:.1} M points", st.drawn_points as f64 / 1e6));
+            }
             ui.label(format!(
-                "  {} tiles drawn, {:.1} M triangles | {} loaded ({:.0} MB), {} queued",
+                "  {} tiles drawn, {} | {} loaded ({:.0} MB), {} queued",
                 st.drawn_tiles,
-                st.drawn_triangles as f64 / 1e6,
+                drawn.join(", "),
                 st.loaded,
                 st.gpu_bytes as f64 / (1 << 20) as f64,
                 st.queued,
             ));
+            if st.budget_full {
+                ui.colored_label(egui::Color32::YELLOW, "  GPU budget full: loading paused — raise the budget or lower the detail");
+            }
             if st.failed > 0 {
                 ui.colored_label(
                     egui::Color32::LIGHT_RED,
@@ -287,17 +311,36 @@ impl Layers {
                  training leaves around it, which an orthographic view puts in front of everything.",
             );
         }
-        if !self.tilesets.is_empty() {
+        let has_mesh = self.tilesets.iter().any(|t| t.has_mesh);
+        let has_points = self.tilesets.iter().any(|t| t.has_points);
+        if has_mesh {
             ui.horizontal(|ui| {
                 ui.label("Mesh detail:");
                 ui.add(egui::Slider::new(&mut self.max_sse, 1.0..=64.0).logarithmic(true).suffix(" px"))
                     .on_hover_text("Screen-space error allowed before a finer tile is loaded. Lower is sharper and loads more.");
             });
+        }
+        if has_points {
+            ui.horizontal(|ui| {
+                ui.label("Point detail:");
+                ui.add(egui::Slider::new(&mut self.point_sse, 0.25..=64.0).logarithmic(true).suffix(" px"))
+                    .on_hover_text(
+                        "Screen-space error allowed before a finer point tile is loaded — about the point spacing \
+                         on screen. Lower is denser and loads more. Point size and EDL are the clouds' settings.",
+                    );
+            });
+        }
+        if !self.tilesets.is_empty() {
             ui.horizontal(|ui| {
                 ui.label("GPU budget:");
                 ui.add(egui::Slider::new(&mut self.budget_mb, 256.0..=16384.0).logarithmic(true).suffix(" MB"))
-                    .on_hover_text("Tiles not on screen are released beyond this. Tiles on screen are never released.");
+                    .on_hover_text(
+                        "Tiles not on screen are released beyond this. Tiles on screen are never released; \
+                         when they fill it, loading pauses.",
+                    );
             });
+        }
+        if has_mesh {
             ui.horizontal(|ui| {
                 ui.label("Lighting:");
                 egui::ComboBox::from_id_salt("mesh_lighting")

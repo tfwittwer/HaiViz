@@ -14,6 +14,11 @@
 //! already loaded — as `haires amesh` writes them, in RD/NAP — and lands on
 //! them directly.
 //!
+//! Point-cloud content (`pnts`, or glTF `POINTS`) is drawn in the cloud's own
+//! point pass rather than with the meshes, so it gets the point size and EDL
+//! the clouds have. Its geometric error is roughly its point spacing, and a
+//! tile that holds points is refined against its own, finer threshold.
+//!
 //! One deliberate deviation from the spec: a tile *without content* never
 //! ends a traversal. Per spec it would, drawing nothing, and a tileset whose
 //! upper levels are empty containers then shows a blank screen over a range of
@@ -86,6 +91,9 @@ struct Node {
     depth: u32,
     state: State,
     last_used: u64,
+    /// The content is points: guessed from a `.pnts` URI until it has been
+    /// loaded once, then known.
+    points: bool,
 }
 
 struct GpuPrim {
@@ -97,11 +105,21 @@ struct GpuPrim {
     alpha_cutoff: f32,
 }
 
+/// Points draw through the tileset's shared index buffer (0, 1, 2, …), so
+/// they carry no indices of their own.
+struct GpuPoints {
+    pos: BufferId,
+    col: BufferId,
+    count: i32,
+}
+
 struct GpuTile {
     prims: Vec<GpuPrim>,
+    points: Vec<GpuPoints>,
     textures: Vec<TextureId>,
     bytes: usize,
     triangles: usize,
+    point_count: usize,
 }
 
 impl GpuTile {
@@ -132,6 +150,19 @@ impl GpuTile {
             })
             .collect();
         let triangles = mesh.triangle_count();
+        let point_count = mesh.point_count();
+        let points = mesh
+            .points
+            .iter()
+            .map(|p| {
+                bytes += p.positions.len() * (12 + 4);
+                GpuPoints {
+                    pos: ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Immutable, BufferSource::slice(&p.positions)),
+                    col: ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Immutable, BufferSource::slice(&p.colors)),
+                    count: p.positions.len() as i32,
+                }
+            })
+            .collect();
         let prims = mesh
             .primitives
             .into_iter()
@@ -156,7 +187,7 @@ impl GpuTile {
                 }
             })
             .collect();
-        GpuTile { prims, textures, bytes, triangles }
+        GpuTile { prims, points, textures, bytes, triangles, point_count }
     }
 
     fn free(self, ctx: &mut dyn RenderingBackend) {
@@ -165,6 +196,10 @@ impl GpuTile {
                 ctx.delete_buffer(vb);
             }
             ctx.delete_buffer(p.bindings.index_buffer);
+        }
+        for p in self.points {
+            ctx.delete_buffer(p.pos);
+            ctx.delete_buffer(p.col);
         }
         for t in self.textures {
             ctx.delete_texture(t);
@@ -203,7 +238,7 @@ fn spawn_loader_pool(rx: mpsc::Receiver<LoadReq>, tx: mpsc::Sender<LoadResult>, 
                     let mut result = Ok(());
                     for uri in &req.uris {
                         match gltf_load::load_content(uri, &req.transform, req.origin) {
-                            Ok(m) => mesh_append(&mut mesh, m),
+                            Ok(m) => mesh.append(m),
                             Err(e) => {
                                 result = Err(format!("{}: {e}", uri.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
                                 break;
@@ -218,18 +253,6 @@ fn spawn_loader_pool(rx: mpsc::Receiver<LoadReq>, tx: mpsc::Sender<LoadResult>, 
             })
             .expect("cannot spawn a tiles loader thread");
     }
-}
-
-fn mesh_append(into: &mut CpuMesh, mut other: CpuMesh) {
-    let base = into.images.len();
-    for p in &mut other.primitives {
-        if let Some(t) = p.texture.as_mut() {
-            *t += base;
-        }
-    }
-    into.images.append(&mut other.images);
-    into.primitives.append(&mut other.primitives);
-    into.warnings.append(&mut other.warnings);
 }
 
 // ---- Parsing ----
@@ -382,6 +405,8 @@ impl Parser<'_> {
             }
         }
         let idx = self.nodes.len();
+        let points = !uris.is_empty()
+            && uris.iter().all(|u| u.extension().is_some_and(|e| e.eq_ignore_ascii_case("pnts")));
         self.nodes.push(Node {
             children: Vec::new(),
             world_lo,
@@ -396,6 +421,7 @@ impl Parser<'_> {
             external,
             depth,
             last_used: 0,
+            points,
         });
         if let Some(children) = tile.get("children").and_then(Value::as_array) {
             for c in children {
@@ -425,6 +451,9 @@ pub struct TilesetStats {
     pub gpu_bytes: usize,
     pub drawn_tiles: usize,
     pub drawn_triangles: usize,
+    pub drawn_points: usize,
+    /// Loading has stopped because the tiles on screen fill the budget.
+    pub budget_full: bool,
     /// The first failure, so the panel can say why rather than only how many.
     pub first_error: Option<String>,
     pub warnings: usize,
@@ -442,6 +471,11 @@ pub struct Tileset {
     nodes: Vec<Node>,
     origin: [f64; 3],
     pipeline: Pipeline,
+    point_pipeline: Pipeline,
+    /// The point pipeline with colour writes off, for EDL's depth replay.
+    point_depth_pipeline: Pipeline,
+    /// 0, 1, 2, … for drawing points; grown to the largest tile seen.
+    iota: Option<(BufferId, usize)>,
     white: TextureId,
     req_tx: Option<mpsc::Sender<LoadReq>>,
     res_rx: mpsc::Receiver<LoadResult>,
@@ -451,6 +485,10 @@ pub struct Tileset {
     render: Vec<usize>,
     wishes: Vec<(u32, f32, usize)>,
     pub stats: TilesetStats,
+    /// What the tileset holds, as far as is known: the panel offers the
+    /// settings that apply.
+    pub has_points: bool,
+    pub has_mesh: bool,
 }
 
 /// Per-frame inputs to the traversal.
@@ -459,6 +497,7 @@ struct View {
     view_proj: glam::Mat4,
     mpp: f64,
     max_sse: f64,
+    point_sse: f64,
     frame: u64,
 }
 
@@ -506,6 +545,7 @@ impl Tileset {
         spawn_loader_pool(req_rx, res_tx, workers);
         let white = ctx.new_texture_from_rgba8(1, 1, &[255, 255, 255, 255]);
         info_tiles(&path, &nodes, ecef);
+        let (has_points, has_mesh) = content_kinds(&nodes);
         Tileset {
             path,
             visible: true,
@@ -514,6 +554,9 @@ impl Tileset {
             nodes,
             origin,
             pipeline: mesh_pipeline(ctx),
+            point_pipeline: point_pipeline(ctx, false),
+            point_depth_pipeline: point_pipeline(ctx, true),
+            iota: None,
             white,
             req_tx: Some(req_tx),
             res_rx,
@@ -529,10 +572,14 @@ impl Tileset {
                 gpu_bytes: 0,
                 drawn_tiles: 0,
                 drawn_triangles: 0,
+                drawn_points: 0,
+                budget_full: false,
                 first_error: None,
                 warnings: 0,
                 first_warning: None,
             },
+            has_points,
+            has_mesh,
         }
     }
 
@@ -551,8 +598,18 @@ impl Tileset {
     }
 
     /// Stream and select tiles for this frame. `mpp` is metres per physical
-    /// pixel — the unit `max_sse` is in.
-    pub fn update(&mut self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4, mpp: f64, max_sse: f64, budget_bytes: usize, frame: u64) {
+    /// pixel — the unit `max_sse` (meshes) and `point_sse` (points) are in.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(
+        &mut self,
+        ctx: &mut dyn RenderingBackend,
+        view_proj: &glam::Mat4,
+        mpp: f64,
+        max_sse: f64,
+        point_sse: f64,
+        budget_bytes: usize,
+        frame: u64,
+    ) {
         while let Ok(r) = self.res_rx.try_recv() {
             self.in_flight = self.in_flight.saturating_sub(1);
             self.ready.push_back(r);
@@ -560,6 +617,7 @@ impl Tileset {
         // Uploads are capped per frame so a burst of arrivals is spread over
         // a few frames instead of stalling one.
         let mut uploaded = 0usize;
+        let mut kinds_changed = false;
         while uploaded < 96 << 20 {
             let Some(r) = self.ready.pop_front() else { break };
             let node = &mut self.nodes[r.node];
@@ -572,7 +630,21 @@ impl Tileset {
                             self.stats.first_warning = Some(w.clone());
                         }
                     }
+                    let points = mesh.primitives.is_empty() && !mesh.points.is_empty();
+                    kinds_changed |= node.points != points;
+                    node.points = points;
+                    let largest = mesh.points.iter().map(|p| p.positions.len()).max().unwrap_or(0);
                     let tile = GpuTile::upload(ctx, mesh, self.white);
+                    if largest > self.iota.map_or(0, |(_, n)| n) {
+                        // Grown in steps so a run of ever so slightly larger
+                        // tiles is not a rebuild each.
+                        let n = largest.next_power_of_two();
+                        if let Some((old, _)) = self.iota.take() {
+                            ctx.delete_buffer(old);
+                        }
+                        let idx: Vec<u32> = (0..n as u32).collect();
+                        self.iota = Some((ctx.new_buffer(BufferType::IndexBuffer, BufferUsage::Immutable, BufferSource::slice(&idx)), n));
+                    }
                     uploaded += tile.bytes;
                     self.stats.gpu_bytes += tile.bytes;
                     self.stats.loaded += 1;
@@ -588,34 +660,23 @@ impl Tileset {
                 }
             }
         }
+        if kinds_changed {
+            (self.has_points, self.has_mesh) = content_kinds(&self.nodes);
+        }
 
         self.render.clear();
         self.wishes.clear();
         if self.visible {
-            let view = View { planes: extract_frustum_planes(view_proj), view_proj: *view_proj, mpp: mpp.max(1e-9), max_sse, frame };
+            let view = View {
+                planes: extract_frustum_planes(view_proj),
+                view_proj: *view_proj,
+                mpp: mpp.max(1e-9),
+                max_sse,
+                point_sse,
+                frame,
+            };
             self.visit(0, &view);
         }
-
-        // Coarse tiles first — they cover the most screen per byte — then
-        // the ones nearest the middle of the view.
-        self.wishes.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
-        let cap = self.workers * 2;
-        if let Some(tx) = &self.req_tx {
-            for &(_, _, i) in &self.wishes {
-                if self.in_flight >= cap {
-                    break;
-                }
-                let n = &mut self.nodes[i];
-                if !matches!(n.state, State::Unloaded) {
-                    continue;
-                }
-                if tx.send(LoadReq { node: i, uris: n.uris.clone(), transform: n.transform, origin: self.origin }).is_ok() {
-                    n.state = State::Queued;
-                    self.in_flight += 1;
-                }
-            }
-        }
-        self.stats.queued = self.in_flight + self.ready.len();
 
         // Evict the least recently used tiles not drawn this frame.
         if self.stats.gpu_bytes > budget_bytes {
@@ -639,12 +700,43 @@ impl Tileset {
             }
         }
 
+        // Then load, unless what is on screen already fills the budget: a
+        // detail setting the budget cannot hold stops at the coarser levels,
+        // which are asked for first, instead of running the GPU out of memory.
+        self.stats.budget_full = self.stats.gpu_bytes > budget_bytes;
+        // Coarse tiles first — they cover the most screen per byte — then
+        // the ones nearest the middle of the view.
+        self.wishes.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        let cap = self.workers * 2;
+        if let Some(tx) = &self.req_tx
+            && !self.stats.budget_full
+        {
+            for &(_, _, i) in &self.wishes {
+                if self.in_flight >= cap {
+                    break;
+                }
+                let n = &mut self.nodes[i];
+                if !matches!(n.state, State::Unloaded) {
+                    continue;
+                }
+                if tx.send(LoadReq { node: i, uris: n.uris.clone(), transform: n.transform, origin: self.origin }).is_ok() {
+                    n.state = State::Queued;
+                    self.in_flight += 1;
+                }
+            }
+        }
+        self.stats.queued = self.in_flight + self.ready.len();
+
         self.stats.drawn_tiles = self.render.len();
-        self.stats.drawn_triangles = self
-            .render
-            .iter()
-            .map(|&i| if let State::Loaded(t) = &self.nodes[i].state { t.triangles } else { 0 })
-            .sum();
+        let (mut tris, mut pts) = (0, 0);
+        for &i in &self.render {
+            if let State::Loaded(t) = &self.nodes[i].state {
+                tris += t.triangles;
+                pts += t.point_count;
+            }
+        }
+        self.stats.drawn_triangles = tris;
+        self.stats.drawn_points = pts;
     }
 
     /// Ask for a tile; true if it can be drawn now.
@@ -676,7 +768,8 @@ impl Tileset {
         let n = &self.nodes[i];
         let has_content = !matches!(n.state, State::Empty);
         let has_children = !n.children.is_empty();
-        let refine = has_children && (!has_content || n.geometric_error / view.mpp > view.max_sse);
+        let max_sse = if n.points { view.point_sse } else { view.max_sse };
+        let refine = has_children && (!has_content || n.geometric_error / view.mpp > max_sse);
         // A failed tile is as complete as it will ever be.
         let failed = matches!(n.state, State::Failed);
 
@@ -785,6 +878,36 @@ impl Tileset {
         }
     }
 
+    /// Draw the point content selected this frame, inside the cloud's point
+    /// pass. `depth_only` is EDL's depth replay, as for the clouds.
+    pub fn draw_points(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4, point_size: f32, z_clip: ZClip, depth_only: bool) {
+        let Some((iota, _)) = self.iota else { return };
+        if !self.visible || self.render.is_empty() {
+            return;
+        }
+        // EDL reads height as depth. Measured from the tileset's own bottom,
+        // over its own span, as each cloud does over its own.
+        let root = &self.nodes[0];
+        let span = root.hi[2] - root.lo[2];
+        let (depth_z0, depth_range) = if span.is_finite() && span > 0.0 && span < 1.0e6 { (root.lo[2], span) } else { (0.0, 0.0) };
+        ctx.apply_pipeline(if depth_only { &self.point_depth_pipeline } else { &self.point_pipeline });
+        ctx.apply_uniforms(UniformsSource::table(&point_shader::Uniforms {
+            mvp: *view_proj,
+            point_size,
+            depth_z0,
+            depth_range,
+            z_clip_min: z_clip.min,
+            z_clip_max: z_clip.max,
+        }));
+        for &i in &self.render {
+            let State::Loaded(tile) = &self.nodes[i].state else { continue };
+            for p in &tile.points {
+                ctx.apply_bindings(&Bindings { vertex_buffers: vec![p.pos, p.col], index_buffer: iota, images: vec![] });
+                ctx.draw(0, p.count, 1);
+            }
+        }
+    }
+
     pub fn unload(mut self, ctx: &mut dyn RenderingBackend) {
         // Closing the request channel lets the workers run dry and exit.
         self.req_tx = None;
@@ -793,8 +916,13 @@ impl Tileset {
                 t.free(ctx);
             }
         }
+        if let Some((b, _)) = self.iota {
+            ctx.delete_buffer(b);
+        }
         ctx.delete_texture(self.white);
         ctx.delete_pipeline(self.pipeline);
+        ctx.delete_pipeline(self.point_pipeline);
+        ctx.delete_pipeline(self.point_depth_pipeline);
     }
 }
 
@@ -825,6 +953,12 @@ fn set_viewer_box(n: &mut Node, origin: [f64; 3]) {
         n.lo = [lo.x as f32, lo.y as f32, lo.z as f32];
         n.hi = [hi.x as f32, hi.y as f32, hi.z as f32];
     }
+}
+
+/// Whether any tile holds points, and any holds a mesh, as far as is known.
+fn content_kinds(nodes: &[Node]) -> (bool, bool) {
+    let with_content = || nodes.iter().filter(|n| !n.uris.is_empty());
+    (with_content().any(|n| n.points), with_content().any(|n| !n.points))
 }
 
 fn info_tiles(path: &Path, nodes: &[Node], ecef: bool) {
@@ -863,6 +997,102 @@ fn mesh_pipeline(ctx: &mut dyn RenderingBackend) -> Pipeline {
             ..Default::default()
         },
     )
+}
+
+/// The cloud's point pipeline, for tile content: same depth rules, same
+/// point size, colour as bytes rather than floats.
+fn point_pipeline(ctx: &mut dyn RenderingBackend, depth_only: bool) -> Pipeline {
+    // gl_PointSize is ignored on desktop GL without GL_PROGRAM_POINT_SIZE.
+    // The cloud pipeline enables it too, but a tileset may be all there is.
+    unsafe { miniquad::gl::glEnable(0x8642) };
+    let shader = ctx
+        .new_shader(ShaderSource::Glsl { vertex: point_shader::VERTEX, fragment: point_shader::FRAGMENT }, point_shader::meta())
+        .expect("tile point shader");
+    ctx.new_pipeline(
+        &[BufferLayout::default(), BufferLayout::default()],
+        &[
+            VertexAttribute::with_buffer("pos", VertexFormat::Float3, 0),
+            VertexAttribute::with_buffer("color", VertexFormat::Byte4, 1),
+        ],
+        shader,
+        PipelineParams {
+            primitive_type: PrimitiveType::Points,
+            depth_test: Comparison::LessOrEqual,
+            depth_write: true,
+            color_write: if depth_only { (false, false, false, false) } else { (true, true, true, true) },
+            ..Default::default()
+        },
+    )
+}
+
+/// `raw_miniquad::shader` with byte colours and a depth origin. The alpha it
+/// writes is the height EDL shades by, as the cloud's does.
+mod point_shader {
+    use miniquad::*;
+
+    pub const VERTEX: &str = r#"#version 100
+        attribute vec3 pos;
+        attribute vec4 color;
+
+        uniform mat4 mvp;
+        uniform float point_size;
+        uniform float depth_z0;
+        uniform float depth_range;
+        uniform float z_clip_min;
+        uniform float z_clip_max;
+
+        varying lowp vec3 v_color;
+        varying mediump float v_depth;
+
+        void main() {
+            if (pos.z < z_clip_min || pos.z > z_clip_max) {
+                gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+                gl_PointSize = 0.0;
+                v_color = vec3(0.0);
+                v_depth = 1.0;
+                return;
+            }
+            gl_Position = mvp * vec4(pos, 1.0);
+            gl_PointSize = point_size;
+            // Byte attributes arrive unnormalised.
+            v_color = color.rgb / 255.0;
+            mediump float t = (depth_range > 0.0) ? clamp((pos.z - depth_z0) / depth_range, 0.0, 1.0) : 0.5;
+            v_depth = t * 0.998 + 0.002;
+        }"#;
+
+    pub const FRAGMENT: &str = r#"#version 100
+        varying lowp vec3 v_color;
+        varying mediump float v_depth;
+
+        void main() {
+            gl_FragColor = vec4(v_color, v_depth);
+        }"#;
+
+    pub fn meta() -> ShaderMeta {
+        ShaderMeta {
+            images: vec![],
+            uniforms: UniformBlockLayout {
+                uniforms: vec![
+                    UniformDesc::new("mvp", UniformType::Mat4),
+                    UniformDesc::new("point_size", UniformType::Float1),
+                    UniformDesc::new("depth_z0", UniformType::Float1),
+                    UniformDesc::new("depth_range", UniformType::Float1),
+                    UniformDesc::new("z_clip_min", UniformType::Float1),
+                    UniformDesc::new("z_clip_max", UniformType::Float1),
+                ],
+            },
+        }
+    }
+
+    #[repr(C)]
+    pub struct Uniforms {
+        pub mvp: glam::Mat4,
+        pub point_size: f32,
+        pub depth_z0: f32,
+        pub depth_range: f32,
+        pub z_clip_min: f32,
+        pub z_clip_max: f32,
+    }
 }
 
 mod mesh_shader {
@@ -1014,7 +1244,8 @@ mod tests {
             let (blo, bhi) = (n.world_lo - DVec3::from(origin), n.world_hi - DVec3::from(origin));
             let mut outside = 0;
             let mut count = 0;
-            for p in m.primitives.iter().flat_map(|p| p.positions.iter()) {
+            let pts = m.points.iter().flat_map(|p| p.positions.iter());
+            for p in m.primitives.iter().flat_map(|p| p.positions.iter()).chain(pts) {
                 count += 1;
                 let v = DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64);
                 if v.cmplt(blo - 0.01).any() || v.cmpgt(bhi + 0.01).any() {
@@ -1022,11 +1253,12 @@ mod tests {
                 }
             }
             println!(
-                "depth {} {}: {} vertices, {} triangles, {} images, {} outside the box, decoded in {:?}",
+                "depth {} {}: {} vertices, {} triangles, {} points, {} images, {} outside the box, decoded in {:?}",
                 n.depth,
                 n.uris[0].display(),
                 count,
                 m.triangle_count(),
+                m.point_count(),
                 m.images.len(),
                 outside,
                 t.elapsed()

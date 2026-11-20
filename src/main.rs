@@ -1260,14 +1260,6 @@ fn height_color_controls(
     changed
 }
 
-/// Measure markers and the cross-section corridor preview, in 3D.
-///
-/// Must be called *after* the point cloud has been composited, not before.
-/// With EDL on, the cloud renders to an offscreen texture and is then blitted
-/// back with a full-screen quad; anything drawn beforehand survives only where
-/// the quad discards, which is exactly where there are no points. Drawn first,
-/// these overlays vanish over the cloud — precisely where they are needed.
-#[allow(clippy::too_many_arguments)]
 /// Draw the meshes and splats over the cloud just rendered — once a frame,
 /// whichever render block gets there first.
 #[allow(clippy::too_many_arguments)]
@@ -1290,6 +1282,14 @@ fn draw_layers(
     layers.draw(&mut *gl.quad_context, view_proj, front, right, up, view.gl(), z_clip);
 }
 
+/// Measure markers and the cross-section corridor preview, in 3D.
+///
+/// Must be called *after* the point cloud has been composited, not before.
+/// With EDL on, the cloud renders to an offscreen texture and is then blitted
+/// back with a full-screen quad; anything drawn beforehand survives only where
+/// the quad discards, which is exactly where there are no points. Drawn first,
+/// these overlays vanish over the cloud — precisely where they are needed.
+#[allow(clippy::too_many_arguments)]
 fn draw_3d_overlays(
     app_mode: AppMode,
     measure_a: Option<Vec3>,
@@ -4798,11 +4798,19 @@ async fn main() {
                 let drawn: i32 = stages.iter()
                     .map(|s| s.draw_visible(&mut *gl.quad_context, &view_proj, point_size, false))
                     .sum();
+                // A tileset's points belong in this pass, beside the clouds',
+                // so they get EDL and the point size; whichever block draws
+                // the layers this frame draws them.
+                let layer_points = !layers_drawn;
+                if layer_points {
+                    layers.draw_points(&mut *gl.quad_context, &view_proj, point_size, z_clip, false);
+                }
                 if edl_enabled {
                     edl_renderer.apply(&mut *gl.quad_context, edl_strength, vp);
                     // Or every overlay below draws over the cloud.
                     edl_renderer.restore_depth(&mut *gl.quad_context, vp, |ctx| {
                         for s in &stages { s.draw_visible(ctx, &view_proj, point_size, true); }
+                        if layer_points { layers.draw_points(ctx, &view_proj, point_size, z_clip, true); }
                     });
                 } else {
                     gl.quad_context.end_render_pass();
@@ -5295,11 +5303,19 @@ async fn main() {
                     gl.quad_context.apply_viewport(vp.0, vp.1, vp.2, vp.3);
                 }
                 let drawn: i32 = copc_stages.iter().map(|cs| cs.draw_visible(&mut *gl.quad_context, &view_proj, point_size, false)).sum();
+                // A tileset's points belong in this pass, beside the clouds',
+                // so they get EDL and the point size; whichever block draws
+                // the layers this frame draws them.
+                let layer_points = !layers_drawn;
+                if layer_points {
+                    layers.draw_points(&mut *gl.quad_context, &view_proj, point_size, z_clip, false);
+                }
                 if edl_enabled {
                     edl_renderer.apply(&mut *gl.quad_context, edl_strength, vp);
                     // Or every overlay below draws over the cloud.
                     edl_renderer.restore_depth(&mut *gl.quad_context, vp, |ctx| {
                         for cs in &copc_stages { cs.draw_visible(ctx, &view_proj, point_size, true); }
+                        if layer_points { layers.draw_points(ctx, &view_proj, point_size, z_clip, true); }
                     });
                 } else {
                     gl.quad_context.end_render_pass();
@@ -5787,11 +5803,19 @@ async fn main() {
                     gl.quad_context.apply_viewport(vp.0, vp.1, vp.2, vp.3);
                 }
                 let result = mgr.draw_visible(&mut *gl.quad_context, &view_proj, point_size, false);
+                // A tileset's points belong in this pass, beside the clouds',
+                // so they get EDL and the point size; whichever block draws
+                // the layers this frame draws them.
+                let layer_points = !layers_drawn;
+                if layer_points {
+                    layers.draw_points(&mut *gl.quad_context, &view_proj, point_size, z_clip, false);
+                }
                 if edl_enabled {
                     edl_renderer.apply(&mut *gl.quad_context, edl_strength, vp);
                     // Or every overlay below draws over the cloud.
                     edl_renderer.restore_depth(&mut *gl.quad_context, vp, |ctx| {
                         mgr.draw_visible(ctx, &view_proj, point_size, true);
+                        if layer_points { layers.draw_points(ctx, &view_proj, point_size, z_clip, true); }
                     });
                 } else {
                     gl.quad_context.end_render_pass();

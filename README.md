@@ -5,8 +5,8 @@ A point-cloud viewer for LAS / LAZ data, built with
 [egui](https://github.com/emilk/egui). It renders large clouds with an
 orthographic camera, extracts vertical cross sections, overlays polylines, lets
 you reclassify points by hand, and exports the result with chosen classes
-filtered out. Alongside the clouds it shows 3D Tiles meshes and Gaussian
-splats, for looking at — see [Meshes and splats](#meshes-and-splats).
+filtered out. Alongside the clouds it shows 3D Tiles meshes and point clouds
+and Gaussian splats, for looking at — see [Meshes and splats](#meshes-and-splats).
 
 ![haiviz screenshot](docs/haiviz.png)
 
@@ -111,9 +111,10 @@ depth-tested against the points both ways, cut by the **Height filter**, and
 framed by **Zoom All**. They are for looking at only: Point Info, Measure,
 snapping, sections, classification and export all work on the points alone.
 
-**3D Tiles** (1.1, and 1.0's `b3dm` and `cmpt` content) stream by
+**3D Tiles** (1.1, and 1.0's `b3dm`, `pnts` and `cmpt` content) stream by
 screen-space error: finer tiles load as you zoom in, on background threads, and
-tiles not on screen are released once the **GPU budget** is exceeded. **Mesh
+tiles not on screen are released once the **GPU budget** is exceeded. Loading
+pauses when the tiles on screen fill the budget. **Mesh
 detail** is the error, in screen pixels, allowed before a finer tile is
 loaded — lower is sharper and loads more. Content is glTF 2.0, binary or JSON,
 with vertex colours and/or PNG / JPEG / WebP textures; quantised meshes
@@ -121,12 +122,19 @@ with vertex colours and/or PNG / JPEG / WebP textures; quantised meshes
 **Lighting** follows the material (`KHR_materials_unlit` is drawn as is, the way
 `haires amesh` bakes its sun into the colours), or can be forced on or off.
 
+Point-cloud tiles — `pnts`, or glTF `POINTS` primitives — are drawn with the
+clouds' **Pt size** and **EDL**, in their own colours (`pnts` colours are
+sRGB, glTF's linear, as the formats specify). **Point detail** is their
+error allowance; a point tile's geometric error is about its point spacing, so
+the default 1 px streams them about as densely as a COPC cloud.
+
 - A tileset in a projected CRS — as `haires amesh` writes them, in RD/NAP —
   lands on clouds in that CRS directly. A tileset in ECEF (EPSG:4978, as most
   published tilesets are) is shown in a local east-north-up frame at its
   centre: upright, but not aligned with projected clouds.
 - Not supported: Draco and meshopt compression, KTX2 / Basis textures (the
-  mesh is drawn without them), implicit tiling, and `i3dm` / `pnts` content.
+  mesh is drawn without them), Draco-compressed `pnts`, implicit tiling, and
+  `i3dm` content.
   A tile that cannot be read is counted under the tileset with the reason.
 
 **Gaussian splats** are read from the uncompressed PLY that 3DGS trainers
@@ -148,8 +156,8 @@ Everything lives in one panel docked to the left of the window, with
 collapsible sections:
 
 - **Controls** — camera, colouring, height filter, cross sections, measure;
-- **Meshes & splats** — 3D Tiles and Gaussian splats, with their detail,
-  budget and lighting;
+- **Meshes & splats** — 3D Tiles (meshes and points) and Gaussian splats,
+  with their detail, budget and lighting;
 - **Classes** — labels, colours and visibility per class, and the class
   definition files;
 - **Classification** — the lasso tools, **Undo last op** and **Export**, which
