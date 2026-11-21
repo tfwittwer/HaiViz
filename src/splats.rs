@@ -21,6 +21,12 @@
 //! Colour is the SH DC term only; the view-dependent bands are read past.
 //! For an inspection viewer that loses glints, not geometry.
 //!
+//! The same renderer draws splats streamed from 3D Tiles: [`SplatAtlas`]
+//! keeps every resident tile's splats in one set of textures, so a single
+//! sort and a single draw cover all the tiles on screen and nothing seams
+//! where two tiles meet. Tiles carry SPZ-compressed splats
+//! ([`decode_spz`]) or plain glTF accessors.
+//!
 //! Georeferencing: a `scene.json` with `origin_rd` (and optionally
 //! `horizontal_scale`) beside the PLY or up to three folders above it — the
 //! file the haires splat pipeline trains from — places the splats in RD/NAP,
@@ -234,7 +240,141 @@ fn read_header(r: &mut impl BufRead) -> Result<Vec<PlyElement>, String> {
 }
 
 /// One decoded splat: centre, covariance, colour.
-type SplatRow = ([f32; 3], [f32; 6], [u8; 4]);
+/// One splat: centre, covariance (xx, xy, xz, yy, yz, zz) and sRGB colour
+/// with linear alpha.
+pub type SplatRow = ([f32; 3], [f32; 6], [u8; 4]);
+
+/// Σ = (R S)(R S)ᵀ, as its upper triangle. `scale` is linear, not log.
+pub fn covariance(scale: Vec3, q: Quat) -> [f32; 6] {
+    let q = if q.length_squared() > 0.0 { q.normalize() } else { Quat::IDENTITY };
+    let m = Mat3::from_quat(q) * Mat3::from_diagonal(scale);
+    let c = m * m.transpose();
+    [c.x_axis.x, c.y_axis.x, c.z_axis.x, c.y_axis.y, c.z_axis.y, c.z_axis.z]
+}
+
+/// `L Σ Lᵀ`: a covariance carried through a linear map.
+pub fn transform_covariance(l: &Mat3, v: [f32; 6]) -> [f32; 6] {
+    let s = Mat3::from_cols(Vec3::new(v[0], v[1], v[2]), Vec3::new(v[1], v[3], v[4]), Vec3::new(v[2], v[4], v[5]));
+    let c = *l * s * l.transpose();
+    [c.x_axis.x, c.y_axis.x, c.z_axis.x, c.y_axis.y, c.z_axis.y, c.z_axis.z]
+}
+
+/// Splats in the layout the shader reads: three texels each.
+/// `t0` = centre (viewer space) and colour packed as r·65536 + g·256 + b;
+/// `t1` = xx, xy, xz, alpha; `t2` = yy, yz, zz.
+#[derive(Default)]
+pub struct SplatTexels {
+    pub t0: Vec<[f32; 4]>,
+    pub t1: Vec<[f32; 4]>,
+    pub t2: Vec<[f32; 4]>,
+}
+
+impl SplatTexels {
+    pub fn len(&self) -> usize {
+        self.t0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.t0.is_empty()
+    }
+    pub fn push(&mut self, center: [f32; 3], v: [f32; 6], rgba: [u8; 4]) {
+        let [r, g, b, a] = rgba;
+        let packed = r as f32 * 65536.0 + g as f32 * 256.0 + b as f32;
+        self.t0.push([center[0], center[1], center[2], packed]);
+        self.t1.push([v[0], v[1], v[2], a as f32 / 255.0]);
+        self.t2.push([v[3], v[4], v[5], 0.0]);
+    }
+    pub fn append(&mut self, mut other: SplatTexels) {
+        self.t0.append(&mut other.t0);
+        self.t1.append(&mut other.t1);
+        self.t2.append(&mut other.t2);
+    }
+}
+
+/// Decode an SPZ blob (Niantic's compressed splats, gzipped), as
+/// `KHR_gaussian_splatting_compression_spz` embeds it, into the file's own
+/// frame — the glTF accessor space, with no axis change. Versions 2 and 3;
+/// the spherical-harmonic bands are skipped like the PLY's.
+pub fn decode_spz(gz: &[u8]) -> Result<Vec<SplatRow>, String> {
+    let mut raw = Vec::new();
+    flate2::read::GzDecoder::new(gz).read_to_end(&mut raw).map_err(|e| format!("SPZ: {e}"))?;
+    if raw.len() < 16 || raw[0..4] != 0x5053_474e_u32.to_le_bytes() {
+        return Err("SPZ: not an SPZ stream".into());
+    }
+    let version = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let n = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+    let (sh_degree, frac) = (raw[12], raw[13]);
+    if !(2..=3).contains(&version) {
+        return Err(format!("SPZ version {version} is not supported (2 and 3 are)"));
+    }
+    let rot_size = if version == 2 { 3 } else { 4 };
+    let sh_dim = match sh_degree {
+        0 => 0,
+        1 => 3,
+        2 => 8,
+        3 => 15,
+        d => return Err(format!("SPZ: spherical-harmonic degree {d}")),
+    };
+    let need = 16 + n * (9 + 1 + 3 + 3 + rot_size + sh_dim * 3);
+    if raw.len() < need {
+        return Err(format!("SPZ: {} bytes for {n} splats, {need} needed", raw.len()));
+    }
+    let pos = &raw[16..16 + 9 * n];
+    let alpha = &raw[16 + 9 * n..16 + 10 * n];
+    let color = &raw[16 + 10 * n..16 + 13 * n];
+    let scale = &raw[16 + 13 * n..16 + 16 * n];
+    let rot = &raw[16 + 16 * n..16 + (16 + rot_size) * n];
+    let step = 1.0 / (1u32 << frac) as f32;
+    let rows = (0..n)
+        .into_par_iter()
+        .filter_map(|i| {
+            let a = alpha[i];
+            if a == 0 {
+                return None;
+            }
+            let p = [0, 1, 2].map(|k| {
+                let b = &pos[9 * i + 3 * k..];
+                // 24-bit two's complement, sign-extended through the top byte.
+                (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 * step
+            });
+            let s = Vec3::new(
+                (scale[3 * i] as f32 / 16.0 - 10.0).exp(),
+                (scale[3 * i + 1] as f32 / 16.0 - 10.0).exp(),
+                (scale[3 * i + 2] as f32 / 16.0 - 10.0).exp(),
+            );
+            let q = if version == 2 {
+                let r = &rot[3 * i..3 * i + 3];
+                let v = Vec3::new(r[0] as f32, r[1] as f32, r[2] as f32) / 127.5 - Vec3::ONE;
+                Quat::from_xyzw(v.x, v.y, v.z, (1.0 - v.length_squared()).max(0.0).sqrt())
+            } else {
+                // Smallest three: 2 bits name the largest component, the
+                // others are 9 bits of magnitude over 1/√2 and a sign bit.
+                let r = &rot[4 * i..4 * i + 4];
+                let mut comp = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+                let largest = (comp >> 30) as usize;
+                let mut q = [0f32; 4];
+                let mut sum = 0.0;
+                for k in (0..4).rev() {
+                    if k == largest {
+                        continue;
+                    }
+                    let mag = (comp & 511) as f32 / 511.0 * std::f32::consts::FRAC_1_SQRT_2;
+                    q[k] = if (comp >> 9) & 1 == 1 { -mag } else { mag };
+                    sum += q[k] * q[k];
+                    comp >>= 10;
+                }
+                q[largest] = (1.0 - sum).max(0.0).sqrt();
+                Quat::from_xyzw(q[0], q[1], q[2], q[3])
+            };
+            // Colour is the DC coefficient over a fixed range: f = (c − ½)/0.15.
+            let rgb = [0, 1, 2].map(|k| {
+                let f = (color[3 * i + k] as f32 / 255.0 - 0.5) / 0.15;
+                ((0.5 + SH_C0 * f).clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+            });
+            Some((p, covariance(s, q), [rgb[0], rgb[1], rgb[2], a]))
+        })
+        .collect();
+    Ok(rows)
+}
 
 pub fn read_ply(path: &Path) -> Result<SplatFile, String> {
     let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -298,19 +438,12 @@ pub fn read_ply(path: &Path) -> Result<SplatFile, String> {
                 }
                 let s = Vec3::new(g(scale[0]).exp(), g(scale[1]).exp(), g(scale[2]).exp());
                 let q = Quat::from_xyzw(g(rot[1]), g(rot[2]), g(rot[3]), g(rot[0]));
-                let q = if q.length_squared() > 0.0 { q.normalize() } else { Quat::IDENTITY };
-                let m = Mat3::from_quat(q) * Mat3::from_diagonal(s);
-                let c = m * m.transpose();
                 let rgb = match (dc, rgb8) {
                     (Some(dc), _) => [0, 1, 2].map(|k| ((0.5 + SH_C0 * g(dc[k])).clamp(0.0, 1.0) * 255.0 + 0.5) as u8),
                     (None, Some(c8)) => [0, 1, 2].map(|k| g(c8[k]).clamp(0.0, 255.0) as u8),
                     _ => [200, 200, 200],
                 };
-                Some((
-                    p,
-                    [c.x_axis.x, c.y_axis.x, c.z_axis.x, c.y_axis.y, c.z_axis.y, c.z_axis.z],
-                    [rgb[0], rgb[1], rgb[2], (alpha * 255.0 + 0.5) as u8],
-                ))
+                Some((p, covariance(s, q), [rgb[0], rgb[1], rgb[2], (alpha * 255.0 + 0.5) as u8]))
             })
             .collect();
         for row in rows {
@@ -349,11 +482,11 @@ impl SplatFile {
     }
 }
 
-/// An RGBA32F texture, made by miniquad (which owns and frees it) and filled
-/// through raw GL, since miniquad offers only half floats. Positions in half
-/// float would be centimetres off a few tens of metres out.
-fn float_texture(ctx: &mut dyn RenderingBackend, w: usize, h: usize, data: &[f32]) -> TextureId {
-    assert_eq!(data.len(), w * h * 4);
+/// An RGBA32F texture, made by miniquad (which owns and frees it) and
+/// allocated through raw GL, since miniquad offers only half floats.
+/// Positions in half float would be centimetres off a few tens of metres out.
+/// Its contents are undefined until [`upload_texels`] fills them.
+fn float_texture(ctx: &mut dyn RenderingBackend, w: usize, h: usize) -> TextureId {
     let tex = ctx.new_texture(
         TextureAccess::Static,
         TextureSource::Empty,
@@ -368,32 +501,61 @@ fn float_texture(ctx: &mut dyn RenderingBackend, w: usize, h: usize, data: &[f32
             ..Default::default()
         },
     );
+    with_raw_texture(ctx, tex, |_| unsafe {
+        use miniquad::gl::*;
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F as GLint, w as GLint, h as GLint, 0, GL_RGBA, GL_FLOAT, std::ptr::null());
+    });
+    tex
+}
+
+/// Run raw GL with `tex` bound, then put the binding back exactly as found:
+/// miniquad caches it and would otherwise skip a bind it believes is already
+/// in place.
+fn with_raw_texture(ctx: &mut dyn RenderingBackend, tex: TextureId, f: impl FnOnce(u32)) {
     const GL_TEXTURE_BINDING_2D: u32 = 0x8069;
     // Irrefutable where miniquad is built without Metal.
     #[allow(irrefutable_let_patterns)]
     if let RawId::OpenGl(id) = unsafe { ctx.texture_raw_id(tex) } {
         unsafe {
             use miniquad::gl::*;
-            // Put the binding back exactly as found: miniquad caches it and
-            // would otherwise skip a bind it believes is already in place.
             let mut prev: GLint = 0;
             glGetIntegerv(GL_TEXTURE_BINDING_2D, &mut prev);
             glBindTexture(GL_TEXTURE_2D, id);
-            glTexImage2D(
-                GL_TEXTURE_2D,
-                0,
-                GL_RGBA32F as GLint,
-                w as GLint,
-                h as GLint,
-                0,
-                GL_RGBA,
-                GL_FLOAT,
-                data.as_ptr() as *const _,
-            );
+            f(id);
             glBindTexture(GL_TEXTURE_2D, prev as GLuint);
         }
     }
-    tex
+}
+
+/// Write texels `start..start + data.len()` of a `TEX_W`-wide float texture:
+/// a partial first row, whole rows, a partial last row.
+fn upload_texels(ctx: &mut dyn RenderingBackend, tex: TextureId, start: usize, data: &[[f32; 4]]) {
+    with_raw_texture(ctx, tex, |_| {
+        let mut i = 0;
+        while i < data.len() {
+            let (row, col) = ((start + i) / TEX_W, (start + i) % TEX_W);
+            let (w, h) = if col == 0 && data.len() - i >= TEX_W {
+                (TEX_W, (data.len() - i) / TEX_W)
+            } else {
+                ((TEX_W - col).min(data.len() - i), 1)
+            };
+            unsafe {
+                use miniquad::gl::*;
+                glTexSubImage2D(
+                    GL_TEXTURE_2D,
+                    0,
+                    col as GLint,
+                    row as GLint,
+                    w as GLint,
+                    h as GLint,
+                    GL_RGBA,
+                    GL_FLOAT,
+                    data[i..].as_ptr() as *const _,
+                );
+            }
+            i += w * h;
+        }
+    });
 }
 
 /// Back-to-front order along `front`, as the `float` indices the shader
@@ -414,6 +576,279 @@ fn sort_order(centers: &[[f32; 3]], front: [f32; 3]) -> Vec<f32> {
         .collect();
     keys.par_sort_unstable();
     keys.par_iter().map(|k| (*k & 0xFFFF_FFFF) as f32).collect()
+}
+
+/// [`sort_order`] over several tiles' splats at once, each at its own base
+/// in the atlas.
+fn sort_segments(segs: &[(Arc<SplatTexels>, usize)], front: [f32; 3]) -> Vec<f32> {
+    let f = Vec3::from(front);
+    let mut keys: Vec<u64> = Vec::with_capacity(segs.iter().map(|(t, _)| t.len()).sum());
+    for (t, base) in segs {
+        keys.par_extend(t.t0.par_iter().enumerate().map(|(i, c)| {
+            let d = -Vec3::new(c[0], c[1], c[2]).dot(f);
+            let b = d.to_bits();
+            let ord = if b & 0x8000_0000 != 0 { !b } else { b | 0x8000_0000 };
+            ((ord as u64) << 32) | (base + i) as u64
+        }));
+    }
+    keys.par_sort_unstable();
+    keys.par_iter().map(|k| (*k & 0xFFFF_FFFF) as f32).collect()
+}
+
+/// The most rows the atlas grows to: 4096 × 4096 splats is where a `float`
+/// index stops being exact (2²⁴).
+const ATLAS_MAX_ROWS: usize = 4096;
+
+/// Free runs of atlas slots, `(start, len)`, sorted by start and merged.
+#[derive(Default)]
+struct Slots {
+    free: Vec<(usize, usize)>,
+}
+
+impl Slots {
+    /// First fit.
+    fn alloc(&mut self, n: usize) -> Option<usize> {
+        let k = self.free.iter().position(|&(_, len)| len >= n)?;
+        let (start, len) = self.free[k];
+        if len == n {
+            self.free.remove(k);
+        } else {
+            self.free[k] = (start + n, len - n);
+        }
+        Some(start)
+    }
+
+    fn free(&mut self, start: usize, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let k = self.free.partition_point(|&(s, _)| s < start);
+        self.free.insert(k, (start, n));
+        // Merge with the neighbours it touches.
+        if k + 1 < self.free.len() && self.free[k].0 + self.free[k].1 == self.free[k + 1].0 {
+            self.free[k].1 += self.free[k + 1].1;
+            self.free.remove(k + 1);
+        }
+        if k > 0 && self.free[k - 1].0 + self.free[k - 1].1 == self.free[k].0 {
+            self.free[k - 1].1 += self.free[k].1;
+            self.free.remove(k);
+        }
+    }
+}
+
+struct SortReq {
+    front: [f32; 3],
+    /// Tile ids, sorted, that the order covers.
+    sel: Vec<usize>,
+    segs: Vec<(Arc<SplatTexels>, usize)>,
+}
+
+struct SortRes {
+    order: Vec<f32>,
+    front: [f32; 3],
+    sel: Vec<usize>,
+}
+
+/// Splats streamed from tiles, in one set of textures with one draw order.
+///
+/// Every resident tile owns a run of texel slots; a sort over the tiles on
+/// screen produces one order for one instanced draw, so splats blend in the
+/// right order across tile borders. The textures grow by doubling (re-filled
+/// from the tiles' CPU copies) up to [`ATLAS_MAX_ROWS`].
+///
+/// The order on screen refers to slots, so a tile it covers must keep its
+/// slot until a newer order no longer does: [`SplatAtlas::protects`] tells
+/// eviction which tiles those are.
+pub struct SplatAtlas {
+    textures: Option<[TextureId; 3]>,
+    rows: usize,
+    slots: Slots,
+    quad: BufferId,
+    quad_idx: BufferId,
+    order: Option<(BufferId, usize)>,
+    pipeline: Pipeline,
+    sort_tx: Option<mpsc::Sender<SortReq>>,
+    sort_rx: mpsc::Receiver<SortRes>,
+    /// What the order on screen covers, and how many splats it draws.
+    shown_sel: Vec<usize>,
+    shown_count: usize,
+    shown_front: [f32; 3],
+    pending_sel: Option<Vec<usize>>,
+}
+
+impl SplatAtlas {
+    pub fn new(ctx: &mut dyn RenderingBackend) -> SplatAtlas {
+        let corners: [[f32; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+        let quad = ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Immutable, BufferSource::slice(&corners));
+        let quad_idx = ctx.new_buffer(BufferType::IndexBuffer, BufferUsage::Immutable, BufferSource::slice(&[0u16, 1, 2, 0, 2, 3]));
+        let (sort_tx, req_rx) = mpsc::channel::<SortReq>();
+        let (res_tx, sort_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("tile-splat-sort".into())
+            .spawn(move || {
+                while let Ok(mut r) = req_rx.recv() {
+                    while let Ok(newer) = req_rx.try_recv() {
+                        r = newer;
+                    }
+                    let order = sort_segments(&r.segs, r.front);
+                    if res_tx.send(SortRes { order, front: r.front, sel: r.sel }).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("cannot spawn the splat sort thread");
+        SplatAtlas {
+            textures: None,
+            rows: 0,
+            slots: Slots::default(),
+            quad,
+            quad_idx,
+            order: None,
+            pipeline: splat_pipeline(ctx),
+            sort_tx: Some(sort_tx),
+            sort_rx,
+            shown_sel: Vec::new(),
+            shown_count: 0,
+            shown_front: [0.0; 3],
+            pending_sel: None,
+        }
+    }
+
+    /// Splats drawn by the order on screen.
+    pub fn shown(&self) -> usize {
+        self.shown_count
+    }
+
+    /// `n` slots, first fit. `None` when no run is long enough: grow, or
+    /// evict.
+    pub fn alloc(&mut self, n: usize) -> Option<usize> {
+        self.slots.alloc(n)
+    }
+
+    pub fn free(&mut self, start: usize, n: usize) {
+        self.slots.free(start, n);
+    }
+
+    /// Double the textures (at least enough for `n` more splats), refilling
+    /// what is resident at the same slots. False at the size limit.
+    pub fn grow(&mut self, ctx: &mut dyn RenderingBackend, n: usize, resident: &[(usize, Arc<SplatTexels>)]) -> bool {
+        let old_cap = self.rows * TEX_W;
+        let mut rows = (self.rows * 2).max(64);
+        while rows * TEX_W < old_cap + n && rows < ATLAS_MAX_ROWS {
+            rows *= 2;
+        }
+        let rows = rows.min(ATLAS_MAX_ROWS);
+        if rows <= self.rows {
+            return false;
+        }
+        let textures = [0, 1, 2].map(|_| float_texture(ctx, TEX_W, rows));
+        for (start, t) in resident {
+            for (k, data) in [&t.t0, &t.t1, &t.t2].into_iter().enumerate() {
+                upload_texels(ctx, textures[k], *start, data);
+            }
+        }
+        if let Some(old) = self.textures.replace(textures) {
+            for t in old {
+                ctx.delete_texture(t);
+            }
+        }
+        self.rows = rows;
+        self.free(old_cap, rows * TEX_W - old_cap);
+        true
+    }
+
+    pub fn upload(&self, ctx: &mut dyn RenderingBackend, start: usize, t: &SplatTexels) {
+        if let Some(tex) = self.textures {
+            for (k, data) in [&t.t0, &t.t1, &t.t2].into_iter().enumerate() {
+                upload_texels(ctx, tex[k], start, data);
+            }
+        }
+    }
+
+    /// Whether the order on screen, or the one being sorted, covers tile `i`.
+    pub fn protects(&self, i: usize) -> bool {
+        self.shown_sel.binary_search(&i).is_ok() || self.pending_sel.as_ref().is_some_and(|p| p.binary_search(&i).is_ok())
+    }
+
+    /// Take a finished sort; ask for another when the tiles on screen have
+    /// changed or the view has turned. `sel` is `(tile, slot, splats)`.
+    pub fn update(&mut self, ctx: &mut dyn RenderingBackend, front: Vec3, sel: &[(usize, usize, Arc<SplatTexels>)]) {
+        let mut latest = None;
+        while let Ok(r) = self.sort_rx.try_recv() {
+            latest = Some(r);
+        }
+        if let Some(r) = latest {
+            let n = r.order.len();
+            if self.order.is_none_or(|(_, cap)| cap < n) {
+                if let Some((b, _)) = self.order.take() {
+                    ctx.delete_buffer(b);
+                }
+                let cap = n.next_power_of_two().max(1024);
+                self.order = Some((ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Stream, BufferSource::empty::<f32>(cap)), cap));
+            }
+            if n > 0
+                && let Some((b, _)) = self.order
+            {
+                ctx.buffer_update(b, BufferSource::slice(&r.order));
+            }
+            self.shown_count = n;
+            self.shown_sel = r.sel;
+            self.shown_front = r.front;
+            self.pending_sel = None;
+        }
+        if self.pending_sel.is_some() {
+            return;
+        }
+        let mut ids: Vec<usize> = sel.iter().map(|s| s.0).collect();
+        ids.sort_unstable();
+        // About a tenth of a degree.
+        let turned = Vec3::from(self.shown_front).dot(front) < 0.999_998;
+        if (ids != self.shown_sel || turned)
+            && let Some(tx) = &self.sort_tx
+        {
+            let segs = sel.iter().map(|(_, start, t)| (t.clone(), *start)).collect();
+            if tx.send(SortReq { front: front.to_array(), sel: ids.clone(), segs }).is_ok() {
+                self.pending_sel = Some(ids);
+            }
+        }
+    }
+
+    pub fn draw(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4, viewport: (f32, f32), z_clip: ZClip) {
+        let (Some(textures), Some((order, _))) = (self.textures, self.order) else { return };
+        if self.shown_count == 0 {
+            return;
+        }
+        ctx.apply_pipeline(&self.pipeline);
+        ctx.apply_bindings(&Bindings { vertex_buffers: vec![self.quad, order], index_buffer: self.quad_idx, images: textures.to_vec() });
+        ctx.apply_uniforms(UniformsSource::table(&splat_shader::Uniforms {
+            mvp: *view_proj,
+            viewport: [viewport.0, viewport.1],
+            tex_size: [TEX_W as f32, self.rows as f32],
+            z_clip_min: z_clip.min,
+            z_clip_max: z_clip.max,
+            crop_lo: [-1.0e9; 3],
+            crop_hi: [1.0e9; 3],
+        }));
+        // As in `SplatCloud::draw`.
+        unsafe { miniquad::gl::glDepthMask(miniquad::gl::GL_FALSE as _) };
+        ctx.draw(0, 6, self.shown_count as i32);
+        unsafe { miniquad::gl::glDepthMask(miniquad::gl::GL_TRUE as _) };
+    }
+
+    pub fn unload(mut self, ctx: &mut dyn RenderingBackend) {
+        self.sort_tx = None;
+        if let Some(t) = self.textures {
+            for t in t {
+                ctx.delete_texture(t);
+            }
+        }
+        if let Some((b, _)) = self.order {
+            ctx.delete_buffer(b);
+        }
+        ctx.delete_buffer(self.quad);
+        ctx.delete_buffer(self.quad_idx);
+        ctx.delete_pipeline(self.pipeline);
+    }
 }
 
 pub struct SplatCloud {
@@ -466,27 +901,19 @@ impl SplatCloud {
             .collect();
 
         let tex_h = n.div_ceil(TEX_W);
-        let mut t0 = vec![0f32; TEX_W * tex_h * 4];
-        let mut t1 = vec![0f32; TEX_W * tex_h * 4];
-        let mut t2 = vec![0f32; TEX_W * tex_h * 4];
+        let mut texels = SplatTexels::default();
         // The horizontal scale shrinks x and y on the way to world; the
         // covariance follows as D Σ Dᵀ.
         let s = g.horizontal_scale as f32;
         let (sxx, sxz) = (1.0 / (s * s), 1.0 / s);
-        for i in 0..n {
-            let c = centers[i];
-            let [r, gr, b, a] = file.rgba[i];
-            let packed = r as f32 * 65536.0 + gr as f32 * 256.0 + b as f32;
-            let v = file.cov[i];
-            t0[i * 4..i * 4 + 4].copy_from_slice(&[c[0], c[1], c[2], packed]);
-            t1[i * 4..i * 4 + 4].copy_from_slice(&[v[0] * sxx, v[1] * sxx, v[2] * sxz, a as f32 / 255.0]);
-            t2[i * 4..i * 4 + 4].copy_from_slice(&[v[3] * sxx, v[4] * sxz, v[5], 0.0]);
+        for ((c, v), col) in centers.iter().zip(&file.cov).zip(&file.rgba) {
+            texels.push(*c, [v[0] * sxx, v[1] * sxx, v[2] * sxz, v[3] * sxx, v[4] * sxz, v[5]], *col);
         }
-        let textures = [
-            float_texture(ctx, TEX_W, tex_h, &t0),
-            float_texture(ctx, TEX_W, tex_h, &t1),
-            float_texture(ctx, TEX_W, tex_h, &t2),
-        ];
+        let textures = [&texels.t0, &texels.t1, &texels.t2].map(|t| {
+            let tex = float_texture(ctx, TEX_W, tex_h);
+            upload_texels(ctx, tex, 0, t);
+            tex
+        });
 
         let corners: [[f32; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
         let quad = ctx.new_buffer(BufferType::VertexBuffer, BufferUsage::Immutable, BufferSource::slice(&corners));
@@ -779,7 +1206,7 @@ mod splat_shader {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn write_ply(path: &Path, rows: &[[f32; 14]]) {
@@ -865,6 +1292,77 @@ mod tests {
         // Looking down: the lowest splat is farthest and drawn first.
         assert_eq!(sort_order(&c, [0.0, 0.0, -1.0]), vec![1.0, 2.0, 0.0]);
         assert_eq!(sort_order(&c, [0.0, 0.0, 1.0]), vec![0.0, 2.0, 1.0]);
+    }
+
+    /// An SPZ stream, gzipped, for splats given as (fixed-point position,
+    /// alpha, colour, log-scale and rotation bytes).
+    pub(crate) fn spz(version: u32, rows: &[([i32; 3], u8, [u8; 3], [u8; 3], Vec<u8>)]) -> Vec<u8> {
+        use std::io::Write;
+        let n = rows.len();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&0x5053_474e_u32.to_le_bytes());
+        raw.extend_from_slice(&version.to_le_bytes());
+        raw.extend_from_slice(&(n as u32).to_le_bytes());
+        raw.extend_from_slice(&[0, 12, 0, 0]);
+        for r in rows {
+            for v in r.0 {
+                raw.extend_from_slice(&v.to_le_bytes()[..3]);
+            }
+        }
+        rows.iter().for_each(|r| raw.push(r.1));
+        rows.iter().for_each(|r| raw.extend_from_slice(&r.2));
+        rows.iter().for_each(|r| raw.extend_from_slice(&r.3));
+        rows.iter().for_each(|r| raw.extend_from_slice(&r.4));
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&raw).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn spz_v3_positions_colours_scales_and_rotations() {
+        // Scale byte 160 is log-scale 0 (1 m), 144 is −1. The rotation word
+        // names w largest with x, y, z zero: identity. 224 is colour 1.0.
+        let ident = (3u32 << 30).to_le_bytes().to_vec();
+        // 90° about z: w = z = 1/√2, w largest, z at full 9-bit magnitude.
+        let quarter = ((3u32 << 30) | 511).to_le_bytes().to_vec();
+        let rows = vec![
+            ([4096, -8192, 2048], 255, [224, 128, 0], [160, 144, 144], ident.clone()),
+            ([0, 0, 0], 128, [128, 128, 128], [160, 144, 144], quarter),
+            ([0, 0, 0], 0, [128, 128, 128], [160, 160, 160], ident),
+        ];
+        let out = decode_spz(&spz(3, &rows)).unwrap();
+        assert_eq!(out.len(), 2, "the transparent one is dropped");
+        let (p, c, col) = out[0];
+        assert_eq!(p, [1.0, -2.0, 0.5]);
+        assert!((c[0] - 1.0).abs() < 1e-5 && (c[3] - (-2.0f32).exp()).abs() < 1e-5 && c[1].abs() < 1e-6);
+        assert_eq!(col[3], 255);
+        assert!(col[0] > 250 && (126..=129).contains(&col[1]) && col[2] < 15, "{col:?}");
+        // Turned a quarter about z, x and y trade variances.
+        let (_, c, _) = out[1];
+        assert!((c[0] - (-2.0f32).exp()).abs() < 1e-3 && (c[3] - 1.0).abs() < 1e-3, "{c:?}");
+    }
+
+    #[test]
+    fn spz_v2_rotations_are_xyz_with_w_derived() {
+        let rows = vec![([0, 0, 0], 255, [128; 3], [160, 144, 144], vec![128, 128, 128])];
+        let out = decode_spz(&spz(2, &rows)).unwrap();
+        let c = out[0].1;
+        assert!((c[0] - 1.0).abs() < 1e-3 && (c[3] - (-2.0f32).exp()).abs() < 1e-3, "{c:?}");
+        let e = decode_spz(&spz(4, &rows)).err().unwrap();
+        assert!(e.contains("version 4"), "{e}");
+    }
+
+    #[test]
+    fn atlas_slots_are_reused_and_merged() {
+        let mut s = Slots::default();
+        s.free(0, 100);
+        assert_eq!(s.alloc(30), Some(0));
+        assert_eq!(s.alloc(30), Some(30));
+        assert_eq!(s.alloc(50), None);
+        s.free(0, 30);
+        s.free(30, 30);
+        assert_eq!(s.free, vec![(0, 100)]);
+        assert_eq!(s.alloc(100), Some(0));
     }
 
     #[test]

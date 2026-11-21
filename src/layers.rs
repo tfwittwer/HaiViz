@@ -21,7 +21,7 @@ use miniquad::*;
 
 use crate::raw_miniquad::ZClip;
 use crate::splats::{self, SplatCloud, SplatFile};
-use crate::tiles3d::{Lighting, Tileset, TilesetDesc};
+use crate::tiles3d::{Detail, Lighting, Tileset, TilesetDesc};
 
 pub enum LoadKind {
     /// LAS / LAZ / COPC, or a folder of tiles: the existing loaders.
@@ -110,6 +110,8 @@ pub struct Layers {
     /// The same for point tiles. Their geometric error is about their point
     /// spacing, so 1 px streams them as densely as a COPC cloud is.
     pub point_sse: f32,
+    /// The same for splat tiles.
+    pub splat_sse: f32,
     pub budget_mb: f32,
     pub lighting: Lighting,
     /// The last load that failed, for the panel.
@@ -125,6 +127,7 @@ impl Default for Layers {
             splats: Vec::new(),
             max_sse: 8.0,
             point_sse: 1.0,
+            splat_sse: 8.0,
             budget_mb: 2048.0,
             lighting: Lighting::Material,
             status: None,
@@ -191,7 +194,8 @@ impl Layers {
         let budget = (self.budget_mb as usize) << 20;
         let per = budget / self.tilesets.len().max(1);
         for t in &mut self.tilesets {
-            t.update(ctx, view_proj, mpp as f64, self.max_sse as f64, self.point_sse as f64, per, self.frame);
+            let detail = Detail { mesh: self.max_sse as f64, points: self.point_sse as f64, splats: self.splat_sse as f64 };
+            t.update(ctx, view_proj, front, mpp as f64, detail, per, self.frame);
         }
         for s in &mut self.splats {
             s.update(ctx, front);
@@ -220,6 +224,10 @@ impl Layers {
         let light = (-front + up * 0.6 + right * 0.4).normalize();
         for t in &self.tilesets {
             t.draw(ctx, view_proj, light, self.lighting, z_clip);
+        }
+        // Splats last: they blend over everything opaque.
+        for t in &self.tilesets {
+            t.draw_splats(ctx, view_proj, (vp.2 as f32, vp.3 as f32), z_clip);
         }
         for s in &self.splats {
             s.draw(ctx, view_proj, (vp.2 as f32, vp.3 as f32), z_clip);
@@ -254,11 +262,17 @@ impl Layers {
             });
             let st = &t.stats;
             let mut drawn = Vec::new();
-            if st.drawn_triangles > 0 || !t.has_points {
+            if st.drawn_triangles > 0 || t.has_mesh {
                 drawn.push(format!("{:.1} M triangles", st.drawn_triangles as f64 / 1e6));
             }
             if st.drawn_points > 0 || t.has_points {
                 drawn.push(format!("{:.1} M points", st.drawn_points as f64 / 1e6));
+            }
+            if st.drawn_splats > 0 || t.has_splats {
+                drawn.push(format!("{:.1} M splats", st.drawn_splats as f64 / 1e6));
+            }
+            if drawn.is_empty() {
+                drawn.push("loading".into());
             }
             ui.label(format!(
                 "  {} tiles drawn, {} | {} loaded ({:.0} MB), {} queued",
@@ -285,6 +299,9 @@ impl Layers {
             }
             if t.ecef {
                 ui.colored_label(egui::Color32::YELLOW, "  ECEF: shown in a local east-north-up frame, not aligned with projected clouds");
+            }
+            if let Some(crs) = &t.esri_crs {
+                ui.label(format!("  placed in {crs} (ESRI_crs)"));
             }
         }
         for (i, s) in self.splats.iter_mut().enumerate() {
@@ -313,6 +330,7 @@ impl Layers {
         }
         let has_mesh = self.tilesets.iter().any(|t| t.has_mesh);
         let has_points = self.tilesets.iter().any(|t| t.has_points);
+        let has_splats = self.tilesets.iter().any(|t| t.has_splats);
         if has_mesh {
             ui.horizontal(|ui| {
                 ui.label("Mesh detail:");
@@ -328,6 +346,13 @@ impl Layers {
                         "Screen-space error allowed before a finer point tile is loaded — about the point spacing \
                          on screen. Lower is denser and loads more. Point size and EDL are the clouds' settings.",
                     );
+            });
+        }
+        if has_splats {
+            ui.horizontal(|ui| {
+                ui.label("Splat detail:");
+                ui.add(egui::Slider::new(&mut self.splat_sse, 1.0..=64.0).logarithmic(true).suffix(" px"))
+                    .on_hover_text("Screen-space error allowed before a finer splat tile is loaded. Lower is sharper and loads more.");
             });
         }
         if !self.tilesets.is_empty() {

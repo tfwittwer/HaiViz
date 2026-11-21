@@ -1,6 +1,6 @@
 [package]
 name = "haiviz"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 
 [dependencies]
@@ -21,6 +21,8 @@ serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # Gaussian splats: PLY decoding and the back-to-front sort.
 rayon = "1"
+# Gzip inside SPZ-compressed Gaussian splats in 3D Tiles.
+flate2 = "1"
 
 [dev-dependencies]
 criterion = "0.7"

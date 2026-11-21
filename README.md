@@ -5,8 +5,9 @@ A point-cloud viewer for LAS / LAZ data, built with
 [egui](https://github.com/emilk/egui). It renders large clouds with an
 orthographic camera, extracts vertical cross sections, overlays polylines, lets
 you reclassify points by hand, and exports the result with chosen classes
-filtered out. Alongside the clouds it shows 3D Tiles meshes and point clouds
-and Gaussian splats, for looking at — see [Meshes and splats](#meshes-and-splats).
+filtered out. Alongside the clouds it shows 3D Tiles (meshes, point clouds
+and Gaussian splats) and Gaussian-splat PLYs, for looking at — see
+[Meshes and splats](#meshes-and-splats).
 
 ![haiviz screenshot](docs/haiviz.png)
 
@@ -122,6 +123,16 @@ with vertex colours and/or PNG / JPEG / WebP textures; quantised meshes
 **Lighting** follows the material (`KHR_materials_unlit` is drawn as is, the way
 `haires amesh` bakes its sun into the colours), or can be forced on or off.
 
+Gaussian-splat tiles (`KHR_gaussian_splatting`, plain or SPZ-compressed as
+`haires splat-tiles` writes them) stream like any other content and are sorted
+together, so splats blend correctly across tile borders. **Splat detail** is
+their error allowance. As with the PLY, colour is the DC term only.
+
+A tileset whose `ESRI_crs` names a projected CRS, with a twin transform and
+bounding volume per tile in it (as `haires splat-tiles` writes beside the ECEF
+ones), is placed by those: it lands on RD/NAP clouds exactly. The panel says
+which CRS it was placed in.
+
 Point-cloud tiles — `pnts`, or glTF `POINTS` primitives — are drawn with the
 clouds' **Pt size** and **EDL**, in their own colours (`pnts` colours are
 sRGB, glTF's linear, as the formats specify). **Point detail** is their
@@ -133,8 +144,8 @@ the default 1 px streams them about as densely as a COPC cloud.
   published tilesets are) is shown in a local east-north-up frame at its
   centre: upright, but not aligned with projected clouds.
 - Not supported: Draco and meshopt compression, KTX2 / Basis textures (the
-  mesh is drawn without them), Draco-compressed `pnts`, implicit tiling, and
-  `i3dm` content.
+  mesh is drawn without them), Draco-compressed `pnts`, SPZ other than
+  versions 2 and 3, implicit tiling, and `i3dm` content.
   A tile that cannot be read is counted under the tileset with the reason.
 
 **Gaussian splats** are read from the uncompressed PLY that 3DGS trainers

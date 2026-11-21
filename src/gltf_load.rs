@@ -5,8 +5,9 @@
 //! behind a feature table that may hold `RTC_CENTER`), `pnts` (a point cloud
 //! in a feature table) and `cmpt` (several tiles back to back). Points come
 //! from `pnts` and from glTF `POINTS` primitives, 1.1's way of storing them.
-//! Instanced (`i3dm`) content is refused with a reason rather than drawn
-//! wrong.
+//! Gaussian splats come from `KHR_gaussian_splatting` primitives, plain or
+//! SPZ-compressed. Instanced (`i3dm`) content is refused with a reason rather
+//! than drawn wrong.
 //!
 //! Everything a worker thread can do happens here: the vertices leave in
 //! viewer space (world minus the session's viewer origin) as `f32`, already
@@ -21,8 +22,10 @@
 
 use std::path::{Path, PathBuf};
 
-use glam::{DMat3, DMat4, DQuat, DVec3};
+use glam::{DMat3, DMat4, DQuat, DVec3, Mat3, Quat, Vec3};
 use serde_json::Value;
+
+use crate::splats::{self, SplatRow, SplatTexels};
 
 /// The fixed rotation 3D Tiles puts between glTF's y-up and the tileset's
 /// z-up: glTF (x, y, z) lands at (x, −z, y).
@@ -75,6 +78,8 @@ pub struct CpuPoints {
 pub struct CpuMesh {
     pub primitives: Vec<CpuPrimitive>,
     pub points: Vec<CpuPoints>,
+    /// Gaussian splats, viewer space, packed for the splat shader.
+    pub splats: Vec<SplatTexels>,
     pub images: Vec<CpuImage>,
     /// Things that were dropped rather than drawn wrong — an undecodable
     /// texture, a line primitive. The tile still shows.
@@ -90,6 +95,10 @@ impl CpuMesh {
         self.points.iter().map(|p| p.positions.len()).sum()
     }
 
+    pub fn splat_count(&self) -> usize {
+        self.splats.iter().map(SplatTexels::len).sum()
+    }
+
     /// Merge another tile's content in, keeping texture indices pointing at
     /// the right images.
     pub fn append(&mut self, mut other: CpuMesh) {
@@ -102,6 +111,7 @@ impl CpuMesh {
         self.images.append(&mut other.images);
         self.primitives.append(&mut other.primitives);
         self.points.append(&mut other.points);
+        self.splats.append(&mut other.splats);
         self.warnings.append(&mut other.warnings);
     }
 }
@@ -398,6 +408,19 @@ struct Attr {
     ncomp: usize,
 }
 
+/// Splats through the full transform: centres into viewer space, covariances
+/// through its linear part.
+fn splats_to_viewer(rows: &[SplatRow], full: &DMat4, origin: DVec3) -> SplatTexels {
+    let l = DMat3::from_mat4(*full);
+    let l = Mat3::from_cols(l.x_axis.as_vec3(), l.y_axis.as_vec3(), l.z_axis.as_vec3());
+    let mut out = SplatTexels::default();
+    for (p, v, c) in rows {
+        let w = full.transform_point3(DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64)) - origin;
+        out.push([w.x as f32, w.y as f32, w.z as f32], splats::transform_covariance(&l, *v), *c);
+    }
+    out
+}
+
 /// A `POSITION` accessor through the full transform, into viewer space.
 fn viewer_positions(pos: &Attr, full: &DMat4, origin: DVec3) -> Vec<[f32; 3]> {
     (0..pos.len())
@@ -668,6 +691,86 @@ impl<'a> Gltf<'a> {
         })
     }
 
+    /// The splats of a `KHR_gaussian_splatting` primitive, in accessor space;
+    /// `None` for any other primitive. SPZ-compressed under either name the
+    /// extension has had, or plain accessors.
+    fn gaussian_splats(&self, prim: &Value) -> Result<Option<Vec<SplatRow>>, String> {
+        let prim_ext = prim.get("extensions");
+        let gs = prim_ext.and_then(|e| e.get("KHR_gaussian_splatting"));
+        let is_spz = |k: &str| k.starts_with("KHR_gaussian_splatting_compression_spz") || k == "KHR_spz_gaussian_splats_compression";
+        let spz = [gs.and_then(|g| g.get("extensions")), prim_ext]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .flat_map(|o| o.iter())
+            .find(|(k, _)| is_spz(k))
+            .map(|(_, v)| v);
+        if let Some(spz) = spz {
+            let view = usize_of(spz, "bufferView").ok_or("SPZ splats without a bufferView")?;
+            return splats::decode_spz(self.view_bytes(view)?.0).map(Some);
+        }
+        let Some(gs) = gs else { return Ok(None) };
+        let attrs = prim.get("attributes").ok_or("splat primitive without attributes")?;
+        // The draft spelled the semantics `_SCALE`; the extension prefixes them.
+        let attr = |name: &str| -> Result<Option<Attr>, String> {
+            let idx = usize_of(attrs, &format!("KHR_gaussian_splatting:{name}")).or_else(|| usize_of(attrs, &format!("_{name}")));
+            idx.map(|i| self.accessor(i)).transpose()
+        };
+        let pos = self.accessor(usize_of(attrs, "POSITION").ok_or("splat primitive without POSITION")?)?;
+        let n = pos.len();
+        let fits = |a: &Option<Attr>| a.as_ref().is_some_and(|a| a.len() == n);
+        let scale = attr("SCALE")?;
+        let rot = attr("ROTATION")?;
+        if !fits(&scale) || !fits(&rot) {
+            return Err("splat primitive without SCALE and ROTATION".into());
+        }
+        let (scale, rot) = (scale.unwrap(), rot.unwrap());
+        let opacity = attr("OPACITY")?.filter(|a| a.len() == n);
+        let dc = attr("SH_DEGREE_0_COEF_0")?.filter(|a| a.len() == n);
+        let color = usize_of(attrs, "COLOR_0").map(|i| self.accessor(i)).transpose()?.filter(|a| a.len() == n);
+        // Unnormalised bytes say 255 where they mean 1.
+        let color_div = match &color {
+            Some(c) if c.data.iter().any(|&v| v > 1.0) => 255.0,
+            _ => 1.0,
+        };
+        // Scales are log-encoded in some writers and linear in others; only
+        // a log scale can be negative, and real splats are mostly under 1 m.
+        let log_scale = scale.data.iter().any(|&v| v < 0.0);
+        let linear = gs.get("colorSpace").and_then(Value::as_str).is_some_and(|c| c.starts_with("lin"));
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            let c = color.as_ref().map(|c| c.get::<4>(i, [1.0; 4]).map(|v| v / color_div));
+            let alpha = match (&opacity, c) {
+                (Some(o), _) => o.get::<1>(i, [1.0])[0],
+                (None, Some(c)) => c[3],
+                _ => 1.0,
+            };
+            if alpha.is_nan() || alpha < 1.0 / 255.0 {
+                continue;
+            }
+            let rgb = match (&dc, c) {
+                (Some(d), _) => d.get::<3>(i, [0.0; 3]).map(|f| 0.5 + 0.282_094_8 * f),
+                (None, Some(c)) => [c[0], c[1], c[2]],
+                _ => [0.8; 3],
+            };
+            let rgb = rgb.map(|v| if linear { linear_to_srgb(v) } else { v.clamp(0.0, 1.0) });
+            let s = Vec3::from(scale.get::<3>(i, [0.0; 3]));
+            let s = if log_scale { s.exp() } else { s };
+            let q = rot.get::<4>(i, [0.0, 0.0, 0.0, 1.0]);
+            rows.push((
+                pos.get::<3>(i, [0.0; 3]),
+                splats::covariance(s, Quat::from_xyzw(q[0], q[1], q[2], q[3])),
+                [
+                    (rgb[0] * 255.0 + 0.5) as u8,
+                    (rgb[1] * 255.0 + 0.5) as u8,
+                    (rgb[2] * 255.0 + 0.5) as u8,
+                    (alpha.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                ],
+            ));
+        }
+        Ok(Some(rows))
+    }
+
     /// `COLOR_0` as sRGB bytes (glTF stores it linear), or white.
     fn colors(&self, attrs: &Value, n: usize) -> Result<Vec<[u8; 4]>, String> {
         Ok(match usize_of(attrs, "COLOR_0").map(|i| self.accessor(i)).transpose()? {
@@ -712,6 +815,10 @@ impl<'a> Gltf<'a> {
             for prim in arr(mesh, "primitives") {
                 if prim.get("extensions").and_then(|e| e.get("KHR_draco_mesh_compression")).is_some() {
                     return Err("KHR_draco_mesh_compression is not supported".into());
+                }
+                if let Some(rows) = self.gaussian_splats(prim)? {
+                    out.splats.push(splats_to_viewer(&rows, &full, origin));
+                    continue;
                 }
                 // 0 is POINTS; 4, 5 and 6 are triangles, strips and fans.
                 let mode = usize_of(prim, "mode").unwrap_or(4);
@@ -1086,6 +1193,84 @@ mod tests {
             "extensions":{"3DTILES_draco_point_compression":{"properties":{"POSITION":0},"byteOffset":0,"byteLength":12}}}"#;
         let e = decode_content(&pnts(ft, &[0u8; 12]), Path::new("."), &DMat4::IDENTITY, [0.0; 3]).err().unwrap();
         assert!(e.contains("draco"), "{e}");
+    }
+
+    /// A one-primitive GLB with the given JSON fragments and binary chunk.
+    fn glb(json: &str, bin: &[u8]) -> Vec<u8> {
+        let mut json = json.as_bytes().to_vec();
+        while json.len() % 4 != 0 {
+            json.push(b' ');
+        }
+        let mut bin = bin.to_vec();
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"glTF");
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&((12 + 8 + json.len() + 8 + bin.len()) as u32).to_le_bytes());
+        out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0x4E4F534Au32.to_le_bytes());
+        out.extend_from_slice(&json);
+        out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0x004E4942u32.to_le_bytes());
+        out.extend_from_slice(&bin);
+        out
+    }
+
+    #[test]
+    fn spz_splat_primitives_land_in_viewer_space() {
+        // As `haires splat-tiles` writes them: z-up data under a node that
+        // turns it y-up, which the tile's y-up-to-z-up undoes.
+        let ident = (3u32 << 30).to_le_bytes().to_vec();
+        let blob = crate::splats::tests::spz(3, &[([4096, 8192, 12288], 255, [128; 3], [160, 144, 128], ident)]);
+        let json = format!(
+            r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0]}}],
+            "nodes":[{{"matrix":[1,0,0,0,0,0,-1,0,0,1,0,0,0,0,0,1],"mesh":0}}],
+            "meshes":[{{"primitives":[{{"mode":0,"attributes":{{"POSITION":0,"KHR_gaussian_splatting:SCALE":1,"KHR_gaussian_splatting:ROTATION":2}},
+              "extensions":{{"KHR_gaussian_splatting":{{"extensions":{{"KHR_gaussian_splatting_compression_spz_2":{{"bufferView":0}}}}}}}}}}]}}],
+            "accessors":[{{"componentType":5126,"count":1,"type":"VEC3"}},{{"componentType":5126,"count":1,"type":"VEC3"}},
+                         {{"componentType":5126,"count":1,"type":"VEC4"}}],
+            "bufferViews":[{{"buffer":0,"byteLength":{}}}],"buffers":[{{"byteLength":{}}}],
+            "extensionsRequired":["KHR_gaussian_splatting","KHR_gaussian_splatting_compression_spz_2"]}}"#,
+            blob.len(),
+            blob.len()
+        );
+        let t = DMat4::from_translation(DVec3::new(191000.0, 443000.0, 20.0));
+        let m = decode_content(&glb(&json, &blob), Path::new("."), &t, [191000.0, 443000.0, 0.0]).unwrap();
+        assert!(m.points.is_empty() && m.primitives.is_empty());
+        assert_eq!(m.splat_count(), 1);
+        let t0 = m.splats[0].t0[0];
+        assert_eq!([t0[0], t0[1], t0[2]], [1.0, 2.0, 23.0]);
+        // Scales 1, e⁻¹, e⁻²: the z variance stays on z through both turns.
+        let (t1, t2) = (m.splats[0].t1[0], m.splats[0].t2[0]);
+        assert!((t1[0] - 1.0).abs() < 1e-5 && (t2[0] - (-2.0f32).exp()).abs() < 1e-5 && (t2[2] - (-4.0f32).exp()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn plain_splat_primitives_read_their_accessors() {
+        let mut bin = Vec::new();
+        let floats: [&[f32]; 4] = [&[1.0, 2.0, 3.0], &[0.0, -1.0, -2.0], &[0.0, 0.0, 0.0, 1.0], &[0.5]];
+        for f in floats {
+            for v in f {
+                bin.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let json = r#"{"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"mesh":0}],
+            "meshes":[{"primitives":[{"mode":0,"attributes":{"POSITION":0,"KHR_gaussian_splatting:SCALE":1,
+              "KHR_gaussian_splatting:ROTATION":2,"KHR_gaussian_splatting:OPACITY":3},"extensions":{"KHR_gaussian_splatting":{}}}]}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":1,"type":"VEC3"},
+                         {"bufferView":0,"byteOffset":12,"componentType":5126,"count":1,"type":"VEC3"},
+                         {"bufferView":0,"byteOffset":24,"componentType":5126,"count":1,"type":"VEC4"},
+                         {"bufferView":0,"byteOffset":40,"componentType":5126,"count":1,"type":"SCALAR"}],
+            "bufferViews":[{"buffer":0,"byteLength":44}],"buffers":[{"byteLength":44}]}"#;
+        let m = decode_content(&glb(json, &bin), Path::new("."), &DMat4::IDENTITY, [0.0; 3]).unwrap();
+        assert_eq!(m.splat_count(), 1);
+        // y-up (1, 2, 3) is z-up (1, −3, 2); log scales (0, −1, −2) likewise.
+        let s = &m.splats[0];
+        assert_eq!([s.t0[0][0], s.t0[0][1], s.t0[0][2]], [1.0, -3.0, 2.0]);
+        assert!((s.t1[0][0] - 1.0).abs() < 1e-5 && (s.t2[0][0] - (-4.0f32).exp()).abs() < 1e-5 && (s.t2[0][2] - (-2.0f32).exp()).abs() < 1e-5);
+        assert!((s.t1[0][3] - 0.5).abs() < 0.01);
     }
 
     #[test]

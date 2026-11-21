@@ -14,6 +14,14 @@
 //! already loaded — as `haires amesh` writes them, in RD/NAP — and lands on
 //! them directly.
 //!
+//! A tileset that carries `ESRI_crs` — a projected CRS, with a second
+//! transform and bounding volume per tile in it, as `haires splat-tiles`
+//! writes beside the ECEF ones — is placed by those instead, so it lands on
+//! RD clouds exactly rather than in an approximate local frame.
+//!
+//! Gaussian-splat content goes into a [`SplatAtlas`] per tileset and is drawn
+//! with one sort across all the tiles on screen.
+//!
 //! Point-cloud content (`pnts`, or glTF `POINTS`) is drawn in the cloud's own
 //! point pass rather than with the meshes, so it gets the point size and EDL
 //! the clouds have. Its geometric error is roughly its point spacing, and a
@@ -35,6 +43,26 @@ use serde_json::Value;
 
 use crate::gltf_load::{self, CpuMesh};
 use crate::raw_miniquad::{ZClip, aabb_outside_frustum, extract_frustum_planes};
+use crate::splats::{SplatAtlas, SplatTexels};
+
+/// What a tile holds. Each kind has its own detail threshold, since a
+/// geometric error means a different thing for each.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    /// Not loaded yet, and nothing in the URI says. Treated as its parent's.
+    Unknown,
+    Mesh,
+    Points,
+    Splats,
+}
+
+/// Screen-space error thresholds, in physical pixels, per kind of content.
+#[derive(Clone, Copy, Debug)]
+pub struct Detail {
+    pub mesh: f64,
+    pub points: f64,
+    pub splats: f64,
+}
 
 /// How meshes are shaded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,9 +119,8 @@ struct Node {
     depth: u32,
     state: State,
     last_used: u64,
-    /// The content is points: guessed from a `.pnts` URI until it has been
-    /// loaded once, then known.
-    points: bool,
+    /// Known once loaded; `.pnts` says points before that.
+    kind: Kind,
 }
 
 struct GpuPrim {
@@ -117,6 +144,8 @@ struct GpuTile {
     prims: Vec<GpuPrim>,
     points: Vec<GpuPoints>,
     textures: Vec<TextureId>,
+    /// The tile's splats and their first slot in the tileset's atlas.
+    splats: Option<(Arc<SplatTexels>, usize)>,
     bytes: usize,
     triangles: usize,
     point_count: usize,
@@ -187,9 +216,11 @@ impl GpuTile {
                 }
             })
             .collect();
-        GpuTile { prims, points, textures, bytes, triangles, point_count }
+        GpuTile { prims, points, textures, splats: None, bytes, triangles, point_count }
     }
 
+    /// Free the buffers and textures. The atlas slots are the caller's to
+    /// give back.
     fn free(self, ctx: &mut dyn RenderingBackend) {
         for p in self.prims {
             for vb in p.bindings.vertex_buffers {
@@ -366,6 +397,8 @@ fn is_tileset_json(p: &Path) -> bool {
 struct Parser<'a> {
     nodes: &'a mut Vec<Node>,
     frame: DMat4,
+    /// Read each tile's `ESRI_crs` transform and volume where it has them.
+    esri: bool,
 }
 
 impl Parser<'_> {
@@ -374,13 +407,15 @@ impl Parser<'_> {
         if tile.get("implicitTiling").is_some() {
             return Err("implicit tiling is not supported yet".into());
         }
-        let local = f64_array(tile.get("transform"))
+        // The projected twin of the tile's placement, where there is one.
+        let esri = tile.get("extensions").and_then(|e| e.get("ESRI_crs")).filter(|_| self.esri);
+        let placed = |k: &str| esri.and_then(|e| e.get(k)).or_else(|| tile.get(k));
+        let local = f64_array(placed("transform"))
             .filter(|m| m.len() == 16)
             .map(|m| DMat4::from_cols_slice(&m))
             .unwrap_or(DMat4::IDENTITY);
         let transform = *parent_transform * local;
-        let (world_lo, world_hi) = tile
-            .get("boundingVolume")
+        let (world_lo, world_hi) = placed("boundingVolume")
             .and_then(|bv| volume_aabb(bv, &transform, &self.frame))
             .unwrap_or((DVec3::splat(-1.0e12), DVec3::splat(1.0e12)));
         let refine = match tile.get("refine").and_then(Value::as_str) {
@@ -405,8 +440,8 @@ impl Parser<'_> {
             }
         }
         let idx = self.nodes.len();
-        let points = !uris.is_empty()
-            && uris.iter().all(|u| u.extension().is_some_and(|e| e.eq_ignore_ascii_case("pnts")));
+        let pnts = !uris.is_empty() && uris.iter().all(|u| u.extension().is_some_and(|e| e.eq_ignore_ascii_case("pnts")));
+        let kind = if pnts { Kind::Points } else { Kind::Unknown };
         self.nodes.push(Node {
             children: Vec::new(),
             world_lo,
@@ -421,7 +456,7 @@ impl Parser<'_> {
             external,
             depth,
             last_used: 0,
-            points,
+            kind,
         });
         if let Some(children) = tile.get("children").and_then(Value::as_array) {
             for c in children {
@@ -452,6 +487,7 @@ pub struct TilesetStats {
     pub drawn_tiles: usize,
     pub drawn_triangles: usize,
     pub drawn_points: usize,
+    pub drawn_splats: usize,
     /// Loading has stopped because the tiles on screen fill the budget.
     pub budget_full: bool,
     /// The first failure, so the panel can say why rather than only how many.
@@ -465,6 +501,8 @@ pub struct Tileset {
     pub visible: bool,
     /// Placed in a local ENU frame because it was in ECEF.
     pub ecef: bool,
+    /// Placed by its `ESRI_crs` twin: the CRS it names, e.g. "EPSG:28992+5709".
+    pub esri_crs: Option<String>,
     /// ECEF to the local frame, or identity. Region volumes in external
     /// tilesets need it as much as the root's do.
     frame: DMat4,
@@ -476,6 +514,11 @@ pub struct Tileset {
     point_depth_pipeline: Pipeline,
     /// 0, 1, 2, … for drawing points; grown to the largest tile seen.
     iota: Option<(BufferId, usize)>,
+    /// Made when the first splat tile arrives.
+    atlas: Option<SplatAtlas>,
+    /// A splat tile found no room even after growing and evicting; loading
+    /// waits until a tile is released.
+    atlas_full: bool,
     white: TextureId,
     req_tx: Option<mpsc::Sender<LoadReq>>,
     res_rx: mpsc::Receiver<LoadResult>,
@@ -489,6 +532,7 @@ pub struct Tileset {
     /// settings that apply.
     pub has_points: bool,
     pub has_mesh: bool,
+    pub has_splats: bool,
 }
 
 /// Per-frame inputs to the traversal.
@@ -496,8 +540,7 @@ struct View {
     planes: [[f32; 4]; 6],
     view_proj: glam::Mat4,
     mpp: f64,
-    max_sse: f64,
-    point_sse: f64,
+    detail: Detail,
     frame: u64,
 }
 
@@ -526,16 +569,17 @@ impl Tileset {
             .and_then(|bv| volume_aabb(bv, &root_local, &DMat4::IDENTITY))
             .ok_or("the root tile has no usable boundingVolume")?;
         let centre = (lo + hi) * 0.5;
-        let ecef = is_region || centre.length() > 6.0e6;
+        let esri_crs = esri_projected_crs(&json);
+        let ecef = esri_crs.is_none() && (is_region || centre.length() > 6.0e6);
         let frame = if ecef { enu_frame(centre) } else { DMat4::IDENTITY };
 
         let mut nodes = Vec::new();
-        Parser { nodes: &mut nodes, frame }.tile(root, &frame, Refine::Replace, &base_dir, 0)?;
-        Ok(TilesetDesc { path: path.to_path_buf(), nodes, ecef, frame })
+        Parser { nodes: &mut nodes, frame, esri: esri_crs.is_some() }.tile(root, &frame, Refine::Replace, &base_dir, 0)?;
+        Ok(TilesetDesc { path: path.to_path_buf(), nodes, ecef, esri_crs, frame })
     }
 
     pub fn attach(ctx: &mut dyn RenderingBackend, desc: TilesetDesc, origin: [f64; 3]) -> Tileset {
-        let TilesetDesc { path, mut nodes, ecef, frame } = desc;
+        let TilesetDesc { path, mut nodes, ecef, esri_crs, frame } = desc;
         for n in &mut nodes {
             set_viewer_box(n, origin);
         }
@@ -544,12 +588,13 @@ impl Tileset {
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8);
         spawn_loader_pool(req_rx, res_tx, workers);
         let white = ctx.new_texture_from_rgba8(1, 1, &[255, 255, 255, 255]);
-        info_tiles(&path, &nodes, ecef);
-        let (has_points, has_mesh) = content_kinds(&nodes);
+        info_tiles(&path, &nodes, ecef, esri_crs.as_deref());
+        let (has_points, has_mesh, has_splats) = content_kinds(&nodes);
         Tileset {
             path,
             visible: true,
             ecef,
+            esri_crs,
             frame,
             nodes,
             origin,
@@ -557,6 +602,8 @@ impl Tileset {
             point_pipeline: point_pipeline(ctx, false),
             point_depth_pipeline: point_pipeline(ctx, true),
             iota: None,
+            atlas: None,
+            atlas_full: false,
             white,
             req_tx: Some(req_tx),
             res_rx,
@@ -573,6 +620,7 @@ impl Tileset {
                 drawn_tiles: 0,
                 drawn_triangles: 0,
                 drawn_points: 0,
+                drawn_splats: 0,
                 budget_full: false,
                 first_error: None,
                 warnings: 0,
@@ -580,6 +628,7 @@ impl Tileset {
             },
             has_points,
             has_mesh,
+            has_splats,
         }
     }
 
@@ -598,15 +647,15 @@ impl Tileset {
     }
 
     /// Stream and select tiles for this frame. `mpp` is metres per physical
-    /// pixel — the unit `max_sse` (meshes) and `point_sse` (points) are in.
+    /// pixel — the unit `detail` is in; `front` orders the splats.
     #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         ctx: &mut dyn RenderingBackend,
         view_proj: &glam::Mat4,
+        front: glam::Vec3,
         mpp: f64,
-        max_sse: f64,
-        point_sse: f64,
+        detail: Detail,
         budget_bytes: usize,
         frame: u64,
     ) {
@@ -620,9 +669,8 @@ impl Tileset {
         let mut kinds_changed = false;
         while uploaded < 96 << 20 {
             let Some(r) = self.ready.pop_front() else { break };
-            let node = &mut self.nodes[r.node];
             match r.result {
-                Ok(mesh) => {
+                Ok(mut mesh) => {
                     if let Some(w) = mesh.warnings.first() {
                         self.stats.warnings += mesh.warnings.len();
                         if self.stats.first_warning.is_none() {
@@ -630,11 +678,37 @@ impl Tileset {
                             self.stats.first_warning = Some(w.clone());
                         }
                     }
-                    let points = mesh.primitives.is_empty() && !mesh.points.is_empty();
-                    kinds_changed |= node.points != points;
-                    node.points = points;
+                    let (tris, pts, spl) = (!mesh.primitives.is_empty(), !mesh.points.is_empty(), mesh.splat_count() > 0);
+                    let kind = match (tris, pts, spl) {
+                        (false, true, false) => Kind::Points,
+                        (false, false, true) => Kind::Splats,
+                        (false, false, false) => self.nodes[r.node].kind,
+                        _ => Kind::Mesh,
+                    };
+                    kinds_changed |= self.nodes[r.node].kind != kind;
+                    self.nodes[r.node].kind = kind;
+                    let splats = std::mem::take(&mut mesh.splats).into_iter().reduce(|mut a, b| {
+                        a.append(b);
+                        a
+                    });
                     let largest = mesh.points.iter().map(|p| p.positions.len()).max().unwrap_or(0);
-                    let tile = GpuTile::upload(ctx, mesh, self.white);
+                    let mut tile = GpuTile::upload(ctx, mesh, self.white);
+                    if let Some(sp) = splats.filter(|s| !s.is_empty()) {
+                        match self.place_splats(ctx, &sp, frame) {
+                            Some(start) => {
+                                tile.bytes += sp.len() * 48;
+                                tile.splats = Some((Arc::new(sp), start));
+                            }
+                            None => {
+                                // No room: back to unloaded, and no more
+                                // loading until something is released.
+                                tile.free(ctx);
+                                self.nodes[r.node].state = State::Unloaded;
+                                self.atlas_full = true;
+                                continue;
+                            }
+                        }
+                    }
                     if largest > self.iota.map_or(0, |(_, n)| n) {
                         // Grown in steps so a run of ever so slightly larger
                         // tiles is not a rebuild each.
@@ -648,7 +722,7 @@ impl Tileset {
                     uploaded += tile.bytes;
                     self.stats.gpu_bytes += tile.bytes;
                     self.stats.loaded += 1;
-                    node.state = State::Loaded(tile);
+                    self.nodes[r.node].state = State::Loaded(tile);
                 }
                 Err(e) => {
                     self.stats.failed += 1;
@@ -656,26 +730,32 @@ impl Tileset {
                         ::log::error!("{}: {e}", self.path.display());
                         self.stats.first_error = Some(e);
                     }
-                    node.state = State::Failed;
+                    self.nodes[r.node].state = State::Failed;
                 }
             }
         }
         if kinds_changed {
-            (self.has_points, self.has_mesh) = content_kinds(&self.nodes);
+            (self.has_points, self.has_mesh, self.has_splats) = content_kinds(&self.nodes);
         }
 
         self.render.clear();
         self.wishes.clear();
         if self.visible {
-            let view = View {
-                planes: extract_frustum_planes(view_proj),
-                view_proj: *view_proj,
-                mpp: mpp.max(1e-9),
-                max_sse,
-                point_sse,
-                frame,
-            };
-            self.visit(0, &view);
+            let view = View { planes: extract_frustum_planes(view_proj), view_proj: *view_proj, mpp: mpp.max(1e-9), detail, frame };
+            self.visit(0, &view, Kind::Unknown);
+        }
+
+        // The splats among the tiles selected, sorted together.
+        if let Some(atlas) = &mut self.atlas {
+            let sel: Vec<(usize, usize, Arc<SplatTexels>)> = self
+                .render
+                .iter()
+                .filter_map(|&i| match &self.nodes[i].state {
+                    State::Loaded(GpuTile { splats: Some((t, start)), .. }) => Some((i, *start, t.clone())),
+                    _ => None,
+                })
+                .collect();
+            atlas.update(ctx, front, &sel);
         }
 
         // Evict the least recently used tiles not drawn this frame.
@@ -684,7 +764,7 @@ impl Tileset {
                 .nodes
                 .iter()
                 .enumerate()
-                .filter(|(_, n)| matches!(n.state, State::Loaded(_)) && n.last_used != frame)
+                .filter(|(i, n)| matches!(n.state, State::Loaded(_)) && n.last_used != frame && !self.atlas.as_ref().is_some_and(|a| a.protects(*i)))
                 .map(|(i, n)| (n.last_used, i))
                 .collect();
             cands.sort_unstable();
@@ -692,18 +772,14 @@ impl Tileset {
                 if self.stats.gpu_bytes <= budget_bytes {
                     break;
                 }
-                if let State::Loaded(t) = std::mem::replace(&mut self.nodes[i].state, State::Unloaded) {
-                    self.stats.gpu_bytes -= t.bytes;
-                    self.stats.loaded -= 1;
-                    t.free(ctx);
-                }
+                self.release(ctx, i);
             }
         }
 
         // Then load, unless what is on screen already fills the budget: a
         // detail setting the budget cannot hold stops at the coarser levels,
         // which are asked for first, instead of running the GPU out of memory.
-        self.stats.budget_full = self.stats.gpu_bytes > budget_bytes;
+        self.stats.budget_full = self.stats.gpu_bytes > budget_bytes || self.atlas_full;
         // Coarse tiles first — they cover the most screen per byte — then
         // the ones nearest the middle of the view.
         self.wishes.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
@@ -737,6 +813,67 @@ impl Tileset {
         }
         self.stats.drawn_triangles = tris;
         self.stats.drawn_points = pts;
+        self.stats.drawn_splats = self.atlas.as_ref().map_or(0, SplatAtlas::shown);
+    }
+
+    /// Unload tile `i`, giving its atlas slots back.
+    fn release(&mut self, ctx: &mut dyn RenderingBackend, i: usize) {
+        if let State::Loaded(t) = std::mem::replace(&mut self.nodes[i].state, State::Unloaded) {
+            self.stats.gpu_bytes -= t.bytes;
+            self.stats.loaded -= 1;
+            if let (Some((s, start)), Some(atlas)) = (&t.splats, &mut self.atlas) {
+                atlas.free(*start, s.len());
+                self.atlas_full = false;
+            }
+            t.free(ctx);
+        }
+    }
+
+    /// Find atlas slots for a tile's splats and upload them: first fit, then
+    /// growing the atlas, then releasing the least recently used splat tiles
+    /// nothing on screen refers to.
+    fn place_splats(&mut self, ctx: &mut dyn RenderingBackend, sp: &SplatTexels, frame: u64) -> Option<usize> {
+        let n = sp.len();
+        let atlas = self.atlas.get_or_insert_with(|| SplatAtlas::new(ctx));
+        let mut start = atlas.alloc(n);
+        if start.is_none() {
+            let resident: Vec<(usize, Arc<SplatTexels>)> = self
+                .nodes
+                .iter()
+                .filter_map(|nd| match &nd.state {
+                    State::Loaded(GpuTile { splats: Some((t, s)), .. }) => Some((*s, t.clone())),
+                    _ => None,
+                })
+                .collect();
+            let atlas = self.atlas.as_mut().unwrap();
+            if atlas.grow(ctx, n, &resident) {
+                start = atlas.alloc(n);
+            }
+        }
+        if start.is_none() {
+            let mut cands: Vec<(u64, usize)> = self
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(i, nd)| {
+                    matches!(nd.state, State::Loaded(GpuTile { splats: Some(_), .. }))
+                        && nd.last_used + 1 < frame
+                        && !self.atlas.as_ref().unwrap().protects(*i)
+                })
+                .map(|(i, nd)| (nd.last_used, i))
+                .collect();
+            cands.sort_unstable();
+            for (_, i) in cands {
+                self.release(ctx, i);
+                start = self.atlas.as_mut().unwrap().alloc(n);
+                if start.is_some() {
+                    break;
+                }
+            }
+        }
+        let start = start?;
+        self.atlas.as_ref().unwrap().upload(ctx, start, sp);
+        Some(start)
     }
 
     /// Ask for a tile; true if it can be drawn now.
@@ -758,7 +895,7 @@ impl Tileset {
     /// Select what to draw under tile `i`. Returns whether everything the
     /// subtree should show is on screen — a REPLACE parent stays up until its
     /// children are complete, so zooming in never opens a hole.
-    fn visit(&mut self, i: usize, view: &View) -> bool {
+    fn visit(&mut self, i: usize, view: &View, inherited: Kind) -> bool {
         if aabb_outside_frustum(&view.planes, &self.nodes[i].lo, &self.nodes[i].hi) {
             return true;
         }
@@ -768,7 +905,13 @@ impl Tileset {
         let n = &self.nodes[i];
         let has_content = !matches!(n.state, State::Empty);
         let has_children = !n.children.is_empty();
-        let max_sse = if n.points { view.point_sse } else { view.max_sse };
+        // A tile not loaded yet is taken to hold what its parent holds.
+        let kind = if n.kind == Kind::Unknown { inherited } else { n.kind };
+        let max_sse = match kind {
+            Kind::Points => view.detail.points,
+            Kind::Splats => view.detail.splats,
+            Kind::Mesh | Kind::Unknown => view.detail.mesh,
+        };
         let refine = has_children && (!has_content || n.geometric_error / view.mpp > max_sse);
         // A failed tile is as complete as it will ever be.
         let failed = matches!(n.state, State::Failed);
@@ -795,7 +938,7 @@ impl Tileset {
                 }
             }
             for c in children {
-                complete &= self.visit(c, view);
+                complete &= self.visit(c, view, kind);
             }
             return complete;
         }
@@ -803,7 +946,7 @@ impl Tileset {
         let mark = self.render.len();
         let mut complete = true;
         for c in children {
-            complete &= self.visit(c, view);
+            complete &= self.visit(c, view, kind);
         }
         if complete || !has_content || failed {
             return complete;
@@ -829,7 +972,8 @@ impl Tileset {
                 // Region volumes inside an external tileset are geodetic like
                 // any other; the frame is whatever the parent tileset chose.
                 let frame = self.frame;
-                Parser { nodes: &mut self.nodes, frame }.tile(&json["root"], &parent_transform, refine, &base_dir, depth)
+                let esri = self.esri_crs.is_some();
+                Parser { nodes: &mut self.nodes, frame, esri }.tile(&json["root"], &parent_transform, refine, &base_dir, depth)
             });
             match result {
                 Ok(root) => {
@@ -908,6 +1052,16 @@ impl Tileset {
         }
     }
 
+    /// Draw the splats of the tiles on screen, blended over everything drawn
+    /// so far. `viewport` is the view's size in physical pixels.
+    pub fn draw_splats(&self, ctx: &mut dyn RenderingBackend, view_proj: &glam::Mat4, viewport: (f32, f32), z_clip: ZClip) {
+        if let Some(atlas) = &self.atlas
+            && self.visible
+        {
+            atlas.draw(ctx, view_proj, viewport, z_clip);
+        }
+    }
+
     pub fn unload(mut self, ctx: &mut dyn RenderingBackend) {
         // Closing the request channel lets the workers run dry and exit.
         self.req_tx = None;
@@ -918,6 +1072,9 @@ impl Tileset {
         }
         if let Some((b, _)) = self.iota {
             ctx.delete_buffer(b);
+        }
+        if let Some(a) = self.atlas {
+            a.unload(ctx);
         }
         ctx.delete_texture(self.white);
         ctx.delete_pipeline(self.pipeline);
@@ -931,6 +1088,7 @@ pub struct TilesetDesc {
     pub path: PathBuf,
     nodes: Vec<Node>,
     pub ecef: bool,
+    esri_crs: Option<String>,
     frame: DMat4,
 }
 
@@ -955,13 +1113,28 @@ fn set_viewer_box(n: &mut Node, origin: [f64; 3]) {
     }
 }
 
-/// Whether any tile holds points, and any holds a mesh, as far as is known.
-fn content_kinds(nodes: &[Node]) -> (bool, bool) {
-    let with_content = || nodes.iter().filter(|n| !n.uris.is_empty());
-    (with_content().any(|n| n.points), with_content().any(|n| !n.points))
+/// Whether any tile is known to hold points, a mesh, splats.
+fn content_kinds(nodes: &[Node]) -> (bool, bool, bool) {
+    let any = |k: Kind| nodes.iter().any(|n| n.kind == k);
+    (any(Kind::Points), any(Kind::Mesh), any(Kind::Splats))
 }
 
-fn info_tiles(path: &Path, nodes: &[Node], ecef: bool) {
+/// The projected CRS a tileset's `ESRI_crs` names, as "EPSG:28992+5709".
+/// Geographic and geocentric ones are left to the ECEF path: their numbers
+/// are not metres.
+fn esri_projected_crs(json: &Value) -> Option<String> {
+    let e = json.get("extensions")?.get("ESRI_crs")?;
+    let wkid = e.get("wkid").or_else(|| e.get("latestWkid")).and_then(Value::as_u64)?;
+    if matches!(wkid, 4326 | 4258 | 4979 | 4978 | 4937 | 4936 | 4269 | 4230) {
+        return None;
+    }
+    Some(match e.get("vcsWkid").or_else(|| e.get("latestVcsWkid")).and_then(Value::as_u64) {
+        Some(v) => format!("EPSG:{wkid}+{v}"),
+        None => format!("EPSG:{wkid}"),
+    })
+}
+
+fn info_tiles(path: &Path, nodes: &[Node], ecef: bool, esri: Option<&str>) {
     let with_content = nodes.iter().filter(|n| !n.uris.is_empty()).count();
     let external = nodes.iter().filter(|n| !n.external.is_empty()).count();
     ::log::info!(
@@ -970,7 +1143,11 @@ fn info_tiles(path: &Path, nodes: &[Node], ecef: bool) {
         nodes.len(),
         with_content,
         external,
-        if ecef { ", ECEF — shown in a local east-north-up frame" } else { "" }
+        match (ecef, esri) {
+            (true, _) => ", ECEF — shown in a local east-north-up frame".to_string(),
+            (false, Some(c)) => format!(", placed in {c} by ESRI_crs"),
+            _ => String::new(),
+        }
     );
 }
 
@@ -1244,8 +1421,9 @@ mod tests {
             let (blo, bhi) = (n.world_lo - DVec3::from(origin), n.world_hi - DVec3::from(origin));
             let mut outside = 0;
             let mut count = 0;
-            let pts = m.points.iter().flat_map(|p| p.positions.iter());
-            for p in m.primitives.iter().flat_map(|p| p.positions.iter()).chain(pts) {
+            let pts = m.points.iter().flat_map(|p| p.positions.iter()).copied();
+            let spl = m.splats.iter().flat_map(|s| s.t0.iter()).map(|t| [t[0], t[1], t[2]]);
+            for p in m.primitives.iter().flat_map(|p| p.positions.iter()).copied().chain(pts).chain(spl) {
                 count += 1;
                 let v = DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64);
                 if v.cmplt(blo - 0.01).any() || v.cmpgt(bhi + 0.01).any() {
@@ -1253,18 +1431,42 @@ mod tests {
                 }
             }
             println!(
-                "depth {} {}: {} vertices, {} triangles, {} points, {} images, {} outside the box, decoded in {:?}",
+                "depth {} {}: {} vertices, {} triangles, {} points, {} splats, {} images, {} outside the box, decoded in {:?}",
                 n.depth,
                 n.uris[0].display(),
                 count,
                 m.triangle_count(),
                 m.point_count(),
+                m.splat_count(),
                 m.images.len(),
                 outside,
                 t.elapsed()
             );
             assert_eq!(outside, 0);
         }
+    }
+
+    #[test]
+    fn esri_crs_twins_place_an_ecef_tileset_in_rd() {
+        let d = scratch("esri");
+        let p = d.join("tileset.json");
+        std::fs::write(
+            &p,
+            r#"{"asset":{"version":"1.1"},"geometricError":10,"extensions":{"ESRI_crs":{"wkid":28992,"vcsWkid":5709}},
+               "root":{"boundingVolume":{"box":[3916197,405557,5001182,60,0,0,0,60,0,0,0,50]},"geometricError":8,
+                 "extensions":{"ESRI_crs":{"boundingVolume":{"box":[191086,443150,22,55,0,0,0,64,0,0,0,19]}}},
+                 "children":[{"boundingVolume":{"box":[0,0,0,10,0,0,0,10,0,0,0,10]},"geometricError":0,
+                   "transform":[0.1,0.99,0,0,-0.78,-0.07,0.61,0,0.61,0.06,0.78,0,3916197,405557,5001182,1],
+                   "extensions":{"ESRI_crs":{"boundingVolume":{"box":[0,0,0,10,0,0,0,10,0,0,0,10]},
+                     "transform":[1,0,0,0,0,1,0,0,0,0,1,0,191086,443150,22,1]}},"content":{"uri":"a.glb"}}]}}"#,
+        )
+        .unwrap();
+        let desc = Tileset::open(&p).unwrap();
+        assert!(!desc.ecef);
+        assert_eq!(desc.esri_crs.as_deref(), Some("EPSG:28992+5709"));
+        assert_eq!(desc.world_bounds(), (DVec3::new(191031.0, 443086.0, 3.0), DVec3::new(191141.0, 443214.0, 41.0)));
+        assert_eq!(desc.nodes[1].world_lo, DVec3::new(191076.0, 443140.0, 12.0));
+        assert_eq!(desc.nodes[1].transform.w_axis.truncate(), DVec3::new(191086.0, 443150.0, 22.0));
     }
 
     #[test]
