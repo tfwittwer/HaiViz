@@ -120,17 +120,14 @@ detail** is the error, in screen pixels, allowed before a finer tile is
 loaded — lower is sharper and loads more. Content is glTF 2.0, binary or JSON,
 with vertex colours and/or PNG / JPEG / WebP textures; quantised meshes
 (`KHR_mesh_quantization`) and `KHR_texture_transform` are read.
-**Lighting** follows the material (`KHR_materials_unlit` is drawn as is, the way
-`haires amesh` bakes its sun into the colours), or can be forced on or off.
+**Lighting** follows the material (`KHR_materials_unlit` is drawn as is), or can be forced on or off.
 
-Gaussian-splat tiles (`KHR_gaussian_splatting`, plain or SPZ-compressed as
-`haires splat-tiles` writes them) stream like any other content and are sorted
+Gaussian-splat tiles (`KHR_gaussian_splatting`, plain or SPZ-compressed) stream like any other content and are sorted
 together, so splats blend correctly across tile borders. **Splat detail** is
 their error allowance. As with the PLY, colour is the DC term only.
 
 A tileset whose `ESRI_crs` names a projected CRS, with a twin transform and
-bounding volume per tile in it (as `haires splat-tiles` writes beside the ECEF
-ones), is placed by those: it lands on RD/NAP clouds exactly. The panel says
+bounding volume per tile in it, is placed by those: it lands on RD/NAP clouds exactly. The panel says
 which CRS it was placed in.
 
 Point-cloud tiles — `pnts`, or glTF `POINTS` primitives — are drawn with the
@@ -139,8 +136,7 @@ sRGB, glTF's linear, as the formats specify). **Point detail** is their
 error allowance; a point tile's geometric error is about its point spacing, so
 the default 1 px streams them about as densely as a COPC cloud.
 
-- A tileset in a projected CRS — as `haires amesh` writes them, in RD/NAP —
-  lands on clouds in that CRS directly. A tileset in ECEF (EPSG:4978, as most
+- A tileset in a projected CRS lands on clouds in that CRS directly. A tileset in ECEF (EPSG:4978, as most
   published tilesets are) is shown in a local east-north-up frame at its
   centre: upright, but not aligned with projected clouds.
 - Not supported: Draco and meshopt compression, KTX2 / Basis textures (the
@@ -153,7 +149,7 @@ write (Inria, Brush, gsplat, nerfstudio). They are drawn as ellipses, sorted
 back to front whenever the view turns. Colour is the base (DC) colour; the
 view-dependent spherical-harmonic bands are not used. A `scene.json` with
 `origin_rd` (and `horizontal_scale`) beside the PLY or up to three folders
-above it — what the haires splat pipeline trains from — places the splats in
+above it places the splats in
 RD/NAP; without one the PLY's coordinates are used as they are.
 
 **Crop floaters** (on by default) hides splats centred well outside the scene:
