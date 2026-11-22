@@ -10,6 +10,8 @@ use macroquad::prelude::*;
 use crate::raw_miniquad::{ClassDefs, ClassVis, CopcStage, EdlRenderer, HeatmapRenderer, SectionData, Stage, TileStageManager, build_section_from_raw_stages, build_section_from_stages, classification_color, default_class_label, load_class_defs, load_class_defs_from, make_section_data, save_class_defs_to, scan_dir_for_copc, DEFAULT_CLASS_FILE};
 use crate::classify::{ClassMask, effective_class};
 use las::Point as LasPoint;
+use crate::extra_bytes::{ExtraColor, ExtraFields, Ramp};
+use std::sync::Arc;
 
 const MOVE_SPEED: f32 = 0.5;
 /// Orbit rotation, in radians per logical pixel of mouse travel.
@@ -32,6 +34,7 @@ const CORRIDOR_POINT_LIMIT: i64 = 60_000_000;
 const SNAP_NEIGHBOURHOOD_M: f64 = 20.0;
 
 mod raw_miniquad;
+mod extra_bytes;
 mod spatial;
 mod polylines;
 mod gpkg;
@@ -250,6 +253,8 @@ pub enum ColorMode {
     Rgb,
     PointSourceId,
     Time,
+    /// A numeric extra-bytes field, chosen with `extra_color_controls`.
+    Extra,
 }
 
 impl ColorMode {
@@ -261,16 +266,18 @@ impl ColorMode {
             ColorMode::Rgb => "RGB",
             ColorMode::PointSourceId => "PointSourceId",
             ColorMode::Time => "Time",
+            ColorMode::Extra => "Extra bytes",
         }
     }
 
-    const ALL: [ColorMode; 6] = [
+    const ALL: [ColorMode; 7] = [
         ColorMode::Height,
         ColorMode::Intensity,
         ColorMode::Classification,
         ColorMode::Rgb,
         ColorMode::PointSourceId,
         ColorMode::Time,
+        ColorMode::Extra,
     ];
 }
 
@@ -1499,6 +1506,199 @@ fn apply_height_color(
     }
 }
 
+/// The colour-mode picker. Extra bytes is offered only while a loaded file has
+/// numeric extra-bytes fields (or is already selected, so the box can show it).
+fn color_mode_picker(ui: &mut egui_macroquad::egui::Ui, mode: &mut ColorMode, have_extra: bool) {
+    ui.horizontal(|ui| {
+        ui.label("Color:");
+        egui_macroquad::egui::ComboBox::from_id_salt("color_mode")
+            .selected_text(mode.label())
+            .show_ui(ui, |ui| {
+                for m in ColorMode::ALL {
+                    if m != ColorMode::Extra || have_extra || *mode == ColorMode::Extra {
+                        ui.selectable_value(mode, m, m.label());
+                    }
+                }
+            });
+    });
+}
+
+/// Field picker, ramp and colour range for the Extra-bytes mode.
+///
+/// A field chosen from the picker, or Reset, is put in `pick`, and
+/// `sync_extra_color` gives it that field's default range after the panel —
+/// which may need a pass over the resident points, so it is not done here.
+/// Range and ramp edits are made to `sel` in place; `sync_extra_color` notices
+/// them by comparison.
+fn extra_color_controls(
+    ui: &mut egui_macroquad::egui::Ui,
+    color_mode: ColorMode,
+    fields: &[extra_bytes::FieldSummary],
+    sel: &mut Option<ExtraColor>,
+    pick: &mut Option<String>,
+) {
+    use egui_macroquad::egui;
+    if color_mode != ColorMode::Extra {
+        return;
+    }
+    let Some(s) = sel.as_mut() else {
+        ui.label("No extra-bytes fields in the loaded files.");
+        return;
+    };
+    let field = fields.iter().find(|f| f.name == s.name);
+    ui.horizontal(|ui| {
+        ui.label("Field:");
+        egui::ComboBox::from_id_salt("extra_field")
+            .selected_text(s.name.as_str())
+            .show_ui(ui, |ui| {
+                for f in fields {
+                    if ui.selectable_label(f.name == s.name, f.name.as_str()).clicked() && f.name != s.name {
+                        *pick = Some(f.name.clone());
+                    }
+                }
+            });
+        egui::ComboBox::from_id_salt("extra_ramp")
+            .selected_text(s.ramp.label())
+            .show_ui(ui, |ui| {
+                for r in [Ramp::Sequential, Ramp::Diverging] {
+                    ui.selectable_value(&mut s.ramp, r, r.label());
+                }
+            });
+    });
+    let decimals = field.map_or(3, |f| f.decimals);
+    let unit = if field.is_some_and(|f| f.is_c2c()) { " m" } else { "" };
+    let speed = ((s.hi - s.lo).abs() / 200.0).max(10f64.powi(-(decimals as i32)));
+    ui.horizontal(|ui| {
+        ui.label("Range:");
+        ui.add(egui::DragValue::new(&mut s.lo).speed(speed).max_decimals(decimals).suffix(unit));
+        ui.label("to");
+        ui.add(egui::DragValue::new(&mut s.hi).speed(speed).max_decimals(decimals).suffix(unit));
+        if ui.small_button("Reset").on_hover_text("Back to the default range for this field").clicked() {
+            *pick = Some(s.name.clone());
+        }
+    });
+    // The ramp as drawn, low end on the left.
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(240.0), 10.0), egui::Sense::hover());
+    let n = 48;
+    for i in 0..n {
+        let c = extra_bytes::ramp_color(s.ramp, (i as f32 + 0.5) / n as f32);
+        let x0 = rect.left() + rect.width() * i as f32 / n as f32;
+        let x1 = rect.left() + rect.width() * (i + 1) as f32 / n as f32;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1 + 0.5, rect.bottom())),
+            0.0,
+            rgb_arr_to_egui(c),
+        );
+    }
+    if let Some(cap) = field.and_then(|f| f.c2c_cap) {
+        ui.horizontal(|ui| {
+            egui::widgets::color_picker::show_color(ui, rgb_arr_to_egui(extra_bytes::BEYOND_COLOR), egui::vec2(14.0, 10.0));
+            ui.label(format!("beyond max-dist ({:.*} m)", decimals, cap / 5.0))
+                .on_hover_text(format!(
+                    "No reference point within max-dist; the file stores {:.*} m (5 × max-dist) for these.",
+                    decimals, cap
+                ));
+        });
+    }
+}
+
+/// Every numeric extra-bytes field of the loaded files, for the picker.
+fn loaded_extra_fields(
+    stages: &[Stage],
+    copc_stages: &[CopcStage],
+    tile_mgr: &Option<TileStageManager>,
+) -> Vec<extra_bytes::FieldSummary> {
+    let tiles = tile_mgr.iter().flat_map(|m| m.loaded.iter().flatten().map(|t| &*t.cloud.extra_fields));
+    extra_bytes::summarise(
+        stages.iter().map(|s| &*s.cloud.extra_fields)
+            .chain(copc_stages.iter().map(|cs| &*cs.extra_fields))
+            .chain(tiles),
+    )
+}
+
+/// Lowest and highest value of field `name` over every resident point, for a
+/// field whose header has no statistics. Taken once, when the field is picked.
+fn loaded_extra_range(
+    name: &str,
+    stages: &[Stage],
+    copc_stages: &[CopcStage],
+    tile_mgr: &Option<TileStageManager>,
+) -> Option<(f64, f64)> {
+    let mut r: Option<(f64, f64)> = None;
+    let mut merge = |x: Option<(f64, f64)>| {
+        if let Some((a, b)) = x {
+            r = Some(r.map_or((a, b), |(lo, hi)| (lo.min(a), hi.max(b))));
+        }
+    };
+    for s in stages {
+        let x = &s.cloud.extra_fields;
+        if let Some(f) = x.get(name) {
+            merge(f.value_range(s.cloud.points.iter().map(|p| p.extra_bytes.as_slice()), x.c2c_cap_raw));
+        }
+    }
+    for cs in copc_stages {
+        let x = &cs.extra_fields;
+        if let Some(f) = x.get(name) {
+            merge(f.value_range(cs.resident_extra_bytes(), x.c2c_cap_raw));
+        }
+    }
+    for t in tile_mgr.iter().flat_map(|m| m.loaded.iter().flatten()) {
+        let x = &t.cloud.extra_fields;
+        if let Some(f) = x.get(name) {
+            merge(f.value_range(t.cloud.points.iter().map(|p| p.extra_bytes.as_slice()), x.c2c_cap_raw));
+        }
+    }
+    r
+}
+
+/// Settle the Extra-bytes colour selection and push it to every data source.
+///
+/// `pick` is a field the operator just chose or reset. `active` is whether a
+/// view colours by extra bytes; only then is a missing or stale selection
+/// (its field no longer loaded) replaced by the default field, so that the
+/// fallback range of a field without header statistics is taken from a view
+/// that has had time to load.
+///
+/// Called before the views each frame, which is how a file loaded
+/// mid-session picks the selection up, and after each panel, so an edit there
+/// is coloured in the same frame. Returns whether any source's selection
+/// changed, which in Extra mode needs a colour rebuild.
+fn sync_extra_color(
+    extra_color: &mut Option<ExtraColor>,
+    pick: Option<String>,
+    active: bool,
+    stages: &mut [Stage],
+    copc_stages: &mut [CopcStage],
+    tile_mgr: &mut Option<TileStageManager>,
+) -> bool {
+    if pick.is_some() || active {
+        let fields = loaded_extra_fields(stages, copc_stages, tile_mgr);
+        let stale = extra_color.as_ref().is_none_or(|s| !fields.iter().any(|f| f.name == s.name));
+        let want = pick.or_else(|| {
+            if stale { extra_bytes::default_field(&fields).map(|f| f.name.clone()) } else { None }
+        });
+        if let Some(f) = want.and_then(|n| fields.iter().find(|f| f.name == n)) {
+            let loaded = if f.min.is_none() || f.max.is_none() {
+                loaded_extra_range(&f.name, stages, copc_stages, tile_mgr)
+            } else {
+                None
+            };
+            *extra_color = Some(ExtraColor::default_for(f, loaded));
+        }
+    }
+    let mut changed = false;
+    let mut set = |slot: &mut Option<ExtraColor>| {
+        if slot != extra_color {
+            *slot = extra_color.clone();
+            changed = true;
+        }
+    };
+    for s in stages.iter_mut() { set(&mut s.extra_color); }
+    for cs in copc_stages.iter_mut() { set(&mut cs.extra_color); }
+    if let Some(mgr) = tile_mgr.as_mut() { set(&mut mgr.extra_color); }
+    changed
+}
+
 /// A readout line with a copy button beside it, so the value can be lifted
 /// out without retyping it. `clip` is what lands on the clipboard, which is
 /// not always what is displayed — the coordinates are copied tab separated
@@ -1539,6 +1739,7 @@ fn point_info_ui(
     title: &str,
     p: &LasPoint,
     class_defs: &Option<ClassDefs>,
+    extra: Option<&ExtraFields>,
 ) {
     ui.label(title);
     copyable_line(
@@ -1562,6 +1763,10 @@ fn point_info_ui(
         );
     }
     ui.label(format!("  Point Source Id: {}", p.point_source_id));
+    // One line per extra-bytes field, in the file's order.
+    for (name, value) in extra.map(|x| x.describe(&p.extra_bytes)).unwrap_or_default() {
+        ui.label(format!("  {name}: {value}"));
+    }
 }
 
 /// Format classification label using custom class_defs or default debug format.
@@ -1605,6 +1810,7 @@ fn class_color_mq(id: u8, class_defs: &Option<ClassDefs>) -> Color {
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn pick_section_point(
     stages: &[Stage],
+    copc_stages: &[CopcStage],
     copc_section_raw: &Option<(Vec<Vec<(LasPoint, f32, f32)>>, f32, f32, f32)>,
     tile_mgr: &Option<TileStageManager>,
     start: (f32, f32),
@@ -1614,7 +1820,7 @@ fn pick_section_point(
     class_vis: ClassVis,
     wx: f32,
     wy: f32,
-) -> Option<(LasPoint, glam::Vec2)> {
+) -> Option<(LasPoint, glam::Vec2, Arc<ExtraFields>)> {
     let dx = end.0 - start.0;
     let dy = end.1 - start.1;
     let len = (dx * dx + dy * dy).sqrt();
@@ -1624,9 +1830,9 @@ fn pick_section_point(
     let dir = (dx / len, dy / len);
     let normal = (-dir.1, dir.0);
 
-    let mut best: Option<(LasPoint, glam::Vec2)> = None;
+    let mut best: Option<(LasPoint, glam::Vec2, Arc<ExtraFields>)> = None;
     let mut best_dist = f32::MAX;
-    let mut consider = |p: &LasPoint, along: f32, z: f32| {
+    let mut consider = |p: &LasPoint, along: f32, z: f32, x: &Arc<ExtraFields>| {
         if !z_clip.contains(z) { return; }
         // A hidden class is unpickable in the section view too — the same rule
         // the 3D pick, the lasso and the ground fit follow.
@@ -1634,7 +1840,7 @@ fn pick_section_point(
         let d = (along - wx).powi(2) + (z - wy).powi(2);
         if d < best_dist {
             best_dist = d;
-            best = Some((p.clone(), glam::Vec2::new(along, z)));
+            best = Some((p.clone(), glam::Vec2::new(along, z), x.clone()));
         }
     };
 
@@ -1645,14 +1851,15 @@ fn pick_section_point(
             let along = rel_x * dir.0 + rel_y * dir.1;
             let perp = rel_x * normal.0 + rel_y * normal.1;
             if along >= 0.0 && along <= len && perp.abs() <= depth {
-                consider(&s.cloud.points[i], along, pos[2]);
+                consider(&s.cloud.points[i], along, pos[2], &s.cloud.extra_fields);
             }
         }
     }
     if let Some((per_stage_raw, _, _, _)) = copc_section_raw {
-        for raw in per_stage_raw {
+        // `per_stage_raw[i]` was cut from `copc_stages[i]`.
+        for (raw, cs) in per_stage_raw.iter().zip(copc_stages) {
             for (p, along, z) in raw {
-                consider(p, *along, *z);
+                consider(p, *along, *z, &cs.extra_fields);
             }
         }
     }
@@ -1664,7 +1871,7 @@ fn pick_section_point(
                 let along = rel_x * dir.0 + rel_y * dir.1;
                 let perp = rel_x * normal.0 + rel_y * normal.1;
                 if along >= 0.0 && along <= len && perp.abs() <= depth {
-                    consider(&loaded.cloud.points[i], along, pos[2]);
+                    consider(&loaded.cloud.points[i], along, pos[2], &loaded.cloud.extra_fields);
                 }
             }
         }
@@ -2673,6 +2880,11 @@ async fn main() {
     let mut classes_save_status: Option<String> = None;
 
     let mut color_mode = ColorMode::Height;
+    // Field, ramp and range for the Extra-bytes colour mode. One selection for
+    // every view and file; `sync_extra_color` resolves and pushes it.
+    let mut extra_color: Option<ExtraColor> = None;
+    // A field picked, or reset, in the panel this frame.
+    let mut extra_pick: Option<String> = None;
     let mut background: Color = BLACK;
     let mut app_mode = AppMode::View3D;
 
@@ -2859,7 +3071,7 @@ async fn main() {
     let mut sec_measure_b: Option<glam::Vec2> = None;
     // Picked point in the section view: the LAS point plus its (along, height)
     // position in section space, used to mark it on screen.
-    let mut sec_picked_point: Option<(LasPoint, glam::Vec2)> = None;
+    let mut sec_picked_point: Option<(LasPoint, glam::Vec2, Arc<ExtraFields>)> = None;
 
     // ---- Manual classification state ----
     // Lasso vertices in section space: (metres along the line, viewer-space Z).
@@ -2897,7 +3109,7 @@ async fn main() {
     // (stage_idx, point_idx) — picked point in the multi-Stage list.
     let mut picked_point: Option<(usize, usize)> = None;
     let mut picked_tile_point: Option<(usize, usize)> = None;
-    let mut picked_copc_point: Option<LasPoint> = None;
+    let mut picked_copc_point: Option<(LasPoint, Arc<ExtraFields>)> = None;
 
     // Tile mode: selected tile for UI
     let mut selected_tile: Option<usize> = None;
@@ -3199,13 +3411,17 @@ async fn main() {
         // is baked into the colour buffers, so a change — including a file
         // arriving unfiltered while a filter is on — has to force a rebuild.
         let class_vis_changed = apply_class_vis(&mut stages, &mut copc_stages, &mut tile_mgr, class_vis);
+        // The Extra-bytes selection likewise: a file loaded while the view
+        // colours by a field has to be told which one, and repainted.
+        let extra_active = color_mode == ColorMode::Extra || section_color_mode == ColorMode::Extra;
+        let extra_changed = sync_extra_color(&mut extra_color, None, extra_active, &mut stages, &mut copc_stages, &mut tile_mgr);
         // Rebuilt here rather than in each of the three per-mode blocks below,
         // and unconditionally rather than only in Classification mode: the
         // hidden-class sentinel rides in the colour buffer whatever the colour
         // mode is, so every mode has to be repainted. One toggle therefore
         // costs one colour rebuild — the same cost as changing colour mode,
         // which is already accepted as interactive.
-        if class_vis_changed {
+        if class_vis_changed || (extra_changed && color_mode == ColorMode::Extra) {
             let mut gl = unsafe { get_internal_gl() };
             gl.flush();
             for st in stages.iter_mut() { st.rebuild_colors(&mut *gl.quad_context, color_mode); }
@@ -3481,7 +3697,7 @@ async fn main() {
                     );
                 }
                 // Picked point marker
-                if let Some((_, spos)) = &sec_picked_point {
+                if let Some((_, spos, _)) = &sec_picked_point {
                     let sx = world_to_screen_x(spos.x);
                     let sy = world_to_screen_y(spos.y);
                     draw_circle_lines(sx, sy, 6.0, 1.5, SKYBLUE);
@@ -3604,6 +3820,7 @@ async fn main() {
             let edits_dirty = stages.iter().any(|s| s.edits.dirty)
                 || copc_stages.iter().any(|cs| cs.edits.dirty);
             let export_sources = export_source_list(&stages, &copc_stages);
+            let extra_fields_ui = loaded_extra_fields(&stages, &copc_stages, &tile_mgr);
             egui_macroquad::ui(|egui_ctx| {
                 egui_macroquad::egui::SidePanel::left("haiviz_panel")
                     .resizable(true)
@@ -3622,16 +3839,8 @@ async fn main() {
                             leave_corridor = true;
                         }
                         ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("Color:");
-                            egui_macroquad::egui::ComboBox::from_id_salt("color_mode")
-                                .selected_text(section_color_mode.label())
-                                .show_ui(ui, |ui| {
-                                    for mode in &ColorMode::ALL {
-                                        ui.selectable_value(&mut section_color_mode, *mode, mode.label());
-                                    }
-                                });
-                        });
+                        color_mode_picker(ui, &mut section_color_mode, !extra_fields_ui.is_empty());
+                        extra_color_controls(ui, section_color_mode, &extra_fields_ui, &mut extra_color, &mut extra_pick);
                         height_color_changed = height_color_controls(ui, section_color_mode, &mut height_color_min, &mut height_color_max, data_offset[2]);
                         z_clip_changed = z_clip_controls(
                             ui, &mut z_clip_enabled, &mut z_clip_lo, &mut z_clip_hi,
@@ -3699,9 +3908,9 @@ async fn main() {
                                 ui.label("  Slope:     vertical");
                             }
                         }
-                        if let Some((ref p, _)) = sec_picked_point {
+                        if let Some((ref p, _, ref x)) = sec_picked_point {
                             ui.separator();
-                            point_info_ui(ui, "Point Info:", p, &class_defs);
+                            point_info_ui(ui, "Point Info:", p, &class_defs, Some(x));
                         }
 
                         // ---- Manual classification ----
@@ -4107,7 +4316,7 @@ async fn main() {
                     AppMode::SectionPointPick => {
                         if let (Some(start), Some(end)) = (section_start, section_end) {
                             sec_picked_point = pick_section_point(
-                                &stages, &copc_section_raw, &tile_mgr,
+                                &stages, &copc_stages, &copc_section_raw, &tile_mgr,
                                 start, end, section_depth, z_clip, class_vis, wx, wy,
                             );
                         }
@@ -4188,7 +4397,20 @@ async fn main() {
                 apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
             }
             let height_rebuild = height_color_changed && section_color_mode == ColorMode::Height;
-            if (section_color_mode != prev_color_mode || height_rebuild || class_rebuild) &&
+            let extra_changed = sync_extra_color(
+                &mut extra_color, extra_pick.take(),
+                section_color_mode == ColorMode::Extra || color_mode == ColorMode::Extra,
+                &mut stages, &mut copc_stages, &mut tile_mgr,
+            );
+            let extra_rebuild = extra_changed && section_color_mode == ColorMode::Extra;
+            // The 3D sources too, so the view is current on the way back.
+            if extra_changed && color_mode == ColorMode::Extra {
+                let gl = unsafe { get_internal_gl() };
+                for s in stages.iter_mut() { s.rebuild_colors(&mut *gl.quad_context, color_mode); }
+                for cs in copc_stages.iter_mut() { cs.rebuild_colors(&mut *gl.quad_context, color_mode); }
+                if let Some(mgr) = tile_mgr.as_mut() { mgr.rebuild_colors(&mut *gl.quad_context, color_mode); }
+            }
+            if (section_color_mode != prev_color_mode || height_rebuild || class_rebuild || extra_rebuild) &&
                 let (Some(start), Some(end)) = (section_start, section_end) {
                     let gl = unsafe { get_internal_gl() };
                     if !stages.is_empty() {
@@ -4863,6 +5085,7 @@ async fn main() {
             let mut class_colors_changed = false;
             let mut export_request: Option<usize> = None;
             let export_sources = export_source_list(&stages, &copc_stages);
+            let extra_fields_ui = loaded_extra_fields(&stages, &copc_stages, &tile_mgr);
             egui_macroquad::ui(|egui_ctx| {
                 egui_macroquad::egui::SidePanel::left("haiviz_panel")
                     .resizable(true)
@@ -4923,16 +5146,8 @@ async fn main() {
                             }
                         }
                         ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("Color:");
-                            egui_macroquad::egui::ComboBox::from_id_salt("color_mode")
-                                .selected_text(color_mode.label())
-                                .show_ui(ui, |ui| {
-                                    for mode in &ColorMode::ALL {
-                                        ui.selectable_value(&mut color_mode, *mode, mode.label());
-                                    }
-                                });
-                        });
+                        color_mode_picker(ui, &mut color_mode, !extra_fields_ui.is_empty());
+                        extra_color_controls(ui, color_mode, &extra_fields_ui, &mut extra_color, &mut extra_pick);
                         height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max, data_offset[2]);
                         z_clip_changed = z_clip_controls(
                             ui, &mut z_clip_enabled, &mut z_clip_lo, &mut z_clip_hi,
@@ -5052,7 +5267,7 @@ async fn main() {
                             && let Some(p) = s.cloud.points.get(idx)
                         {
                             ui.separator();
-                            point_info_ui(ui, "Point Info:", p, &class_defs);
+                            point_info_ui(ui, "Point Info:", p, &class_defs, Some(&s.cloud.extra_fields));
                         }
                 });
                 class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
@@ -5238,9 +5453,14 @@ async fn main() {
                 apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
             }
             let height_rebuild = height_color_changed && color_mode == ColorMode::Height;
-            if color_mode != prev_color_mode || height_rebuild || class_rebuild {
+            // Every source, like a height ramp change: the selection is shared.
+            let extra_rebuild = sync_extra_color(
+                &mut extra_color, extra_pick.take(), color_mode == ColorMode::Extra,
+                &mut stages, &mut copc_stages, &mut tile_mgr,
+            ) && color_mode == ColorMode::Extra;
+            if color_mode != prev_color_mode || height_rebuild || class_rebuild || extra_rebuild {
                 let gl = unsafe { get_internal_gl() };
-                if height_rebuild || class_rebuild {
+                if height_rebuild || class_rebuild || extra_rebuild {
                     for cs in copc_stages.iter_mut() {
                         cs.rebuild_colors(&mut *gl.quad_context, color_mode);
                     }
@@ -5364,6 +5584,7 @@ async fn main() {
             let mut leave_corridor = false;
             let mut export_request: Option<usize> = None;
             let export_sources = export_source_list(&stages, &copc_stages);
+            let extra_fields_ui = loaded_extra_fields(&stages, &copc_stages, &tile_mgr);
             egui_macroquad::ui(|egui_ctx| {
                 egui_macroquad::egui::SidePanel::left("haiviz_panel")
                     .resizable(true)
@@ -5418,16 +5639,8 @@ async fn main() {
                             }
                         }
                         ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("Color:");
-                            egui_macroquad::egui::ComboBox::from_id_salt("color_mode")
-                                .selected_text(color_mode.label())
-                                .show_ui(ui, |ui| {
-                                    for mode in &ColorMode::ALL {
-                                        ui.selectable_value(&mut color_mode, *mode, mode.label());
-                                    }
-                                });
-                        });
+                        color_mode_picker(ui, &mut color_mode, !extra_fields_ui.is_empty());
+                        extra_color_controls(ui, color_mode, &extra_fields_ui, &mut extra_color, &mut extra_pick);
                         height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max, data_offset[2]);
                         z_clip_changed = z_clip_controls(
                             ui, &mut z_clip_enabled, &mut z_clip_lo, &mut z_clip_hi,
@@ -5542,9 +5755,9 @@ async fn main() {
                             ui.separator();
                             ui.label("A set — click point B");
                         }
-                        if let Some(ref p) = picked_copc_point {
+                        if let Some((ref p, ref x)) = picked_copc_point {
                             ui.separator();
-                            point_info_ui(ui, "Point Info:", p, &class_defs);
+                            point_info_ui(ui, "Point Info:", p, &class_defs, Some(x));
                         }
                 });
                 class_colors_changed = classes_section(ui, &mut class_defs, &mut class_vis, max_class, &mut class_file, &mut classes_save_status);
@@ -5657,7 +5870,7 @@ async fn main() {
                         let mut best_dist = f32::MAX;
                         for cs in copc_stages.iter().filter(|cs| cs.visible) {
                             if let Some((p, _vpos, dist)) = cs.find_nearest_point(&view_proj, mx - view_rect.x, my - view_rect.y, view_rect.w, view_rect.h) 
-                                && dist < best_dist { best_dist = dist; picked_copc_point = Some(p.clone()); 
+                                && dist < best_dist { best_dist = dist; picked_copc_point = Some((p.clone(), cs.extra_fields.clone())); 
                             }
                         }
                     }
@@ -5750,9 +5963,14 @@ async fn main() {
                 apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
             }
             let height_rebuild = height_color_changed && color_mode == ColorMode::Height;
-            if color_mode != prev_color_mode || height_rebuild || class_rebuild {
+            // Every source, like a height ramp change: the selection is shared.
+            let extra_rebuild = sync_extra_color(
+                &mut extra_color, extra_pick.take(), color_mode == ColorMode::Extra,
+                &mut stages, &mut copc_stages, &mut tile_mgr,
+            ) && color_mode == ColorMode::Extra;
+            if color_mode != prev_color_mode || height_rebuild || class_rebuild || extra_rebuild {
                 let gl = unsafe { get_internal_gl() };
-                if height_rebuild || class_rebuild {
+                if height_rebuild || class_rebuild || extra_rebuild {
                     for s in stages.iter_mut() {
                         s.rebuild_colors(&mut *gl.quad_context, color_mode);
                     }
@@ -5908,6 +6126,7 @@ async fn main() {
             let mut class_colors_changed = false;
             let mut export_request: Option<usize> = None;
             let export_sources = export_source_list(&stages, &copc_stages);
+            let extra_fields_ui = loaded_extra_fields(&stages, &copc_stages, &tile_mgr);
             egui_macroquad::ui(|egui_ctx| {
                 egui_macroquad::egui::SidePanel::left("haiviz_panel")
                     .resizable(true)
@@ -5970,16 +6189,8 @@ async fn main() {
                             }
                         }
                         ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("Color:");
-                            egui_macroquad::egui::ComboBox::from_id_salt("color_mode")
-                                .selected_text(color_mode.label())
-                                .show_ui(ui, |ui| {
-                                    for mode in &ColorMode::ALL {
-                                        ui.selectable_value(&mut color_mode, *mode, mode.label());
-                                    }
-                                });
-                        });
+                        color_mode_picker(ui, &mut color_mode, !extra_fields_ui.is_empty());
+                        extra_color_controls(ui, color_mode, &extra_fields_ui, &mut extra_color, &mut extra_pick);
                         height_color_changed = height_color_controls(ui, color_mode, &mut height_color_min, &mut height_color_max, data_offset[2]);
                         z_clip_changed = z_clip_controls(
                             ui, &mut z_clip_enabled, &mut z_clip_lo, &mut z_clip_hi,
@@ -6082,7 +6293,7 @@ async fn main() {
                             let Some(ref lt) = mgr.loaded[tile_idx] {
                                 ui.separator();
                                 let p = &lt.cloud.points[point_idx];
-                                point_info_ui(ui, &format!("Point Info ({})", mgr.tiles[tile_idx].filename), p, &class_defs);
+                                point_info_ui(ui, &format!("Point Info ({})", mgr.tiles[tile_idx].filename), p, &class_defs, Some(&lt.cloud.extra_fields));
                             
                         }
                 });
@@ -6289,9 +6500,14 @@ async fn main() {
                 apply_height_color(&mut stages, &mut copc_stages, &mut tile_mgr, height_color_min, height_color_max);
             }
             let height_rebuild = height_color_changed && color_mode == ColorMode::Height;
-            if color_mode != prev_color_mode || height_rebuild || class_rebuild {
+            // Every source, like a height ramp change: the selection is shared.
+            let extra_rebuild = sync_extra_color(
+                &mut extra_color, extra_pick.take(), color_mode == ColorMode::Extra,
+                &mut stages, &mut copc_stages, &mut tile_mgr,
+            ) && color_mode == ColorMode::Extra;
+            if color_mode != prev_color_mode || height_rebuild || class_rebuild || extra_rebuild {
                 let gl = unsafe { get_internal_gl() };
-                if height_rebuild || class_rebuild {
+                if height_rebuild || class_rebuild || extra_rebuild {
                     for s in stages.iter_mut() {
                         s.rebuild_colors(&mut *gl.quad_context, color_mode);
                     }

@@ -212,10 +212,35 @@ typing a class label does not move the camera.
 ## Colouring
 
 The **Color** dropdown switches how points are shaded:
-Height, Intensity, Classification, RGB, PointSourceId, or Time. In **Height**
+Height, Intensity, Classification, RGB, PointSourceId, Time, or Extra bytes. In **Height**
 mode you can set the min/max range used for the colour ramp, in absolute
 elevation. The **Background** colour and **point size** are adjustable, and an
 EDL (eye-dome-lighting) **Strength** slider adds depth shading.
+
+### Extra bytes
+
+**Extra bytes** appears in the dropdown when a loaded file has numeric LAS
+extra-bytes fields (the Extra Bytes VLR, `LASF_Spec`/4). Pick the field, a
+**Sequential** or **Diverging** ramp (neutral at 0), and the **Range**; the
+bar under it is the ramp as drawn. The range is fixed: it comes from the
+descriptor's min/max in the file header, not from the points on screen, so
+colours do not shift as COPC nodes stream in. A field whose header has no
+min/max takes the range of the points loaded when it is picked, once.
+**Reset** goes back to the default. Point Info lists every extra-bytes field of
+the picked point, scaled, with as many decimals as the field's scale has.
+
+The output of `copc_compare c2c` gets its own defaults. `c2c_dist` is shown
+sequential from 0 to max-dist; `c2c_dx`, `c2c_dy`, `c2c_dz` and `c2c_plane` are
+diverging from −max-dist to +max-dist (positive dz: the compared point lies
+above). Points with no reference neighbour within max-dist are stored as
+5 × max-dist in every field. They are drawn grey whatever the range, and Point
+Info shows them as "beyond max-dist". Max-dist is not stored in the file:
+haiviz takes it as a fifth of `c2c_dist`'s header max, which is that stored
+value whenever any point is beyond max-dist. A file that also has components or
+`c2c_plane` shows whether that is the case (if no point is beyond, their maxima
+differ from `c2c_dist`'s). A `c2c_dist`-only file with no point beyond max-dist
+cannot show this, so its farthest point is greyed and the default range is a
+fifth of what it should be.
 
 The section view keeps its own colour mode. Switching to Classification to
 check your work on a slice does not repaint the 3D view, and the 3D dropdown

@@ -3,6 +3,7 @@
     use std::fs::File;
     use std::io::BufReader;
     use std::path::Path;
+    use std::sync::Arc;
     use ::log::{info, error, warn};
 
 
@@ -11,6 +12,7 @@
     use miniquad::*;
 
     use crate::ColorMode;
+    use crate::extra_bytes::{ExtraColor, ExtraFields, ExtraRamp};
     use crate::classify::{ClassEdits, ClassMask, effective_class};
     use crate::spatial::{RayHit, SpatialGrid};
     use crate::edge_follow::Sample;
@@ -194,6 +196,9 @@
         pub time_max: f64,
         /// Highest classification id present (class 12 recovered from `is_overlap`).
         pub max_class: u8,
+        /// What the points' extra bytes hold, from the header. Shared so a
+        /// picked point can carry its file's descriptors into Point Info.
+        pub extra_fields: Arc<ExtraFields>,
     }
 
     impl VizPointcloud {
@@ -209,6 +214,7 @@
         pub fn load(filename: &str) -> VizPointcloud {
             let mut reader = Reader::from_path(filename).unwrap();
             let n = reader.header().number_of_points() as usize;
+            let extra_fields = Arc::new(ExtraFields::from_header(reader.header()));
 
             let point_data = reader.read_all().unwrap();
             let mut points: Vec<Point> = Vec::with_capacity(n);
@@ -263,7 +269,7 @@
             info!("{} points loaded from {}", points.len(), filename);
             info!("Intensity range: {}..{}", intensity_min, intensity_max);
             info!("Time range: {}..{}", time_min, time_max);
-            VizPointcloud { points, min, max, intensity_min, intensity_max, time_min, time_max, max_class }
+            VizPointcloud { points, min, max, intensity_min, intensity_max, time_min, time_max, max_class, extra_fields }
         }
     }
 
@@ -352,6 +358,8 @@
         pub z_clip: ZClip,
         /// Which classes are shown; see [`ClassVis`].
         pub class_vis: ClassVis,
+        /// Field and range for the Extra-bytes colour mode; see `apply_extra_color`.
+        pub extra_color: Option<ExtraColor>,
         /// Manual classification ops. Unlike the COPC case all points are
         /// resident, so ops are applied directly and only kept for persistence
         /// and undo.
@@ -370,7 +378,7 @@
         point: &Point, pos_z: f32, h_color_min: f32, h_color_max: f32,
         intensity_min: u16, intensity_range: f32, time: f64, time_min: f64, time_range: f64,
         mode: ColorMode, class_defs: &Option<ClassDefs>,
-        override_rgb: Option<[f32; 3]>, class_vis: ClassVis,
+        override_rgb: Option<[f32; 3]>, class_vis: ClassVis, extra: Option<&ExtraRamp>,
     ) -> [f32; 3] {
         if !class_vis.contains(effective_class(point)) {
             return HIDDEN_COLOR;
@@ -433,6 +441,10 @@
                     [0.5, 0.5, 0.5]
                 }
             }
+            ColorMode::Extra => match extra {
+                Some(r) => r.color(&point.extra_bytes),
+                None => crate::extra_bytes::NO_VALUE_COLOR,
+            },
             ColorMode::PointSourceId => {
                 let psid = point.point_source_id;
                 let h = (psid as f32 * 0.618_034) % 1.0;
@@ -680,7 +692,7 @@
                 .points
                 .iter()
                 .enumerate()
-                .map(|(i, p)| color_for_point(p, positions[i][2], 0.0, height_range, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &class_defs, None, ClassVis::ALL))
+                .map(|(i, p)| color_for_point(p, positions[i][2], 0.0, height_range, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &class_defs, None, ClassVis::ALL, None))
                 .collect();
 
             let (pipeline, depth_pipeline) = (create_pipeline(ctx, false), create_pipeline(ctx, true));
@@ -710,6 +722,7 @@
                 // the next frame, which is also how a stage loaded while a
                 // filter is in force picks it up.
                 class_vis: ClassVis::ALL,
+                extra_color: None,
                 edits: ClassEdits::default(),
                 index,
             };
@@ -894,6 +907,7 @@
             let (h_lo, h_hi) = (self.color_h_min, self.color_h_max);
             let intensity_range = (self.cloud.intensity_max - self.cloud.intensity_min) as f32;
             let time_range = self.cloud.time_max - self.cloud.time_min;
+            let extra = ExtraRamp::resolve(self.extra_color.as_ref(), &self.cloud.extra_fields);
 
             for chunk in &mut self.chunks {
                 let chunk_colors: Vec<[f32; 3]> = chunk
@@ -901,7 +915,7 @@
                     .iter()
                     .map(|&i| {
                         let p = &self.cloud.points[i];
-                        color_for_point(p, self.positions[i][2], h_lo, h_hi, self.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.cloud.time_min, time_range, color_mode, &self.class_defs, self.rgb_override, self.class_vis)
+                        color_for_point(p, self.positions[i][2], h_lo, h_hi, self.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.cloud.time_min, time_range, color_mode, &self.class_defs, self.rgb_override, self.class_vis, extra.as_ref())
                     })
                     .collect();
 
@@ -930,6 +944,7 @@
             let (h_lo, h_hi) = (self.color_h_min, self.color_h_max);
             let intensity_range = (self.cloud.intensity_max - self.cloud.intensity_min) as f32;
             let time_range = self.cloud.time_max - self.cloud.time_min;
+            let extra = ExtraRamp::resolve(self.extra_color.as_ref(), &self.cloud.extra_fields);
 
             let mut section_verts = Vec::new();
             let mut h_min = f32::MAX;
@@ -949,7 +964,7 @@
                     h_max = h_max.max(pos[2]);
                     section_verts.push(Vertex {
                         pos: [along, pos[2], 0.0],
-                        color: color_for_point(p, pos[2], h_lo, h_hi, self.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.cloud.time_min, time_range, color_mode, &self.class_defs, self.rgb_override, self.class_vis),
+                        color: color_for_point(p, pos[2], h_lo, h_hi, self.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.cloud.time_min, time_range, color_mode, &self.class_defs, self.rgb_override, self.class_vis, extra.as_ref()),
                     });
                 }
             }
@@ -1032,6 +1047,9 @@
         pub z_clip: ZClip,
         /// Which classes are shown; see [`ClassVis`].
         pub class_vis: ClassVis,
+        /// Field and range for the Extra-bytes colour mode, resolved against
+        /// each tile's own descriptors when it is coloured.
+        pub extra_color: Option<ExtraColor>,
     }
 
     fn read_index(dir_path: &str) -> Vec<TileInfo> {
@@ -1153,6 +1171,7 @@
                 color_h_max: (global_max[2] - global_min[2]) as f32,
                 z_clip: ZClip::OPEN,
                 class_vis: ClassVis::ALL,
+                extra_color: None,
             }
         }
 
@@ -1204,6 +1223,7 @@
             let (h_lo, h_hi) = (self.color_h_min, self.color_h_max);
             let intensity_range = (cloud.intensity_max - cloud.intensity_min) as f32;
             let time_range = cloud.time_max - cloud.time_min;
+            let extra = ExtraRamp::resolve(self.extra_color.as_ref(), &cloud.extra_fields);
 
             let positions: Vec<[f32; 3]> = cloud.points.iter().map(|p| [
                 (p.x - self.global_min[0]) as f32,
@@ -1212,7 +1232,7 @@
             ]).collect();
 
             let colors: Vec<[f32; 3]> = cloud.points.iter().enumerate().map(|(i, p)| {
-                color_for_point(p, positions[i][2], h_lo, h_hi, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &self.class_defs, override_rgb, self.class_vis)
+                color_for_point(p, positions[i][2], h_lo, h_hi, cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), cloud.time_min, time_range, color_mode, &self.class_defs, override_rgb, self.class_vis, extra.as_ref())
             }).collect();
 
             let total_points = colors.len() as i32;
@@ -1271,14 +1291,16 @@
             let (h_lo, h_hi) = (self.color_h_min, self.color_h_max);
             let class_defs = self.class_defs.clone();
             let class_vis = self.class_vis;
+            let extra_color = self.extra_color.clone();
             for loaded in self.loaded.iter_mut().flatten() {
                 let intensity_range = (loaded.cloud.intensity_max - loaded.cloud.intensity_min) as f32;
                 let time_range = loaded.cloud.time_max - loaded.cloud.time_min;
                 let override_rgb = loaded.rgb_override;
+                let extra = ExtraRamp::resolve(extra_color.as_ref(), &loaded.cloud.extra_fields);
                 for chunk in &mut loaded.chunks {
                     let chunk_colors: Vec<[f32; 3]> = chunk.point_indices.iter().map(|&i| {
                         let p = &loaded.cloud.points[i];
-                        color_for_point(p, loaded.positions[i][2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &class_defs, override_rgb, class_vis)
+                        color_for_point(p, loaded.positions[i][2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &class_defs, override_rgb, class_vis, extra.as_ref())
                     }).collect();
                     ctx.buffer_update(chunk.bindings.vertex_buffers[1], BufferSource::slice(&chunk_colors));
                 }
@@ -1289,14 +1311,16 @@
             let (h_lo, h_hi) = (self.color_h_min, self.color_h_max);
             let class_defs = self.class_defs.clone();
             let class_vis = self.class_vis;
+            let extra_color = self.extra_color.clone();
             if let Some(ref mut loaded) = self.loaded[index] {
                 let intensity_range = (loaded.cloud.intensity_max - loaded.cloud.intensity_min) as f32;
                 let time_range = loaded.cloud.time_max - loaded.cloud.time_min;
                 let override_rgb = loaded.rgb_override;
+                let extra = ExtraRamp::resolve(extra_color.as_ref(), &loaded.cloud.extra_fields);
                 for chunk in &mut loaded.chunks {
                     let chunk_colors: Vec<[f32; 3]> = chunk.point_indices.iter().map(|&i| {
                         let p = &loaded.cloud.points[i];
-                        color_for_point(p, loaded.positions[i][2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &class_defs, override_rgb, class_vis)
+                        color_for_point(p, loaded.positions[i][2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &class_defs, override_rgb, class_vis, extra.as_ref())
                     }).collect();
                     ctx.buffer_update(chunk.bindings.vertex_buffers[1], BufferSource::slice(&chunk_colors));
                 }
@@ -1475,6 +1499,7 @@
             for loaded in self.loaded.iter().flatten() {
                 let intensity_range = (loaded.cloud.intensity_max - loaded.cloud.intensity_min) as f32;
                 let time_range = loaded.cloud.time_max - loaded.cloud.time_min;
+                let extra = ExtraRamp::resolve(self.extra_color.as_ref(), &loaded.cloud.extra_fields);
                 for (i, pos) in loaded.positions.iter().enumerate() {
                     let rel_x = pos[0] - start.0;
                     let rel_y = pos[1] - start.1;
@@ -1489,7 +1514,7 @@
                         h_max = h_max.max(pos[2]);
                         section_verts.push(Vertex {
                             pos: [along, pos[2], 0.0],
-                            color: color_for_point(p, pos[2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &self.class_defs, loaded.rgb_override, self.class_vis),
+                            color: color_for_point(p, pos[2], h_lo, h_hi, loaded.cloud.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), loaded.cloud.time_min, time_range, color_mode, &self.class_defs, loaded.rgb_override, self.class_vis, extra.as_ref()),
                         });
                     }
                 }
@@ -1982,6 +2007,13 @@
         /// `ingest_node`, so a node arriving long after a class was switched
         /// off is coloured to match what is already on screen.
         pub class_vis: ClassVis,
+        /// What the points' extra bytes hold, from the header.
+        pub extra_fields: Arc<ExtraFields>,
+        /// Field and range for the Extra-bytes colour mode. The range is fixed
+        /// (header statistics, or what the operator typed) rather than
+        /// gathered from ingested nodes like intensity's, so a node streaming
+        /// in does not shift the colours of the ones already shown.
+        pub extra_color: Option<ExtraColor>,
         /// Nodes dispatched to the loader thread but not yet ingested.
         in_flight: HashSet<VoxelKey>,
         /// Nodes force-loaded for the active section corridor. These are held
@@ -2194,6 +2226,7 @@
             let header = reader.header();
 
             let copc_info = header.copc_info_vlr().expect("Not a COPC file");
+            let extra_fields = Arc::new(ExtraFields::from_header(header));
             let (cx, cy, cz, halfsize, spacing) = (
                 copc_info.center_x,
                 copc_info.center_y,
@@ -2276,6 +2309,8 @@
                 color_h_max: (global_max[2] - global_min[2]) as f32,
                 z_clip: ZClip::OPEN,
                 class_vis: ClassVis::ALL,
+                extra_fields,
+                extra_color: None,
                 in_flight: HashSet::new(),
                 pinned: HashSet::new(),
                 pin_box: None,
@@ -2529,6 +2564,8 @@
                 1.0
             };
 
+            let extra = ExtraRamp::resolve(self.extra_color.as_ref(), &self.extra_fields);
+
             let positions: Vec<[f32; 3]> = pts.iter().map(|p| [
                 (p.x - self.viewer_origin[0]) as f32,
                 (p.y - self.viewer_origin[1]) as f32,
@@ -2539,7 +2576,7 @@
                 color_for_point(
                     p, positions[i][2], h_lo, h_hi,
                     self.intensity_min, intensity_range, p.gps_time.unwrap_or(0.), self.time_min, time_range,
-                    color_mode, &self.class_defs, self.rgb_override, self.class_vis,
+                    color_mode, &self.class_defs, self.rgb_override, self.class_vis, extra.as_ref(),
                 )
             }).collect();
 
@@ -2729,6 +2766,12 @@
                 }
             }
             drawn
+        }
+
+        /// The extra bytes of every resident point, for a field whose header
+        /// has no statistics to take a colour range from.
+        pub fn resident_extra_bytes(&self) -> impl Iterator<Item = &[u8]> {
+            self.loaded_nodes.values().flat_map(|n| n.points.iter().map(|p| p.extra_bytes.as_slice()))
         }
 
         pub fn total_loaded_points(&self) -> i32 {
@@ -2962,13 +3005,14 @@
             else {
                 1.0
             };
+            let extra = ExtraRamp::resolve(self.extra_color.as_ref(), &self.extra_fields);
             for node in self.loaded_nodes.values_mut() {
                 for chunk in &mut node.chunks {
                     let colors: Vec<[f32; 3]> = chunk.point_indices.iter().map(|&i| {
                         color_for_point(
                             &node.points[i], node.positions[i][2], h_lo, h_hi,
                             self.intensity_min, intensity_range, node.points[i].gps_time.unwrap_or(0.), self.time_min, time_range,
-                            color_mode, &self.class_defs, self.rgb_override, self.class_vis,
+                            color_mode, &self.class_defs, self.rgb_override, self.class_vis, extra.as_ref(),
                         )
                     }).collect();
                     ctx.buffer_update(chunk.bindings.vertex_buffers[1], BufferSource::slice(&colors));
@@ -3005,6 +3049,7 @@
                 1.0
             };
 
+            let extra = ExtraRamp::resolve(self.extra_color.as_ref(), &self.extra_fields);
             let mut verts = Vec::new();
             let mut raw: Vec<(Point, f32, f32)> = Vec::new();
             let mut h_min = f32::MAX;
@@ -3027,7 +3072,7 @@
                             color: color_for_point(
                                 &node.points[i], pos[2], h_lo, h_hi,
                                 self.intensity_min, intensity_range, node.points[i].gps_time.unwrap_or(0.), self.time_min, time_range,
-                                color_mode, &self.class_defs, self.rgb_override, self.class_vis,
+                                color_mode, &self.class_defs, self.rgb_override, self.class_vis, extra.as_ref(),
                             ),
                         });
                     }
@@ -3157,13 +3202,14 @@
                 else {
                     1.0
                 };
+                let extra = ExtraRamp::resolve(cs.extra_color.as_ref(), &cs.extra_fields);
                 for (pt, along, pos_z) in raw {
                     all_verts.push(Vertex {
                         pos: [*along, *pos_z, 0.0],
                         color: color_for_point(
                             pt, *pos_z, cs.color_h_min, cs.color_h_max,
                             cs.intensity_min, intensity_range, pt.gps_time.unwrap_or(0.), cs.time_min, time_range,
-                            color_mode, &cs.class_defs, cs.rgb_override, cs.class_vis,
+                            color_mode, &cs.class_defs, cs.rgb_override, cs.class_vis, extra.as_ref(),
                         ),
                     });
                 }
